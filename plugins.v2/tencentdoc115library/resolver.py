@@ -19,7 +19,6 @@ except ImportError:
 
 from .store import CatalogStore, utc_now
 
-
 DEFAULT_VIDEO_EXTENSIONS = {
     ".3gp",
     ".avi",
@@ -210,7 +209,7 @@ class ShareResolver:
                 if not last_error.retryable:
                     raise last_error
             if attempt < retry_count:
-                sleep(min(2 ** attempt, 8))
+                sleep(min(2**attempt, 8))
         raise last_error or ShareResolutionError("115 请求失败")
 
     @staticmethod
@@ -223,8 +222,7 @@ class ShareResolver:
         :return Tuple: 分享码和访问码
         """
         parsed = urlsplit(str(share_url or ""))
-        hostname = str(parsed.hostname or "").lower()
-        if hostname != "115.com" and not hostname.endswith(".115.com"):
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
             raise ShareResolutionError(
                 "无法从资源链接中识别 115 分享码",
                 status_code=422,
@@ -240,7 +238,7 @@ class ShareResolver:
                 return share_code, receive_code
         except Exception:
             pass
-        match = re.search(r"/(?:s|share)/([^/?#]+)", parsed.path, re.IGNORECASE)
+        match = re.search(r"/(?:s|share)/([^/?#&]+)", parsed.path, re.IGNORECASE)
         share_code = match.group(1) if match else ""
         query = parse_qs(parsed.query)
         receive_code = str(
@@ -304,16 +302,10 @@ class ShareResolver:
             or ""
         )
         name = str(
-            normalized.get("name")
-            or normalized.get("file_name")
-            or item.get("n")
-            or ""
+            normalized.get("name") or normalized.get("file_name") or item.get("n") or ""
         )
         size_value = (
-            normalized.get("size")
-            or normalized.get("file_size")
-            or item.get("s")
-            or 0
+            normalized.get("size") or normalized.get("file_size") or item.get("s") or 0
         )
         try:
             size = int(size_value)
@@ -345,13 +337,17 @@ class ShareResolver:
         """
         config = self.config_provider()
         extensions = {
-            extension.strip().lower()
-            if extension.strip().startswith(".")
-            else f".{extension.strip().lower()}"
+            (
+                extension.strip().lower()
+                if extension.strip().startswith(".")
+                else f".{extension.strip().lower()}"
+            )
             for extension in str(
                 config.get("video_extensions")
                 or ",".join(sorted(DEFAULT_VIDEO_EXTENSIONS))
-            ).replace("，", ",").split(",")
+            )
+            .replace("，", ",")
+            .split(",")
             if extension.strip()
         }
         max_files = min(max(int(config.get("share_max_files") or 5000), 1), 50000)
@@ -535,9 +531,7 @@ class ShareResolver:
                             retryable=False,
                         )
                 else:
-                    target_file_id = str(
-                        resource.get("resolved_file_id") or ""
-                    ).strip()
+                    target_file_id = str(resource.get("resolved_file_id") or "").strip()
                     if not target_file_id:
                         selected = self.choose_movie_file(
                             self.list_video_files(resource["share_url"])
@@ -556,7 +550,7 @@ class ShareResolver:
                     user_agent,
                 )
             except ShareResolutionError as error:
-                status = "share_error" if not error.retryable else "ready"
+                status = "invalid_share" if not error.retryable else "ready"
                 self.store.update_resource_status(resource_id, status, str(error))
                 logger.warning(f"115 分享资源解析失败：{resource_id} - {str(error)}")
                 raise

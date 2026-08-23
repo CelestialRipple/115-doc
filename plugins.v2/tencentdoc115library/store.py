@@ -214,13 +214,13 @@ class CatalogStore:
                 UPDATE resource
                 SET strm_status = CASE
                         WHEN status = 'ready' OR strm_path IS NOT NULL THEN 'ready'
-                        WHEN status IN ('share_error', 'build_error') THEN 'failed'
+                        WHEN status IN ('invalid_share', 'share_error', 'build_error') THEN 'failed'
                         ELSE strm_status
                     END,
                     scrape_status = CASE
                         WHEN status = 'ready' THEN 'ready'
                         WHEN status = 'metadata_error' THEN 'failed'
-                        WHEN status IN ('share_error', 'build_error') THEN 'blocked'
+                        WHEN status IN ('invalid_share', 'share_error', 'build_error') THEN 'blocked'
                         ELSE scrape_status
                     END
                 WHERE strm_status = 'pending' AND scrape_status = 'pending'
@@ -246,6 +246,22 @@ class CatalogStore:
                 "strm_status = 'pending', scrape_status = 'pending', "
                 "last_error = 'MoviePilot 重启，已恢复到待生成队列', updated_at = ? "
                 "WHERE status = 'processing'",
+                (utc_now(),),
+            )
+            connection.execute(
+                """
+                UPDATE resource
+                SET status = 'invalid_share', updated_at = ?
+                WHERE status = 'share_error'
+                  AND (
+                    last_error LIKE '%访问码错误%'
+                    OR last_error LIKE '%密码错误%'
+                    OR last_error LIKE '%分享已失效%'
+                    OR last_error LIKE '%分享无效%'
+                    OR last_error LIKE '%无法从资源链接中识别%'
+                    OR last_error LIKE '%未发现可播放视频%'
+                  )
+                """,
                 (utc_now(),),
             )
 
@@ -703,7 +719,7 @@ class CatalogStore:
         status_clause = (
             "AND status = 'ready'"
             if ready_only
-            else ("AND status NOT IN ('removed', 'share_error')")
+            else ("AND status NOT IN ('removed', 'invalid_share', 'share_error')")
         )
         query = f"""
             SELECT * FROM resource
@@ -968,7 +984,8 @@ class CatalogStore:
                 f"UPDATE resource SET status = 'pending', "
                 f"strm_status = 'pending', scrape_status = 'pending', "
                 f"last_error = NULL, "
-                f"updated_at = ? WHERE resource_id IN ({placeholders})",
+                f"updated_at = ? WHERE resource_id IN ({placeholders}) "
+                f"AND status <> 'invalid_share'",
                 (utc_now(), *resource_ids),
             )
         return int(cursor.rowcount)

@@ -111,6 +111,23 @@ def test_parser_recognizes_headers_and_share_link() -> None:
     assert resource["group_name"] == "电影合集"
 
 
+def test_parser_prioritizes_share_path_across_alternate_domains() -> None:
+    resource = CatalogParser.parse_row(
+        sheet_id="sheet-a",
+        sheet_title="星火4K全站资源",
+        group_name="星火",
+        row_number=2,
+        row=[
+            "龙虎金刚",
+            "https://example.com/details/123",
+            "https://115cdn.com/s/swsbevb3hkk?password=sk4k&",
+        ],
+        header_map={"title": 0, "share_url": 1},
+    )
+    assert resource is not None
+    assert resource["share_url"] == ("https://115cdn.com/s/swsbevb3hkk?password=sk4k&")
+
+
 def test_tencent_range_limits_never_exceed_cell_limit() -> None:
     assert TencentDocumentClient.safe_page_rows(1000, 6) == 1000
     assert TencentDocumentClient.safe_page_rows(1000, 20) == 500

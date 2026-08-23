@@ -152,3 +152,14 @@ def test_build_progress_is_visible_and_all_failures_can_be_requeued(
     assert resource["strm_status"] == "pending"
     assert resource["scrape_status"] == "pending"
     assert resource["last_error"] is None
+
+    store.update_resource_status(
+        "resource-1",
+        "invalid_share",
+        "115 分享访问码错误",
+        strm_status="failed",
+        scrape_status="blocked",
+    )
+    assert store.retry_all_failed_resources() == 0
+    assert store.retry_resources(["resource-1"]) == 0
+    assert store.get_resource("resource-1")["status"] == "invalid_share"

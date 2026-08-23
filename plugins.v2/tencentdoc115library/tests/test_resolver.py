@@ -11,6 +11,14 @@ def test_parse_share_url_with_password() -> None:
     assert receive_code == "wxyz"
 
 
+def test_parse_share_url_accepts_115_alternate_domains() -> None:
+    share_code, receive_code = ShareResolver.parse_share_url(
+        "https://115cdn.com/s/swsbevb3hkk?password=sk4k&"
+    )
+    assert share_code == "swsbevb3hkk"
+    assert receive_code == "sk4k"
+
+
 def test_parse_invalid_share_url_reports_honest_error() -> None:
     with pytest.raises(ShareResolutionError, match="无法.*分享码"):
         ShareResolver.parse_share_url("https://example.com/not-a-share")
@@ -46,9 +54,7 @@ def test_share_listing_is_anonymous_and_does_not_load_cookie() -> None:
         },
     }
 
-    files = resolver.list_video_files(
-        "https://115.com/s/anonymous-test?password=abcd"
-    )
+    files = resolver.list_video_files("https://115.com/s/anonymous-test?password=abcd")
 
     assert files[0]["file_id"] == "123"
     assert files[0]["file_name"] == "电影.mkv"

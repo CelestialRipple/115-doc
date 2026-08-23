@@ -187,7 +187,7 @@ def main() -> None:
         invalid_build = plugin._builder.build(limit=1)
         assert invalid_build["failed"] == 1
         invalid_resource = store.get_resource("smoke-resource")
-        assert invalid_resource["status"] == "share_error"
+        assert invalid_resource["status"] == "invalid_share"
         assert invalid_resource["strm_status"] == "failed"
         assert invalid_resource["scrape_status"] == "blocked"
         assert not list(output_root.rglob("*.strm"))
@@ -209,7 +209,12 @@ def main() -> None:
                 "file_size": 1000,
             },
         ]
-        store.retry_resources(["smoke-resource"])
+        store.update_resource_status(
+            "smoke-resource",
+            "pending",
+            strm_status="pending",
+            scrape_status="pending",
+        )
         plugin._resolver.list_video_files = lambda _share_url: movie_files
         plugin._builder._recognize = lambda *_args, **_kwargs: (
             object(),

@@ -537,9 +537,10 @@ class LibraryBuilder:
                     success_count += 1
                     logger.info(f"STRM 资源生成完成：{resource['title']}")
                 except ShareResolutionError as error:
+                    share_status = "share_error" if error.retryable else "invalid_share"
                     self.store.update_resource_status(
                         resource["resource_id"],
-                        "share_error",
+                        share_status,
                         str(error),
                         strm_status="failed",
                         scrape_status="blocked",

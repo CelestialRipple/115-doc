@@ -79,7 +79,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.5.0"
+    plugin_version = "0.5.1"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -1109,6 +1109,7 @@ class TencentDoc115Library(_PluginBase):
             "processing": "处理中",
             "ready": "全部完成",
             "share_error": "分享错误",
+            "invalid_share": "无效分享（不再重试）",
             "metadata_error": "刮削错误",
             "build_error": "生成错误",
             "removed": "已移除",

@@ -3,6 +3,7 @@ import json
 import re
 from threading import Event, Lock
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 try:
     from app.sdk.logging import logger
@@ -11,7 +12,6 @@ except ImportError:
 
 from .client import TencentDocumentClient, TencentDocumentError, looks_like_url
 from .store import CatalogStore
-
 
 HEADER_ALIASES = {
     "title": {"影片名称", "电影名称", "影视名称", "名称", "片名", "标题"},
@@ -133,11 +133,20 @@ class CatalogParser:
     @staticmethod
     def _extract_share_url(value: str, row: List[str]) -> str:
         candidates = [value, *row]
+        urls = []
         for candidate in candidates:
-            match = re.search(r"https?://[^\s\]）)}>,，]+", str(candidate or ""))
-            if match:
-                return match.group(0).rstrip(".。")
-        return ""
+            urls.extend(
+                match.group(0).rstrip(".。")
+                for match in re.finditer(
+                    r"https?://[^\s\]）)}>,，]+",
+                    str(candidate or ""),
+                    re.IGNORECASE,
+                )
+            )
+        for url in urls:
+            if re.search(r"/(?:s|share)/[^/?#&]+", urlsplit(url).path, re.IGNORECASE):
+                return url
+        return urls[0] if urls else ""
 
     @staticmethod
     def _resource_id(sheet_id: str, title: str, version: str, share_url: str) -> str:
@@ -300,9 +309,7 @@ class CatalogSynchronizer:
                     }
                 )
         self.store.upsert_sheets(sheets)
-        self.store.disable_missing_sheets(
-            {str(sheet["sheet_id"]) for sheet in sheets}
-        )
+        self.store.disable_missing_sheets({str(sheet["sheet_id"]) for sheet in sheets})
         config_changed = False
         for sheet in sheets:
             key = sheet_config_key(sheet["sheet_id"])
@@ -364,9 +371,7 @@ class CatalogSynchronizer:
                 sheets = self.store.list_sheets(enabled_only=True)
             else:
                 sheets = [
-                    sheet
-                    for sheet in sheets
-                    if sheet.get("scan_status") != "completed"
+                    sheet for sheet in sheets if sheet.get("scan_status") != "completed"
                 ]
             client = self.client_factory()
             page_limit = max_pages or int(config.get("pages_per_run") or 5)
@@ -383,9 +388,7 @@ class CatalogSynchronizer:
                     sheet.get("used_row_count") or sheet.get("row_count") or 0
                 )
                 column_count = int(
-                    sheet.get("used_column_count")
-                    or sheet.get("column_count")
-                    or 6
+                    sheet.get("used_column_count") or sheet.get("column_count") or 6
                 )
                 column_count = min(max(column_count, 1), max_columns)
                 while not self.stop_event.is_set():
@@ -399,7 +402,9 @@ class CatalogSynchronizer:
                             "processed_rows": processed_rows,
                         }
                     page = client.get_range(
-                        file_id=str(sheet.get("file_id") or config.get("file_id") or ""),
+                        file_id=str(
+                            sheet.get("file_id") or config.get("file_id") or ""
+                        ),
                         sheet_id=str(sheet.get("remote_sheet_id") or current_sheet_id),
                         start_row=current_row,
                         row_count=requested_rows,
@@ -426,7 +431,9 @@ class CatalogSynchronizer:
                         if resource:
                             resources.append(resource)
                     next_row = current_row + int(page["requested_rows"])
-                    source_row_count = max(len(rows) - (1 if current_row == 1 else 0), 0)
+                    source_row_count = max(
+                        len(rows) - (1 if current_row == 1 else 0), 0
+                    )
                     self.store.save_page(
                         sheet_id=current_sheet_id,
                         scan_id=scan_id,
