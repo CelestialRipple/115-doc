@@ -94,6 +94,22 @@ docker run -d \
 
 进入插件市场安装“腾讯文档115媒体库”。建议先把插件的 STRM 输出目录设为 `/media/tencentdoc115`，并设置一个保守的空间上限；在 MoviePilot 中把下载器监控下载目录设为 `/media/downloads`，整理媒体目录设为 `/media/library`。只选择一个小工作表，按“发现工作表 → 继续同步 → 生成下一批”的顺序验证；确认后再勾选其他工作表并使用“同步全部并生成”。
 
+## Unraid 与 Emby 路径示例
+
+如果 MoviePilot 已有宿主机 `/mnt/user/data` 到容器 `/data` 的映射，可直接这样配置：
+
+- 插件“STRM/元数据输出目录”：`/data/tencentdoc115`
+- 宿主机实际目录：`/mnt/user/data/tencentdoc115`
+- 插件“Emby 可访问的 MoviePilot 地址”：`http://UNRAID局域网IP:MoviePilot映射端口`，不能使用 `127.0.0.1`
+
+在 Emby 容器中新增一条只读路径映射：
+
+| Emby 宿主机路径 | Emby 容器路径 | 权限 |
+| --- | --- | --- |
+| `/mnt/user/data/tencentdoc115` | `/media/tencentdoc115` | Read Only |
+
+然后在 Emby 中建立媒体库：电影库可加入 `/media/tencentdoc115/电影合集`、`/media/tencentdoc115/星火` 和 `/media/tencentdoc115/蚂蚁`；电视剧库加入 `/media/tencentdoc115/剧集`。如果在插件中使用了自定义分组名称，则按实际生成的子目录添加。
+
 ## 尚未包含在首个版本中的功能
 
 - 自动清理改分组或移除资源后遗留的旧 STRM/NFO 目录。

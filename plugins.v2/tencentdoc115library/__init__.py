@@ -73,7 +73,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
     plugin_version = "0.2.0"
     plugin_author = "Codex"
-    author_url = "https://github.com/"
+    author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
     plugin_order = 25
     auth_level = 1
