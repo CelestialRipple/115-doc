@@ -110,3 +110,23 @@ def test_local_search_defaults_to_ready_resources(tmp_path: Path) -> None:
 
     results = store.search_resources("测试")
     assert [item["resource_id"] for item in results] == ["resource-1"]
+
+
+def test_known_v2_signature_errors_can_be_requeued_automatically(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page(
+        "sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99
+    )
+    store.update_resource_status(
+        "resource-1",
+        "build_error",
+        "MediaChain.recognize_by_meta() got an unexpected keyword argument 'mtype'",
+    )
+
+    assert store.retry_errors_containing("unexpected keyword argument 'mtype'") == 1
+    resource = store.get_resource("resource-1")
+    assert resource["status"] == "pending"
+    assert resource["last_error"] is None

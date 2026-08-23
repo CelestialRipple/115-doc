@@ -80,7 +80,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步多个腾讯文档，使用 MoviePilot 刮削并按需解析 115 分享。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -122,6 +122,11 @@ class TencentDoc115Library(_PluginBase):
         self._enabled = bool(self._config.get("enabled"))
         data_path = self.get_data_path()
         self._store = CatalogStore(data_path / "catalog.db")
+        retried = self._store.retry_errors_containing(
+            "unexpected keyword argument 'mtype'"
+        )
+        if retried:
+            logger.info(f"已自动重新排队 {retried} 条 V2 识别接口兼容失败资源")
         self._resolver = ShareResolver(
             store=self._store,
             config_provider=self._current_config,

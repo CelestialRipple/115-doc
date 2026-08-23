@@ -925,6 +925,19 @@ class CatalogStore:
             )
         return int(cursor.rowcount)
 
+    def retry_errors_containing(self, message_fragment: str) -> int:
+        """把由已知插件兼容错误造成的失败资源自动重新加入队列。"""
+        fragment = str(message_fragment or "").strip()
+        if not fragment:
+            return 0
+        with self._lock, self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE resource SET status = 'pending', last_error = NULL, "
+                "updated_at = ? WHERE status = 'build_error' AND last_error LIKE ?",
+                (utc_now(), f"%{fragment}%"),
+            )
+        return int(cursor.rowcount)
+
     def status_snapshot(self) -> Dict[str, Any]:
         """
         生成插件状态摘要

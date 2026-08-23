@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
@@ -12,7 +13,7 @@ from tencentdoc115library import TencentDoc115Library
 from tencentdoc115library.download_marker import parse_download_marker
 from tencentdoc115library import library as library_module
 from app.plugins import _PluginBase
-from app.schemas.types import TorrentStatus
+from app.schemas.types import MediaType, TorrentStatus
 
 
 def main() -> None:
@@ -55,6 +56,30 @@ def main() -> None:
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()
         (output_root / "usage.bin").write_bytes(b"12")
+
+        original_media_chain = library_module.MediaChain
+        original_meta_info = library_module.MetaInfo
+
+        class LegacyMediaChain:
+            @staticmethod
+            def recognize_by_meta(metainfo, obtain_images=False):
+                assert obtain_images is True
+                return SimpleNamespace(type=metainfo.type)
+
+        library_module.MediaChain = LegacyMediaChain
+        library_module.MetaInfo = lambda title, subtitle=None: SimpleNamespace(
+            title=title,
+            subtitle=subtitle,
+            year=None,
+            type=None,
+        )
+        _, recognized = plugin._builder._recognize(
+            {"title": "兼容测试", "year": "2024", "version": ""},
+            MediaType.MOVIE,
+        )
+        assert recognized.type == MediaType.MOVIE
+        library_module.MediaChain = original_media_chain
+        library_module.MetaInfo = original_meta_info
 
         original_scraping_chain = library_module.ScrapingChain
 

@@ -1,5 +1,6 @@
 import os
 import re
+from inspect import signature
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -93,11 +94,17 @@ class LibraryBuilder:
         meta = MetaInfo(title=title, subtitle=version or None)
         meta.year = str(resource.get("year") or "").strip() or None
         meta.type = media_type
-        mediainfo = MediaChain().recognize_by_meta(
-            metainfo=meta,
-            mtype=media_type,
-            obtain_images=True,
-        )
+        recognize_method = MediaChain().recognize_by_meta
+        recognize_kwargs: Dict[str, Any] = {
+            "metainfo": meta,
+            "obtain_images": True,
+        }
+        try:
+            if "mtype" in signature(recognize_method).parameters:
+                recognize_kwargs["mtype"] = media_type
+        except (TypeError, ValueError):
+            pass
+        mediainfo = recognize_method(**recognize_kwargs)
         if not mediainfo:
             raise LibraryBuildError(
                 f"MoviePilot 未识别到媒体：{title}"
