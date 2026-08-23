@@ -78,9 +78,9 @@ class TencentDoc115Library(_PluginBase):
     """将腾讯文档中的 115 分享资源构建为可按需播放的媒体库。"""
 
     plugin_name = "腾讯文档115媒体库"
-    plugin_desc = "同步多个腾讯文档，使用 MoviePilot 刮削并按需解析 115 分享。"
+    plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.3.1"
+    plugin_version = "0.4.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"

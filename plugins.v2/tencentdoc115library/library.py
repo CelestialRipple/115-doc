@@ -26,8 +26,64 @@ from .resolver import ShareResolutionError, ShareResolver
 from .storage_limit import configured_limit_bytes, directory_size
 from .store import CatalogStore
 
-
 INVALID_PATH_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+TV_TYPE_KEYWORDS = ("电视剧", "剧集", "连续剧", "tv", "番剧")
+CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+SEASON_PATTERNS = (
+    re.compile(
+        r"(?<![A-Za-z0-9])S(?P<season>\d{1,2})"
+        r"(?:[ ._-]*E(?P<episode>\d{1,4}))?(?!\d)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<![A-Za-z])Season[ ._-]*(?P<season>\d{1,2})(?!\d)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"第\s*(?P<season>[零〇一二三四五六七八九十百两\d]+)\s*季"),
+)
+EPISODE_PATTERNS = (
+    re.compile(
+        r"(?<![A-Za-z0-9])(?:E|EP|Episode)[ ._-]*(?P<episode>\d{1,4})(?!\d)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"第\s*(?P<episode>[零〇一二三四五六七八九十百两\d]+)\s*[集话]"),
+)
+
+
+def chinese_number(value: str) -> Optional[int]:
+    """把常见的中文集数、季数转换为整数。"""
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    if "百" in value:
+        left, right = value.split("百", 1)
+        hundreds = CHINESE_DIGITS.get(left, 1) if left else 1
+        remainder = chinese_number(right) if right else 0
+        return hundreds * 100 + (remainder or 0)
+    if "十" in value:
+        left, right = value.split("十", 1)
+        tens = CHINESE_DIGITS.get(left, 1) if left else 1
+        units = CHINESE_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + units
+    digits = [CHINESE_DIGITS.get(character) for character in value]
+    if any(digit is None for digit in digits):
+        return None
+    return int("".join(str(digit) for digit in digits))
 
 
 def safe_path_segment(value: str, fallback: str = "未命名") -> str:
@@ -52,7 +108,7 @@ class LibraryBuilder:
     """
     把目录记录限量生成为本地 STRM 和 MoviePilot 元数据
 
-    电影不会在生成阶段访问 115，电视剧为了建立集列表会在此阶段展开单条分享
+    电影和电视剧都会先匿名展开 115 分享；播放取直链时才使用用户 Cookie
     """
 
     def __init__(
@@ -77,15 +133,31 @@ class LibraryBuilder:
         self._run_lock = Lock()
 
     @staticmethod
-    def _media_type(resource: Dict[str, Any]) -> MediaType:
+    def _media_type(
+        resource: Dict[str, Any],
+        source_files: Optional[List[Dict[str, Any]]] = None,
+    ) -> MediaType:
         raw_type = str(resource.get("media_type") or "").lower()
         group_name = str(resource.get("group_name") or "").lower()
         if any(
-            keyword in raw_type or keyword in group_name
-            for keyword in ("电视剧", "剧集", "连续剧", "tv", "番剧")
+            keyword in raw_type or keyword in group_name for keyword in TV_TYPE_KEYWORDS
+        ):
+            return MediaType.TV
+        if source_files and any(
+            LibraryBuilder._looks_like_tv_path(
+                str(source_file.get("file_path") or source_file.get("file_name") or "")
+            )
+            for source_file in source_files
         ):
             return MediaType.TV
         return MediaType.MOVIE
+
+    @staticmethod
+    def _looks_like_tv_path(value: str) -> bool:
+        """判断完整分享路径是否包含季、集标记。"""
+        return any(pattern.search(value) for pattern in SEASON_PATTERNS) or any(
+            pattern.search(value) for pattern in EPISODE_PATTERNS
+        )
 
     @staticmethod
     def _recognize(resource: Dict[str, Any], media_type: MediaType) -> Tuple[Any, Any]:
@@ -111,7 +183,9 @@ class LibraryBuilder:
                 + (f" ({meta.year})" if meta.year else "")
             )
         if mediainfo.type not in {MediaType.MOVIE, MediaType.TV}:
-            raise LibraryBuildError(f"MoviePilot 返回了不支持的媒体类型：{mediainfo.type}")
+            raise LibraryBuildError(
+                f"MoviePilot 返回了不支持的媒体类型：{mediainfo.type}"
+            )
         return meta, mediainfo
 
     @staticmethod
@@ -217,35 +291,66 @@ class LibraryBuilder:
         meta: Any,
         mediainfo: Any,
         directory: Optional[Path] = None,
+        source_files: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
+        if source_files is None:
+            source_files = self.resolver.list_video_files(resource["share_url"])
+        selected_file = self.resolver.choose_movie_file(source_files)
         directory = directory or self._base_directory(resource, mediainfo)
         base_name = self._media_directory_name(resource, mediainfo)
         version = safe_path_segment(str(resource.get("version") or ""), "")
         filename = f"{base_name} - {version}.strm" if version else f"{base_name}.strm"
         strm_path = directory / filename
-        self._write_strm(strm_path, self._play_url(resource["resource_id"]))
+        self._write_strm(
+            strm_path,
+            self._play_url(resource["resource_id"], selected_file["file_id"]),
+        )
+        self.store.replace_resource_files(
+            resource["resource_id"],
+            [{**selected_file, "strm_path": str(strm_path)}],
+        )
         self._scrape(directory, meta, mediainfo)
         return str(strm_path)
 
     @staticmethod
-    def _episode_identity(file_name: str) -> Tuple[Optional[int], Optional[int]]:
+    def _episode_identity(
+        file_name: str,
+        file_path: str = "",
+    ) -> Tuple[Optional[int], Optional[int]]:
         meta = MetaInfo(file_name)
         season = meta.begin_season
         episode = meta.begin_episode
+        identity_text = str(file_path or file_name)
+        for pattern in SEASON_PATTERNS:
+            match = pattern.search(identity_text)
+            if not match:
+                continue
+            parsed_season = chinese_number(match.group("season"))
+            season = parsed_season or season
+            if match.groupdict().get("episode"):
+                episode = int(match.group("episode"))
+            break
         if episode is None:
-            match = re.search(
-                r"(?:S(?P<season>\d{1,2})[ ._-]*)?E(?P<episode>\d{1,4})",
-                file_name,
+            for pattern in EPISODE_PATTERNS:
+                match = pattern.search(identity_text)
+                if match:
+                    episode = chinese_number(match.group("episode"))
+                    break
+        if episode is None and season is not None:
+            bare_episode = re.fullmatch(
+                r"(?:EP?|Episode)?[ ._-]*(\d{1,4})",
+                Path(file_name).stem,
                 re.IGNORECASE,
             )
-            if match:
-                season = int(match.group("season") or 1)
-                episode = int(match.group("episode"))
-        if episode is None:
-            match = re.search(r"第\s*(\d{1,4})\s*[集话]", file_name)
-            if match:
-                season = season or 1
-                episode = int(match.group(1))
+            if bare_episode:
+                episode = int(bare_episode.group(1))
+        season_only_file = any(pattern.search(file_name) for pattern in SEASON_PATTERNS)
+        if (
+            episode is None
+            and season is not None
+            and (season_only_file or Path(file_name).suffix.lower() == ".iso")
+        ):
+            episode = 1
         return season or (1 if episode is not None else None), episode
 
     def _build_tv(
@@ -254,14 +359,19 @@ class LibraryBuilder:
         meta: Any,
         mediainfo: Any,
         directory: Optional[Path] = None,
+        source_files: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         directory = directory or self._base_directory(resource, mediainfo)
-        source_files = self.resolver.list_video_files(resource["share_url"])
+        if source_files is None:
+            source_files = self.resolver.list_video_files(resource["share_url"])
         expanded_files: List[Dict[str, Any]] = []
         unrecognized_files = []
         media_name = self._media_directory_name(resource, mediainfo)
         for source_file in source_files:
-            season, episode = self._episode_identity(source_file["file_name"])
+            season, episode = self._episode_identity(
+                source_file["file_name"],
+                str(source_file.get("file_path") or ""),
+            )
             if episode is None:
                 unrecognized_files.append(source_file["file_name"])
                 continue
@@ -359,7 +469,8 @@ class LibraryBuilder:
                 directory: Optional[Path] = None
                 directory_size_before = 0
                 try:
-                    media_type = self._media_type(resource)
+                    source_files = self.resolver.list_video_files(resource["share_url"])
+                    media_type = self._media_type(resource, source_files)
                     meta, mediainfo = self._recognize(resource, media_type)
                     directory = self._base_directory(resource, mediainfo)
                     directory_size_before = directory_size(directory)
@@ -369,6 +480,7 @@ class LibraryBuilder:
                             meta,
                             mediainfo,
                             directory=directory,
+                            source_files=source_files,
                         )
                     else:
                         output_path = self._build_movie(
@@ -376,6 +488,7 @@ class LibraryBuilder:
                             meta,
                             mediainfo,
                             directory=directory,
+                            source_files=source_files,
                         )
                     self.store.update_resource_status(
                         resource["resource_id"],
@@ -399,7 +512,7 @@ class LibraryBuilder:
                     )
                     failed_count += 1
                     logger.warning(
-                        f"电视剧分享展开失败：{resource['title']} - {str(error)}"
+                        f"115 分享校验失败：{resource['title']} - {str(error)}"
                     )
                 except LibraryBuildError as error:
                     error_status = (

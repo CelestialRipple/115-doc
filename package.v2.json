@@ -3,11 +3,12 @@
         "name": "腾讯文档115媒体库",
         "description": "同步多个腾讯文档中的115分享资源，支持断点、一键后台同步、空间上限、MoviePilot刮削、按需播放和原生检索下载",
         "labels": "媒体库,115网盘,STRM,直链下载",
-        "version": "0.3.1",
+        "version": "0.4.0",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.4.0": "电影和剧集构建前均匿名校验并展开 115 分享；根据完整文件路径识别 SxxExx、Sxx、Season 和中文季集名称，无效分享跳过 STRM",
             "v0.3.1": "兼容 MoviePilot V2 的 recognize_by_meta 方法签名，并自动重新排队受该错误影响的资源",
             "v0.3.0": "兼容 MoviePilot V2 旧模块接口；支持配置多个腾讯文档，并以“文档别名（工作表名）”区分工作表",
             "v0.2.0": "增加同步全部并生成后台流水线、安全停止按钮，以及 STRM/NFO/图片输出目录空间上限",

@@ -5,13 +5,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from tencentdoc115library import TencentDoc115Library
 from tencentdoc115library.download_marker import parse_download_marker
 from tencentdoc115library import library as library_module
+from tencentdoc115library.resolver import ShareResolutionError
 from app.plugins import _PluginBase
 from app.schemas.types import MediaType, TorrentStatus
 
@@ -81,6 +81,36 @@ def main() -> None:
         library_module.MediaChain = original_media_chain
         library_module.MetaInfo = original_meta_info
 
+        assert (
+            plugin._builder._media_type(
+                {"media_type": "电影", "group_name": "电影合集"},
+                [{"file_path": "/某剧/Show.S01E02.mkv"}],
+            )
+            == MediaType.TV
+        )
+        assert (
+            plugin._builder._media_type(
+                {"media_type": "", "group_name": "未分类"},
+                [{"file_path": "/普通电影/普通电影.2024.mkv"}],
+            )
+            == MediaType.MOVIE
+        )
+        library_module.MetaInfo = lambda _title: SimpleNamespace(
+            begin_season=None,
+            begin_episode=None,
+        )
+        assert plugin._builder._episode_identity("02.mkv", "/某剧/第一季/02.mkv") == (
+            1,
+            2,
+        )
+        assert plugin._builder._episode_identity(
+            "Show.S02.iso", "/某剧/Show.S02.iso"
+        ) == (2, 1)
+        assert plugin._builder._episode_identity(
+            "某剧 第一季.mkv", "/某剧/某剧 第一季.mkv"
+        ) == (1, 1)
+        library_module.MetaInfo = original_meta_info
+
         original_scraping_chain = library_module.ScrapingChain
 
         class LegacyScrapingChain:
@@ -92,7 +122,7 @@ def main() -> None:
         plugin._builder._scrape(output_root, object(), object())
         library_module.ScrapingChain = original_scraping_chain
 
-        plugin._config["output_size_limit_gb"] = 1 / (1024 ** 3)
+        plugin._config["output_size_limit_gb"] = 1 / (1024**3)
         limited_build = plugin._builder.build()
         assert limited_build["status"] == "space_limit"
         assert limited_build["processed"] == 0
@@ -136,6 +166,53 @@ def main() -> None:
             ],
             1,
         )
+
+        original_list_video_files = plugin._resolver.list_video_files
+        original_recognize = plugin._builder._recognize
+
+        def invalid_share(_share_url):
+            raise ShareResolutionError(
+                "115 分享无效或访问码错误",
+                status_code=404,
+                retryable=False,
+            )
+
+        plugin._resolver.list_video_files = invalid_share
+        plugin._builder._recognize = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("无效分享不应进入媒体识别")
+        )
+        invalid_build = plugin._builder.build(limit=1)
+        assert invalid_build["failed"] == 1
+        assert store.get_resource("smoke-resource")["status"] == "share_error"
+        assert not list(output_root.rglob("*.strm"))
+        plugin._resolver.list_video_files = original_list_video_files
+        plugin._builder._recognize = original_recognize
+
+        resource = store.get_resource("smoke-resource")
+        original_scrape = plugin._builder._scrape
+        plugin._builder._scrape = lambda *_args, **_kwargs: None
+        movie_path = plugin._builder._build_movie(
+            resource,
+            object(),
+            SimpleNamespace(title="测试电影", year="2024"),
+            source_files=[
+                {
+                    "file_id": "small",
+                    "file_name": "花絮.mp4",
+                    "file_path": "/花絮.mp4",
+                    "file_size": 100,
+                },
+                {
+                    "file_id": "main",
+                    "file_name": "测试电影.mkv",
+                    "file_path": "/测试电影.mkv",
+                    "file_size": 1000,
+                },
+            ],
+        )
+        plugin._builder._scrape = original_scrape
+        assert "file_id=main" in Path(movie_path).read_text(encoding="utf-8")
+        assert store.get_resource_file("smoke-resource", "main")
         store.update_resource_status(
             "smoke-resource",
             "ready",
@@ -172,10 +249,13 @@ def main() -> None:
             "smoke-task",
             downloader="腾讯文档115直链",
         )
-        assert module["list_torrents"](
-            status=TorrentStatus.TRANSFER,
-            downloader="腾讯文档115直链",
-        ) == []
+        assert (
+            module["list_torrents"](
+                status=TorrentStatus.TRANSFER,
+                downloader="腾讯文档115直链",
+            )
+            == []
+        )
 
         class FakeSynchronizer:
             calls = 0
