@@ -1,0 +1,15 @@
+{
+    "TencentDoc115Library": {
+        "name": "腾讯文档115媒体库",
+        "description": "分页同步腾讯文档中的115分享资源，支持一键后台同步、空间上限、MoviePilot刮削、按需播放和原生检索下载",
+        "labels": "媒体库,115网盘,STRM,直链下载",
+        "version": "0.2.0",
+        "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
+        "author": "Codex",
+        "level": 1,
+        "history": {
+            "v0.2.0": "增加同步全部并生成后台流水线、安全停止按钮，以及 STRM/NFO/图片输出目录空间上限",
+            "v0.1.0": "首个开发版本：工作表分组、分页同步、SQLite断点、限量构建、按需播放和原生检索下载"
+        }
+    }
+}
