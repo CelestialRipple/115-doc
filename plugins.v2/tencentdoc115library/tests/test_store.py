@@ -32,9 +32,7 @@ def _store(tmp_path: Path) -> CatalogStore:
             }
         ]
     )
-    store.configure_sheets(
-        {"sheet-1": {"enabled": True, "group_name": "电影合集"}}
-    )
+    store.configure_sheets({"sheet-1": {"enabled": True, "group_name": "电影合集"}})
     return store
 
 
@@ -60,9 +58,7 @@ def test_completed_scan_marks_missing_rows_removed_and_can_restore_them(
 ) -> None:
     store = _store(tmp_path)
     first = store.begin_sheet_scan("sheet-1")
-    store.save_page(
-        "sheet-1", first["scan_id"], 101, {}, [_resource()], 99
-    )
+    store.save_page("sheet-1", first["scan_id"], 101, {}, [_resource()], 99)
     store.complete_sheet_scan("sheet-1", first["scan_id"])
 
     second = store.begin_sheet_scan("sheet-1")
@@ -71,9 +67,7 @@ def test_completed_scan_marks_missing_rows_removed_and_can_restore_them(
     assert store.get_resource("resource-1")["status"] == "removed"
 
     third = store.begin_sheet_scan("sheet-1")
-    store.save_page(
-        "sheet-1", third["scan_id"], 101, {}, [_resource()], 99
-    )
+    store.save_page("sheet-1", third["scan_id"], 101, {}, [_resource()], 99)
     store.complete_sheet_scan("sheet-1", third["scan_id"])
     assert store.get_resource("resource-1")["status"] == "pending"
 
@@ -81,9 +75,7 @@ def test_completed_scan_marks_missing_rows_removed_and_can_restore_them(
 def test_group_change_requeues_existing_resource(tmp_path: Path) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")
-    store.save_page(
-        "sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99
-    )
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
     store.update_resource_status(
         "resource-1", "ready", strm_path="/old/group/movie.strm"
     )
@@ -97,9 +89,7 @@ def test_group_change_requeues_existing_resource(tmp_path: Path) -> None:
 def test_local_search_defaults_to_ready_resources(tmp_path: Path) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")
-    store.save_page(
-        "sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99
-    )
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
     assert store.search_resources("测试电影") == []
 
     store.update_resource_status(
@@ -117,9 +107,7 @@ def test_known_v2_signature_errors_can_be_requeued_automatically(
 ) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")
-    store.save_page(
-        "sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99
-    )
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
     store.update_resource_status(
         "resource-1",
         "build_error",
@@ -129,4 +117,38 @@ def test_known_v2_signature_errors_can_be_requeued_automatically(
     assert store.retry_errors_containing("unexpected keyword argument 'mtype'") == 1
     resource = store.get_resource("resource-1")
     assert resource["status"] == "pending"
+    assert resource["last_error"] is None
+
+
+def test_build_progress_is_visible_and_all_failures_can_be_requeued(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+    store.update_resource_status(
+        "resource-1",
+        "processing",
+        strm_status="ready",
+        scrape_status="scraping",
+        strm_path="/media/movie.strm",
+    )
+
+    snapshot = store.status_snapshot()
+    assert snapshot["strm_counts"] == {"ready": 1}
+    assert snapshot["scrape_counts"] == {"scraping": 1}
+    assert snapshot["current_resources"][0]["title"] == "测试电影"
+
+    store.update_resource_status(
+        "resource-1",
+        "metadata_error",
+        "TMDB unavailable",
+        strm_status="ready",
+        scrape_status="failed",
+    )
+    assert store.retry_all_failed_resources() == 1
+    resource = store.get_resource("resource-1")
+    assert resource["status"] == "pending"
+    assert resource["strm_status"] == "pending"
+    assert resource["scrape_status"] == "pending"
     assert resource["last_error"] is None

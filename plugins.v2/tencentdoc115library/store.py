@@ -7,8 +7,7 @@ from threading import RLock
 from typing import Any, Dict, Generator, List, Optional, Tuple
 from uuid import uuid4
 
-
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -60,8 +59,7 @@ class CatalogStore:
 
     def _initialize(self) -> None:
         with self._lock, self.connection() as connection:
-            connection.executescript(
-                """
+            connection.executescript("""
                 CREATE TABLE IF NOT EXISTS sheet_state (
                     sheet_id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -98,6 +96,8 @@ class CatalogStore:
                     group_name TEXT NOT NULL,
                     row_hash TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
+                    strm_status TEXT NOT NULL DEFAULT 'pending',
+                    scrape_status TEXT NOT NULL DEFAULT 'pending',
                     last_error TEXT,
                     media_source TEXT,
                     media_id TEXT,
@@ -168,8 +168,7 @@ class CatalogStore:
 
                 CREATE INDEX IF NOT EXISTS idx_direct_download_state
                     ON direct_download_task(state, organized, updated_at);
-                """
-            )
+                """)
             download_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -197,6 +196,35 @@ class CatalogStore:
                     connection.execute(
                         f"ALTER TABLE sheet_state ADD COLUMN {column_name} TEXT"
                     )
+            resource_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(resource)").fetchall()
+            }
+            if "strm_status" not in resource_columns:
+                connection.execute(
+                    "ALTER TABLE resource ADD COLUMN strm_status "
+                    "TEXT NOT NULL DEFAULT 'pending'"
+                )
+            if "scrape_status" not in resource_columns:
+                connection.execute(
+                    "ALTER TABLE resource ADD COLUMN scrape_status "
+                    "TEXT NOT NULL DEFAULT 'pending'"
+                )
+            connection.execute("""
+                UPDATE resource
+                SET strm_status = CASE
+                        WHEN status = 'ready' OR strm_path IS NOT NULL THEN 'ready'
+                        WHEN status IN ('share_error', 'build_error') THEN 'failed'
+                        ELSE strm_status
+                    END,
+                    scrape_status = CASE
+                        WHEN status = 'ready' THEN 'ready'
+                        WHEN status = 'metadata_error' THEN 'failed'
+                        WHEN status IN ('share_error', 'build_error') THEN 'blocked'
+                        ELSE scrape_status
+                    END
+                WHERE strm_status = 'pending' AND scrape_status = 'pending'
+                """)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.execute(
                 "UPDATE sync_run SET status = 'interrupted', finished_at = ? "
@@ -211,6 +239,13 @@ class CatalogStore:
                 "UPDATE direct_download_task SET state = 'paused', "
                 "last_error = 'MoviePilot 重启，可重新点击下载以断点续传', "
                 "updated_at = ? WHERE state IN ('queued', 'downloading')",
+                (utc_now(),),
+            )
+            connection.execute(
+                "UPDATE resource SET status = 'pending', "
+                "strm_status = 'pending', scrape_status = 'pending', "
+                "last_error = 'MoviePilot 重启，已恢复到待生成队列', updated_at = ? "
+                "WHERE status = 'processing'",
                 (utc_now(),),
             )
 
@@ -295,6 +330,7 @@ class CatalogStore:
                 if current and current["group_name"] != group_name:
                     connection.execute(
                         "UPDATE resource SET group_name = ?, status = 'pending', "
+                        "strm_status = 'pending', scrape_status = 'pending', "
                         "strm_path = NULL, last_error = NULL, updated_at = ? "
                         "WHERE sheet_id = ? AND status <> 'removed'",
                         (group_name, utc_now(), sheet_id),
@@ -453,6 +489,8 @@ class CatalogStore:
                         group_name = excluded.group_name,
                         row_hash = excluded.row_hash,
                         status = CASE WHEN ? THEN 'pending' ELSE resource.status END,
+                        strm_status = CASE WHEN ? THEN 'pending' ELSE resource.strm_status END,
+                        scrape_status = CASE WHEN ? THEN 'pending' ELSE resource.scrape_status END,
                         last_error = CASE WHEN ? THEN NULL ELSE resource.last_error END,
                         strm_path = CASE WHEN ? THEN NULL ELSE resource.strm_path END,
                         resolved_file_id = CASE WHEN ? THEN NULL ELSE resource.resolved_file_id END,
@@ -476,6 +514,8 @@ class CatalogStore:
                         scan_id,
                         now,
                         now,
+                        changed,
+                        changed,
                         changed,
                         changed,
                         changed,
@@ -653,13 +693,17 @@ class CatalogStore:
     ) -> List[Dict[str, Any]]:
         """从本地镜像目录搜索资源，不访问腾讯文档或 115。"""
         escaped = (
-            str(keyword or "").strip().replace("\\", "\\\\")
+            str(keyword or "")
+            .strip()
+            .replace("\\", "\\\\")
             .replace("%", "\\%")
             .replace("_", "\\_")
         )
         pattern = f"%{escaped}%"
-        status_clause = "AND status = 'ready'" if ready_only else (
-            "AND status NOT IN ('removed', 'share_error')"
+        status_clause = (
+            "AND status = 'ready'"
+            if ready_only
+            else ("AND status NOT IN ('removed', 'share_error')")
         )
         query = f"""
             SELECT * FROM resource
@@ -824,6 +868,8 @@ class CatalogStore:
             "resolved_file_id",
             "resolved_file_name",
             "resolved_at",
+            "strm_status",
+            "scrape_status",
         }
         updates = ["status = ?", "last_error = ?", "updated_at = ?"]
         parameters: List[Any] = [status, error, utc_now()]
@@ -919,9 +965,25 @@ class CatalogStore:
         placeholders = ",".join("?" for _ in resource_ids)
         with self._lock, self.connection() as connection:
             cursor = connection.execute(
-                f"UPDATE resource SET status = 'pending', last_error = NULL, "
+                f"UPDATE resource SET status = 'pending', "
+                f"strm_status = 'pending', scrape_status = 'pending', "
+                f"last_error = NULL, "
                 f"updated_at = ? WHERE resource_id IN ({placeholders})",
                 (utc_now(), *resource_ids),
+            )
+        return int(cursor.rowcount)
+
+    def retry_all_failed_resources(self) -> int:
+        """把全部生成、分享和刮削失败资源重新加入待生成队列。"""
+        with self._lock, self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE resource
+                SET status = 'pending', strm_status = 'pending',
+                    scrape_status = 'pending', last_error = NULL, updated_at = ?
+                WHERE status IN ('share_error', 'metadata_error', 'build_error')
+                """,
+                (utc_now(),),
             )
         return int(cursor.rowcount)
 
@@ -932,7 +994,9 @@ class CatalogStore:
             return 0
         with self._lock, self.connection() as connection:
             cursor = connection.execute(
-                "UPDATE resource SET status = 'pending', last_error = NULL, "
+                "UPDATE resource SET status = 'pending', "
+                "strm_status = 'pending', scrape_status = 'pending', "
+                "last_error = NULL, "
                 "updated_at = ? WHERE status = 'build_error' AND last_error LIKE ?",
                 (utc_now(), f"%{fragment}%"),
             )
@@ -952,26 +1016,52 @@ class CatalogStore:
                 ).fetchall()
             }
             total_resources = sum(resource_counts.values())
+            active_resources = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM resource WHERE status <> 'removed'"
+                ).fetchone()["count"]
+            )
+            strm_counts = {
+                row["strm_status"]: int(row["count"])
+                for row in connection.execute(
+                    "SELECT strm_status, COUNT(*) AS count FROM resource "
+                    "WHERE status <> 'removed' GROUP BY strm_status"
+                ).fetchall()
+            }
+            scrape_counts = {
+                row["scrape_status"]: int(row["count"])
+                for row in connection.execute(
+                    "SELECT scrape_status, COUNT(*) AS count FROM resource "
+                    "WHERE status <> 'removed' GROUP BY scrape_status"
+                ).fetchall()
+            }
+            current_resources = [dict(row) for row in connection.execute("""
+                    SELECT resource_id, title, group_name, strm_status,
+                           scrape_status, updated_at
+                    FROM resource
+                    WHERE status = 'processing'
+                    ORDER BY updated_at DESC LIMIT 5
+                    """).fetchall()]
             recent_runs = [
                 dict(row)
                 for row in connection.execute(
                     "SELECT * FROM sync_run ORDER BY started_at DESC LIMIT 10"
                 ).fetchall()
             ]
-            recent_errors = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT resource_id, title, year, status, last_error, updated_at
+            recent_errors = [dict(row) for row in connection.execute("""
+                    SELECT resource_id, title, year, status, strm_status,
+                           scrape_status, last_error, updated_at
                     FROM resource
                     WHERE last_error IS NOT NULL AND last_error <> ''
                     ORDER BY updated_at DESC LIMIT 20
-                    """
-                ).fetchall()
-            ]
+                    """).fetchall()]
         return {
             "total_resources": total_resources,
+            "active_resources": active_resources,
             "resource_counts": resource_counts,
+            "strm_counts": strm_counts,
+            "scrape_counts": scrape_counts,
+            "current_resources": current_resources,
             "sheets": self.list_sheets(),
             "recent_runs": recent_runs,
             "recent_errors": recent_errors,

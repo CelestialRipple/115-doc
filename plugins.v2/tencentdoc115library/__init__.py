@@ -35,7 +35,6 @@ from .schemas import BuildActionRequest, ResourceRetryRequest, SyncActionRequest
 from .storage_limit import format_gib
 from .store import CatalogStore
 
-
 DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": False,
     "auto_sync": False,
@@ -80,7 +79,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.4.0"
+    plugin_version = "0.5.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -181,9 +180,7 @@ class TencentDoc115Library(_PluginBase):
             access_token=str(config.get("access_token") or ""),
             client_secret=str(config.get("client_secret") or ""),
             refresh_token=str(config.get("refresh_token") or ""),
-            access_token_expires_at=float(
-                config.get("access_token_expires_at") or 0
-            ),
+            access_token_expires_at=float(config.get("access_token_expires_at") or 0),
             retry_count=int(config.get("request_retries") or 4),
             on_token_refresh=self._save_tokens,
         )
@@ -490,6 +487,87 @@ class TencentDoc115Library(_PluginBase):
         count = self._store.retry_resources(payload.resource_ids)
         return Response(success=True, message=f"已重新排队 {count} 条资源")
 
+    def _retry_all_failed_and_build(self) -> Dict[str, Any]:
+        """重新排队全部失败资源，并连续按批次重试一次。"""
+        if not self._store or not self._builder:
+            return {"status": "failed", "message": "插件尚未初始化"}
+        requeued = self._store.retry_all_failed_resources()
+        totals = {
+            "synced_pages": 0,
+            "synced_rows": 0,
+            "built": 0,
+            "success": 0,
+            "failed": 0,
+        }
+        if not requeued:
+            self._set_pipeline_status(
+                phase="completed",
+                message="当前没有失败资源需要重试",
+                **totals,
+            )
+            return {"status": "completed", "requeued": 0, **totals}
+        self._set_pipeline_status(
+            phase="building",
+            message=f"已重新排队 {requeued} 条失败资源，正在按批次重试",
+            **totals,
+        )
+        known_usage_bytes: Optional[int] = None
+        while not self._stop_event.is_set():
+            result = self._builder.build(known_usage_bytes=known_usage_bytes)
+            processed = int(result.get("processed") or 0)
+            known_usage_bytes = int(result.get("usage_bytes") or 0)
+            totals["built"] += processed
+            totals["success"] += int(result.get("success") or 0)
+            totals["failed"] += int(result.get("failed") or 0)
+            build_status = str(result.get("status") or "failed")
+            self._set_pipeline_status(
+                phase="building",
+                message=(
+                    f"失败资源重试中：{totals['success']} 成功 / "
+                    f"{totals['failed']} 再次失败"
+                ),
+                usage_bytes=int(result.get("usage_bytes") or 0),
+                limit_bytes=int(result.get("limit_bytes") or 0),
+                **totals,
+            )
+            if build_status == "space_limit":
+                self._set_pipeline_status(
+                    phase="space_limit",
+                    message="重试已因输出空间上限停止，未处理资源仍为 pending",
+                    **totals,
+                )
+                return {"status": "space_limit", "requeued": requeued, **totals}
+            if build_status in {"busy", "interrupted"}:
+                final_phase = "stopped" if build_status == "interrupted" else "failed"
+                self._set_pipeline_status(
+                    phase=final_phase,
+                    message=str(result.get("message") or "失败资源重试未完成"),
+                    **totals,
+                )
+                return {"status": final_phase, "requeued": requeued, **totals}
+            if processed == 0:
+                self._set_pipeline_status(
+                    phase="completed",
+                    message=(
+                        f"失败资源已完成一轮重试：{totals['success']} 成功 / "
+                        f"{totals['failed']} 再次失败"
+                    ),
+                    **totals,
+                )
+                return {"status": "completed", "requeued": requeued, **totals}
+        self._set_pipeline_status(
+            phase="stopped",
+            message="失败资源重试已停止；未处理资源仍为 pending",
+            **totals,
+        )
+        return {"status": "stopped", "requeued": requeued, **totals}
+
+    def retry_all_failed(self) -> Response:
+        """后台重试全部失败资源，并持续处理到本轮队列结束。"""
+        if not self._store or not self._builder:
+            return Response(success=False, message="插件尚未初始化")
+        return self._submit("重试全部失败资源", self._retry_all_failed_and_build)
+
     def status(self) -> Response:
         """返回同步检查点、资源计数和最近错误。"""
         if not self._store:
@@ -582,6 +660,13 @@ class TencentDoc115Library(_PluginBase):
                 "endpoint": self.retry_resources,
                 "methods": ["POST"],
                 "summary": "重试失败资源",
+                "auth": "bear",
+            },
+            {
+                "path": "/resources/retry-all",
+                "endpoint": self.retry_all_failed,
+                "methods": ["POST"],
+                "summary": "重试全部失败资源并生成",
                 "auth": "bear",
             },
             {
@@ -758,7 +843,10 @@ class TencentDoc115Library(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {"model": "enabled", "label": "启用插件"},
+                                        "props": {
+                                            "model": "enabled",
+                                            "label": "启用插件",
+                                        },
                                     }
                                 ],
                             },
@@ -768,7 +856,10 @@ class TencentDoc115Library(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {"model": "auto_sync", "label": "自动分页同步"},
+                                        "props": {
+                                            "model": "auto_sync",
+                                            "label": "自动分页同步",
+                                        },
                                     }
                                 ],
                             },
@@ -778,7 +869,10 @@ class TencentDoc115Library(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {"model": "auto_build", "label": "定时自动生成"},
+                                        "props": {
+                                            "model": "auto_build",
+                                            "label": "定时自动生成",
+                                        },
                                     }
                                 ],
                             },
@@ -788,7 +882,10 @@ class TencentDoc115Library(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {"model": "scrape_metadata", "label": "MoviePilot刮削"},
+                                        "props": {
+                                            "model": "scrape_metadata",
+                                            "label": "MoviePilot刮削",
+                                        },
                                     }
                                 ],
                             },
@@ -871,7 +968,9 @@ class TencentDoc115Library(_PluginBase):
                             self._text_field("share_max_files", "单分享最多视频数", 3),
                             self._text_field("share_page_size", "115每页文件数", 3),
                             self._text_field("share_max_depth", "115最大目录深度", 3),
-                            self._text_field("request_interval", "115请求间隔（秒）", 3),
+                            self._text_field(
+                                "request_interval", "115请求间隔（秒）", 3
+                            ),
                             self._text_field("request_retries", "临时错误重试次数", 3),
                             self._text_field("search_page_size", "本地检索每页条数", 3),
                             self._text_field("download_retries", "直链下载重试次数", 3),
@@ -893,7 +992,9 @@ class TencentDoc115Library(_PluginBase):
                                     }
                                 ],
                             },
-                            self._text_field("p115_cookie", "115 Cookie（复用失败时使用）", 8, True),
+                            self._text_field(
+                                "p115_cookie", "115 Cookie（复用失败时使用）", 8, True
+                            ),
                         ],
                     },
                     {
@@ -911,9 +1012,10 @@ class TencentDoc115Library(_PluginBase):
         ]
         defaults = dict(DEFAULT_CONFIG)
         defaults.update(self._config)
-        if not str(defaults.get("document_urls") or "").strip() and str(
-            defaults.get("document_url") or ""
-        ).strip():
+        if (
+            not str(defaults.get("document_urls") or "").strip()
+            and str(defaults.get("document_url") or "").strip()
+        ):
             defaults["document_urls"] = (
                 f"主文档|{str(defaults['document_url']).strip()}"
             )
@@ -928,17 +1030,29 @@ class TencentDoc115Library(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """返回手动操作、断点状态和最近错误页面。"""
-        snapshot = self._store.status_snapshot() if self._store else {
-            "total_resources": 0,
-            "resource_counts": {},
-            "sheets": [],
-            "recent_errors": [],
-        }
-        storage = self._builder.storage_snapshot() if self._builder else {
-            "usage_bytes": 0,
-            "limit_bytes": 0,
-            "limit_reached": False,
-        }
+        snapshot = (
+            self._store.status_snapshot()
+            if self._store
+            else {
+                "total_resources": 0,
+                "active_resources": 0,
+                "resource_counts": {},
+                "strm_counts": {},
+                "scrape_counts": {},
+                "current_resources": [],
+                "sheets": [],
+                "recent_errors": [],
+            }
+        )
+        storage = (
+            self._builder.storage_snapshot()
+            if self._builder
+            else {
+                "usage_bytes": 0,
+                "limit_bytes": 0,
+                "limit_reached": False,
+            }
+        )
         pipeline = self._pipeline_snapshot()
         buttons = [
             ("发现工作表", "mdi-table-search", "discover", "primary"),
@@ -946,6 +1060,12 @@ class TencentDoc115Library(_PluginBase):
             ("同步全部并生成", "mdi-playlist-check", "sync-all", "success"),
             ("重新扫描", "mdi-restart-alert", "sync/reset", "warning"),
             ("生成下一批", "mdi-movie-open-plus", "build", "success"),
+            (
+                "重试全部失败并生成",
+                "mdi-refresh-circle",
+                "resources/retry-all",
+                "warning",
+            ),
             ("停止后台任务", "mdi-stop-circle", "tasks/stop", "error"),
         ]
         button_components = [
@@ -984,10 +1104,62 @@ class TencentDoc115Library(_PluginBase):
                     },
                 }
             )
+        status_labels = {
+            "pending": "等待处理",
+            "processing": "处理中",
+            "ready": "全部完成",
+            "share_error": "分享错误",
+            "metadata_error": "刮削错误",
+            "build_error": "生成错误",
+            "removed": "已移除",
+        }
+        strm_labels = {
+            "pending": "等待校验",
+            "validating": "正在校验分享",
+            "validated": "分享校验完成",
+            "generating": "正在生成 STRM",
+            "ready": "STRM 已生成",
+            "failed": "STRM 失败",
+        }
+        scrape_labels = {
+            "pending": "等待识别",
+            "recognizing": "正在识别媒体",
+            "recognized": "媒体识别完成",
+            "scraping": "正在刮削元数据",
+            "ready": "刮削完成",
+            "skipped": "已关闭刮削",
+            "failed": "刮削失败",
+            "blocked": "前序失败，未刮削",
+        }
         counts = snapshot.get("resource_counts", {})
-        count_text = " · ".join(
-            f"{status}: {count}" for status, count in sorted(counts.items())
-        ) or "尚无资源"
+        count_text = (
+            " · ".join(
+                f"{status_labels.get(status, status)}: {count}"
+                for status, count in sorted(counts.items())
+            )
+            or "尚无资源"
+        )
+        active_resources = int(snapshot.get("active_resources") or 0)
+        strm_counts = snapshot.get("strm_counts", {})
+        scrape_counts = snapshot.get("scrape_counts", {})
+        strm_ready = int(strm_counts.get("ready") or 0)
+        strm_failed = int(strm_counts.get("failed") or 0)
+        strm_waiting = max(active_resources - strm_ready - strm_failed, 0)
+        scrape_ready = int(scrape_counts.get("ready") or 0) + int(
+            scrape_counts.get("skipped") or 0
+        )
+        scrape_failed = int(scrape_counts.get("failed") or 0)
+        scrape_blocked = int(scrape_counts.get("blocked") or 0)
+        scrape_waiting = max(
+            active_resources - scrape_ready - scrape_failed - scrape_blocked,
+            0,
+        )
+        strm_percent = (
+            round(strm_ready * 100 / active_resources) if active_resources else 0
+        )
+        scrape_percent = (
+            round(scrape_ready * 100 / active_resources) if active_resources else 0
+        )
         limit_bytes = int(storage.get("limit_bytes") or 0)
         usage_text = format_gib(int(storage.get("usage_bytes") or 0))
         limit_text = format_gib(limit_bytes) if limit_bytes else "不限"
@@ -1017,7 +1189,26 @@ class TencentDoc115Library(_PluginBase):
                     "component": "VListItem",
                     "props": {
                         "title": str(item.get("title") or item.get("resource_id")),
-                        "subtitle": f"{item.get('status')}：{item.get('last_error')}",
+                        "subtitle": (
+                            f"STRM：{strm_labels.get(item.get('strm_status'), item.get('strm_status'))} · "
+                            f"刮削：{scrape_labels.get(item.get('scrape_status'), item.get('scrape_status'))} · "
+                            f"{item.get('last_error')}"
+                        ),
+                    },
+                }
+            )
+        current_items: List[Dict[str, Any]] = []
+        for item in snapshot.get("current_resources", []):
+            current_items.append(
+                {
+                    "component": "VListItem",
+                    "props": {
+                        "title": str(item.get("title") or item.get("resource_id")),
+                        "subtitle": (
+                            f"{item.get('group_name') or '未分组'} · "
+                            f"STRM：{strm_labels.get(item.get('strm_status'), item.get('strm_status'))} · "
+                            f"刮削：{scrape_labels.get(item.get('scrape_status'), item.get('scrape_status'))}"
+                        ),
                     },
                 }
             )
@@ -1054,11 +1245,81 @@ class TencentDoc115Library(_PluginBase):
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-4"},
                 "content": [
+                    {"component": "VCardTitle", "text": "STRM 与刮削进度"},
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "mb-1"},
+                                "text": (
+                                    f"STRM：{strm_ready}/{active_resources} 已生成 · "
+                                    f"{strm_waiting} 待处理 · {strm_failed} 失败 · "
+                                    f"{strm_percent}%"
+                                ),
+                            },
+                            {
+                                "component": "VProgressLinear",
+                                "props": {
+                                    "model-value": strm_percent,
+                                    "color": "success",
+                                    "height": 12,
+                                    "rounded": True,
+                                    "class": "mb-4",
+                                },
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "mb-1"},
+                                "text": (
+                                    f"元数据刮削：{scrape_ready}/{active_resources} 完成 · "
+                                    f"{scrape_waiting} 等待 · {scrape_blocked} 前序阻断 · "
+                                    f"{scrape_failed} 失败 · {scrape_percent}%"
+                                ),
+                            },
+                            {
+                                "component": "VProgressLinear",
+                                "props": {
+                                    "model-value": scrape_percent,
+                                    "color": "info",
+                                    "height": 12,
+                                    "rounded": True,
+                                    "class": "mb-4",
+                                },
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-subtitle-1"},
+                                "text": "当前处理",
+                            },
+                            {
+                                "component": "VList",
+                                "content": current_items
+                                or [
+                                    {
+                                        "component": "VListItem",
+                                        "props": {"title": "当前没有正在处理的资源"},
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-4"},
+                "content": [
                     {"component": "VCardTitle", "text": "工作表断点"},
                     {
                         "component": "VList",
                         "content": sheet_items
-                        or [{"component": "VListItem", "props": {"title": "尚未发现工作表"}}],
+                        or [
+                            {
+                                "component": "VListItem",
+                                "props": {"title": "尚未发现工作表"},
+                            }
+                        ],
                     },
                 ],
             },

@@ -309,7 +309,6 @@ class LibraryBuilder:
             resource["resource_id"],
             [{**selected_file, "strm_path": str(strm_path)}],
         )
-        self._scrape(directory, meta, mediainfo)
         return str(strm_path)
 
     @staticmethod
@@ -403,7 +402,6 @@ class LibraryBuilder:
                 + (f"：{example}" if example else "")
             )
         self.store.replace_resource_files(resource["resource_id"], expanded_files)
-        self._scrape(directory, meta, mediainfo)
         return str(directory)
 
     def build(
@@ -468,10 +466,31 @@ class LibraryBuilder:
                 processed += 1
                 directory: Optional[Path] = None
                 directory_size_before = 0
+                current_stage = "validating"
                 try:
+                    self.store.update_resource_status(
+                        resource["resource_id"],
+                        "processing",
+                        strm_status="validating",
+                        scrape_status="pending",
+                    )
                     source_files = self.resolver.list_video_files(resource["share_url"])
                     media_type = self._media_type(resource, source_files)
+                    current_stage = "recognizing"
+                    self.store.update_resource_status(
+                        resource["resource_id"],
+                        "processing",
+                        strm_status="validated",
+                        scrape_status="recognizing",
+                    )
                     meta, mediainfo = self._recognize(resource, media_type)
+                    current_stage = "generating"
+                    self.store.update_resource_status(
+                        resource["resource_id"],
+                        "processing",
+                        strm_status="generating",
+                        scrape_status="recognized",
+                    )
                     directory = self._base_directory(resource, mediainfo)
                     directory_size_before = directory_size(directory)
                     if media_type == MediaType.TV:
@@ -490,9 +509,22 @@ class LibraryBuilder:
                             directory=directory,
                             source_files=source_files,
                         )
+                    scrape_enabled = bool(config.get("scrape_metadata", True))
+                    if scrape_enabled:
+                        current_stage = "scraping"
+                        self.store.update_resource_status(
+                            resource["resource_id"],
+                            "processing",
+                            strm_status="ready",
+                            scrape_status="scraping",
+                            strm_path=output_path,
+                        )
+                        self._scrape(directory, meta, mediainfo)
                     self.store.update_resource_status(
                         resource["resource_id"],
                         "ready",
+                        strm_status="ready",
+                        scrape_status="ready" if scrape_enabled else "skipped",
                         media_source=str(
                             getattr(mediainfo, "media_source", None)
                             or getattr(mediainfo, "source", None)
@@ -509,6 +541,8 @@ class LibraryBuilder:
                         resource["resource_id"],
                         "share_error",
                         str(error),
+                        strm_status="failed",
+                        scrape_status="blocked",
                     )
                     failed_count += 1
                     logger.warning(
@@ -517,23 +551,45 @@ class LibraryBuilder:
                 except LibraryBuildError as error:
                     error_status = (
                         "metadata_error"
-                        if "MoviePilot" in str(error)
+                        if current_stage in {"recognizing", "scraping"}
+                        or "MoviePilot" in str(error)
                         else "build_error"
                     )
                     self.store.update_resource_status(
                         resource["resource_id"],
                         error_status,
                         str(error),
+                        strm_status=(
+                            "ready" if current_stage == "scraping" else "failed"
+                        ),
+                        scrape_status=(
+                            "failed"
+                            if current_stage in {"recognizing", "scraping"}
+                            else "blocked"
+                        ),
                     )
                     failed_count += 1
                     logger.warning(
                         f"STRM 资源生成失败：{resource['title']} - {str(error)}"
                     )
                 except Exception as error:
+                    error_status = (
+                        "metadata_error"
+                        if current_stage in {"recognizing", "scraping"}
+                        else "build_error"
+                    )
                     self.store.update_resource_status(
                         resource["resource_id"],
-                        "build_error",
+                        error_status,
                         str(error),
+                        strm_status=(
+                            "ready" if current_stage == "scraping" else "failed"
+                        ),
+                        scrape_status=(
+                            "failed"
+                            if current_stage in {"recognizing", "scraping"}
+                            else "blocked"
+                        ),
                     )
                     failed_count += 1
                     logger.error(

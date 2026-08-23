@@ -51,7 +51,10 @@ def main() -> None:
         api_paths = {api["path"] for api in plugin.get_api()}
         assert "/sync-all" in api_paths
         assert "/tasks/stop" in api_paths
-        assert plugin.get_page()
+        assert "/resources/retry-all" in api_paths
+        page_text = str(plugin.get_page())
+        assert "STRM 与刮削进度" in page_text
+        assert "重试全部失败并生成" in page_text
 
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()
@@ -183,41 +186,62 @@ def main() -> None:
         )
         invalid_build = plugin._builder.build(limit=1)
         assert invalid_build["failed"] == 1
-        assert store.get_resource("smoke-resource")["status"] == "share_error"
+        invalid_resource = store.get_resource("smoke-resource")
+        assert invalid_resource["status"] == "share_error"
+        assert invalid_resource["strm_status"] == "failed"
+        assert invalid_resource["scrape_status"] == "blocked"
         assert not list(output_root.rglob("*.strm"))
         plugin._resolver.list_video_files = original_list_video_files
         plugin._builder._recognize = original_recognize
 
-        resource = store.get_resource("smoke-resource")
         original_scrape = plugin._builder._scrape
-        plugin._builder._scrape = lambda *_args, **_kwargs: None
-        movie_path = plugin._builder._build_movie(
-            resource,
+        movie_files = [
+            {
+                "file_id": "small",
+                "file_name": "花絮.mp4",
+                "file_path": "/花絮.mp4",
+                "file_size": 100,
+            },
+            {
+                "file_id": "main",
+                "file_name": "测试电影.mkv",
+                "file_path": "/测试电影.mkv",
+                "file_size": 1000,
+            },
+        ]
+        store.retry_resources(["smoke-resource"])
+        plugin._resolver.list_video_files = lambda _share_url: movie_files
+        plugin._builder._recognize = lambda *_args, **_kwargs: (
             object(),
-            SimpleNamespace(title="测试电影", year="2024"),
-            source_files=[
-                {
-                    "file_id": "small",
-                    "file_name": "花絮.mp4",
-                    "file_path": "/花絮.mp4",
-                    "file_size": 100,
-                },
-                {
-                    "file_id": "main",
-                    "file_name": "测试电影.mkv",
-                    "file_path": "/测试电影.mkv",
-                    "file_size": 1000,
-                },
-            ],
+            SimpleNamespace(
+                title="测试电影",
+                year="2024",
+                type=MediaType.MOVIE,
+                media_source="themoviedb",
+                source="themoviedb",
+                media_id="movie-1",
+                tmdb_id="1",
+            ),
         )
+
+        def successful_scrape(*_args, **_kwargs):
+            scraping_resource = store.get_resource("smoke-resource")
+            assert scraping_resource["strm_status"] == "ready"
+            assert scraping_resource["scrape_status"] == "scraping"
+
+        plugin._builder._scrape = successful_scrape
+        successful_build = plugin._builder.build(limit=1)
+        assert successful_build["success"] == 1
+        resource = store.get_resource("smoke-resource")
+        movie_path = resource["strm_path"]
+        assert resource["status"] == "ready"
+        assert resource["strm_status"] == "ready"
+        assert resource["scrape_status"] == "ready"
+        plugin._resolver.list_video_files = original_list_video_files
+        plugin._builder._recognize = original_recognize
         plugin._builder._scrape = original_scrape
         assert "file_id=main" in Path(movie_path).read_text(encoding="utf-8")
         assert store.get_resource_file("smoke-resource", "main")
-        store.update_resource_status(
-            "smoke-resource",
-            "ready",
-            strm_path="/media/电影合集/测试电影/测试电影.strm",
-        )
 
         results = plugin.search_torrents({}, "测试电影")
         assert len(results) == 1
