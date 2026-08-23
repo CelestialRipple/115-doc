@@ -8,7 +8,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -65,6 +65,10 @@ class CatalogStore:
                 CREATE TABLE IF NOT EXISTS sheet_state (
                     sheet_id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
+                    source_title TEXT,
+                    document_title TEXT,
+                    file_id TEXT,
+                    remote_sheet_id TEXT,
                     row_count INTEGER NOT NULL DEFAULT 0,
                     column_count INTEGER NOT NULL DEFAULT 0,
                     used_row_count INTEGER NOT NULL DEFAULT 0,
@@ -177,6 +181,22 @@ class CatalogStore:
                     "ALTER TABLE direct_download_task "
                     "ADD COLUMN episodes_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            sheet_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(sheet_state)"
+                ).fetchall()
+            }
+            for column_name in (
+                "source_title",
+                "document_title",
+                "file_id",
+                "remote_sheet_id",
+            ):
+                if column_name not in sheet_columns:
+                    connection.execute(
+                        f"ALTER TABLE sheet_state ADD COLUMN {column_name} TEXT"
+                    )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.execute(
                 "UPDATE sync_run SET status = 'interrupted', finished_at = ? "
@@ -206,11 +226,16 @@ class CatalogStore:
                 connection.execute(
                     """
                     INSERT INTO sheet_state (
-                        sheet_id, title, row_count, column_count,
+                        sheet_id, title, source_title, document_title,
+                        file_id, remote_sheet_id, row_count, column_count,
                         used_row_count, used_column_count, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(sheet_id) DO UPDATE SET
                         title = excluded.title,
+                        source_title = excluded.source_title,
+                        document_title = excluded.document_title,
+                        file_id = excluded.file_id,
+                        remote_sheet_id = excluded.remote_sheet_id,
                         row_count = excluded.row_count,
                         column_count = excluded.column_count,
                         used_row_count = excluded.used_row_count,
@@ -220,6 +245,10 @@ class CatalogStore:
                     (
                         sheet["sheet_id"],
                         sheet["title"],
+                        sheet.get("source_title") or sheet["title"],
+                        sheet.get("document_title"),
+                        sheet.get("file_id"),
+                        sheet.get("remote_sheet_id") or sheet["sheet_id"],
                         int(sheet.get("row_count") or 0),
                         int(sheet.get("column_count") or 0),
                         int(sheet.get("used_row_count") or 0),
@@ -227,6 +256,18 @@ class CatalogStore:
                         now,
                     ),
                 )
+
+    def disable_missing_sheets(self, present_sheet_ids: set[str]) -> None:
+        """停用已不在当前文档配置中的工作表，但保留其资源和历史。"""
+        if not present_sheet_ids:
+            return
+        placeholders = ",".join("?" for _ in present_sheet_ids)
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                f"UPDATE sheet_state SET enabled = 0, updated_at = ? "
+                f"WHERE sheet_id NOT IN ({placeholders})",
+                (utc_now(), *sorted(present_sheet_ids)),
+            )
 
     def configure_sheets(self, mappings: Dict[str, Dict[str, Any]]) -> None:
         """
@@ -271,7 +312,7 @@ class CatalogStore:
         parameters: Tuple[Any, ...] = ()
         if enabled_only:
             query += " WHERE enabled = 1"
-        query += " ORDER BY title"
+        query += " ORDER BY COALESCE(document_title, ''), title"
         with self.connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]

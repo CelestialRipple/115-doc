@@ -6,10 +6,16 @@ from time import monotonic, sleep
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
-from app.sdk.config import settings
-from app.sdk.logging import logger
-from app.sdk.network import RequestUtils
-from app.sdk.plugins import PluginManager
+try:
+    from app.sdk.config import settings
+    from app.sdk.logging import logger
+    from app.sdk.network import RequestUtils
+    from app.sdk.plugins import PluginManager
+except ImportError:
+    from app.core.config import settings
+    from app.core.plugin import PluginManager
+    from app.log import logger
+    from app.utils.http import RequestUtils
 
 from .store import CatalogStore, utc_now
 

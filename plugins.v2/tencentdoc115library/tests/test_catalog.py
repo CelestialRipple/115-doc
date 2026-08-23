@@ -4,6 +4,8 @@ from tencentdoc115library.catalog import (
     CatalogParser,
     CatalogSynchronizer,
     default_group_for_title,
+    document_sources,
+    namespaced_sheet_id,
 )
 from tencentdoc115library.client import TencentDocumentClient
 from tencentdoc115library.store import CatalogStore
@@ -16,6 +18,73 @@ def test_default_groups_match_expected_library_layout() -> None:
     assert default_group_for_title("剧集") == "剧集"
     assert default_group_for_title("星火4K全站资源") == "星火"
     assert default_group_for_title("蚂蚁4K") == "蚂蚁"
+
+
+def test_multiple_document_sources_support_aliases_and_unique_sheet_ids() -> None:
+    sources = document_sources(
+        {
+            "document_urls": (
+                "电影库|https://docs.qq.com/sheet/movie\n"
+                "https://docs.qq.com/sheet/tv\n"
+                "电影库重复|https://docs.qq.com/sheet/movie"
+            )
+        }
+    )
+    assert sources == [
+        {"name": "电影库", "url": "https://docs.qq.com/sheet/movie"},
+        {"name": "文档2", "url": "https://docs.qq.com/sheet/tv"},
+    ]
+    assert namespaced_sheet_id("file-a", "000001") == namespaced_sheet_id(
+        "file-a", "000001"
+    )
+    assert namespaced_sheet_id("file-a", "000001") != namespaced_sheet_id(
+        "file-b", "000001"
+    )
+
+
+def test_discover_namespaces_same_sheet_id_across_documents(tmp_path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+
+    class FakeClient:
+        @staticmethod
+        def convert_file_id(url):
+            return "file-movie" if url.endswith("movie") else "file-tv"
+
+        @staticmethod
+        def get_sheets(file_id):
+            return [
+                {
+                    "sheet_id": "000001",
+                    "title": "电影大全" if file_id == "file-movie" else "剧集大全",
+                    "row_count": 10,
+                    "column_count": 6,
+                    "used_row_count": 10,
+                    "used_column_count": 6,
+                }
+            ]
+
+    config = {
+        "document_urls": (
+            "电影库|https://docs.qq.com/sheet/movie\n"
+            "剧集库|https://docs.qq.com/sheet/tv"
+        )
+    }
+    synchronizer = CatalogSynchronizer(
+        store=store,
+        client_factory=FakeClient,
+        config_provider=lambda: dict(config),
+        config_updater=lambda updated: config.update(updated),
+        stop_event=Event(),
+    )
+
+    sheets = synchronizer.discover_sheets()
+    assert len(sheets) == 2
+    assert {sheet["title"] for sheet in sheets} == {
+        "电影库（电影大全）",
+        "剧集库（剧集大全）",
+    }
+    assert len({sheet["sheet_id"] for sheet in sheets}) == 2
+    assert {sheet["remote_sheet_id"] for sheet in sheets} == {"000001"}
 
 
 def test_parser_recognizes_headers_and_share_link() -> None:

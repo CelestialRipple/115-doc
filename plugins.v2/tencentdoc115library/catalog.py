@@ -4,7 +4,10 @@ import re
 from threading import Event, Lock
 from typing import Any, Callable, Dict, List, Optional
 
-from app.sdk.logging import logger
+try:
+    from app.sdk.logging import logger
+except ImportError:
+    from app.log import logger
 
 from .client import TencentDocumentClient, TencentDocumentError, looks_like_url
 from .store import CatalogStore
@@ -27,6 +30,33 @@ DEFAULT_COLUMN_INDEX = {
     "rating": 4,
     "year": 5,
 }
+
+
+def document_sources(config: Dict[str, Any]) -> List[Dict[str, str]]:
+    """解析多行腾讯文档配置，支持“别名|链接”和单独链接。"""
+    raw = str(config.get("document_urls") or "").strip()
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
+        legacy_url = str(config.get("document_url") or "").strip()
+        lines = [legacy_url] if legacy_url else []
+    sources: List[Dict[str, str]] = []
+    seen_urls = set()
+    for index, line in enumerate(lines, start=1):
+        if "|" in line:
+            alias, url = (part.strip() for part in line.split("|", 1))
+        else:
+            alias, url = f"文档{index}", line
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        sources.append({"name": alias or f"文档{index}", "url": url})
+    return sources
+
+
+def namespaced_sheet_id(file_id: str, remote_sheet_id: str) -> str:
+    """生成跨文档不冲突且可稳定恢复断点的内部工作表 ID。"""
+    identity = f"{file_id}:{remote_sheet_id}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 def sheet_config_key(sheet_id: str) -> str:
@@ -243,13 +273,36 @@ class CatalogSynchronizer:
         """
         config = dict(self.config_provider())
         client = self.client_factory()
-        file_id = str(config.get("file_id") or "").strip()
-        if not file_id:
-            file_id = client.convert_file_id(str(config.get("document_url") or ""))
-            config["file_id"] = file_id
-            self.config_updater(config)
-        sheets = client.get_sheets(file_id)
+        sources = document_sources(config)
+        if not sources:
+            raise TencentDocumentError("尚未配置腾讯文档链接")
+        sheets: List[Dict[str, Any]] = []
+        legacy_file_id = str(config.get("file_id") or "").strip()
+        legacy_url = str(config.get("document_url") or "").strip()
+        for source in sources:
+            file_id = (
+                legacy_file_id
+                if len(sources) == 1 and source["url"] == legacy_url and legacy_file_id
+                else client.convert_file_id(source["url"])
+            )
+            for remote_sheet in client.get_sheets(file_id):
+                remote_sheet_id = str(remote_sheet["sheet_id"])
+                source_title = str(remote_sheet["title"])
+                sheets.append(
+                    {
+                        **remote_sheet,
+                        "sheet_id": namespaced_sheet_id(file_id, remote_sheet_id),
+                        "remote_sheet_id": remote_sheet_id,
+                        "file_id": file_id,
+                        "document_title": source["name"],
+                        "source_title": source_title,
+                        "title": f"{source['name']}（{source_title}）",
+                    }
+                )
         self.store.upsert_sheets(sheets)
+        self.store.disable_missing_sheets(
+            {str(sheet["sheet_id"]) for sheet in sheets}
+        )
         config_changed = False
         for sheet in sheets:
             key = sheet_config_key(sheet["sheet_id"])
@@ -316,13 +369,6 @@ class CatalogSynchronizer:
                     if sheet.get("scan_status") != "completed"
                 ]
             client = self.client_factory()
-            file_id = str(config.get("file_id") or "").strip()
-            if not file_id:
-                file_id = client.convert_file_id(
-                    str(config.get("document_url") or "")
-                )
-                config["file_id"] = file_id
-                self.config_updater(config)
             page_limit = max_pages or int(config.get("pages_per_run") or 5)
             page_limit = min(max(page_limit, 1), 100)
             requested_rows = int(config.get("page_rows") or 1000)
@@ -353,8 +399,8 @@ class CatalogSynchronizer:
                             "processed_rows": processed_rows,
                         }
                     page = client.get_range(
-                        file_id=file_id,
-                        sheet_id=current_sheet_id,
+                        file_id=str(sheet.get("file_id") or config.get("file_id") or ""),
+                        sheet_id=str(sheet.get("remote_sheet_id") or current_sheet_id),
                         start_row=current_row,
                         row_count=requested_rows,
                         column_count=column_count,

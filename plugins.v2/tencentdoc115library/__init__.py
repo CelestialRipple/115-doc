@@ -7,12 +7,20 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import Body, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response as HttpResponse
 
-from app.domain.context import TorrentInfo
 from app.log import logger
 from app.plugins import _PluginBase
-from app.runtime.thread import ThreadHelper
 from app.schemas import Response
 from app.schemas.types import MediaType
+
+try:
+    from app.domain.context import TorrentInfo
+except ImportError:
+    from app.core.context import TorrentInfo
+
+try:
+    from app.runtime.thread import ThreadHelper
+except ImportError:
+    from app.helper.thread import ThreadHelper
 
 from .catalog import CatalogSynchronizer, default_group_for_title, sheet_config_key
 from .client import TencentDocumentClient
@@ -35,6 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "sync_cron": "0 */6 * * *",
     "build_cron": "*/5 * * * *",
     "document_url": "",
+    "document_urls": "",
     "client_id": "",
     "client_secret": "",
     "openid": "",
@@ -69,9 +78,9 @@ class TencentDoc115Library(_PluginBase):
     """将腾讯文档中的 115 分享资源构建为可按需播放的媒体库。"""
 
     plugin_name = "腾讯文档115媒体库"
-    plugin_desc = "分页同步腾讯文档，使用 MoviePilot 刮削并按需解析 115 分享。"
+    plugin_desc = "同步多个腾讯文档，使用 MoviePilot 刮削并按需解析 115 分享。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.3.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -664,6 +673,31 @@ class TencentDoc115Library(_PluginBase):
             "content": [{"component": "VTextField", "props": props}],
         }
 
+    @staticmethod
+    def _textarea_field(
+        model: str,
+        label: str,
+        hint: str = "",
+    ) -> Dict[str, Any]:
+        """生成一个适合多行文档链接的配置框。"""
+        return {
+            "component": "VCol",
+            "props": {"cols": 12},
+            "content": [
+                {
+                    "component": "VTextarea",
+                    "props": {
+                        "model": model,
+                        "label": label,
+                        "rows": 4,
+                        "auto-grow": True,
+                        "persistent-hint": bool(hint),
+                        "hint": hint,
+                    },
+                }
+            ],
+        }
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """返回凭据、同步保护、115 和工作表分组配置。"""
         sheets = self._store.list_sheets() if self._store else []
@@ -784,7 +818,11 @@ class TencentDoc115Library(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            self._text_field("document_url", "腾讯文档表格地址", 12),
+                            self._textarea_field(
+                                "document_urls",
+                                "腾讯文档表格（每行一条）",
+                                hint="支持“文档别名|链接”；只填链接时自动命名为文档1、文档2",
+                            ),
                             self._text_field("client_id", "Client ID", 6),
                             self._text_field("openid", "Open ID", 6),
                             self._text_field(
@@ -868,6 +906,12 @@ class TencentDoc115Library(_PluginBase):
         ]
         defaults = dict(DEFAULT_CONFIG)
         defaults.update(self._config)
+        if not str(defaults.get("document_urls") or "").strip() and str(
+            defaults.get("document_url") or ""
+        ).strip():
+            defaults["document_urls"] = (
+                f"主文档|{str(defaults['document_url']).strip()}"
+            )
         for sheet in sheets:
             key = sheet_config_key(sheet["sheet_id"])
             defaults.setdefault(f"sheet_{key}_enabled", False)

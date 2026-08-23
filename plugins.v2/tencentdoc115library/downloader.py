@@ -6,12 +6,22 @@ from threading import Event, Lock
 from time import monotonic
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from app.runtime.thread import ThreadHelper
 from app.schemas import DownloaderTorrent
 from app.schemas.types import TorrentStatus
-from app.sdk.config import settings
-from app.sdk.logging import logger
-from app.sdk.network import RequestUtils
+
+try:
+    from app.runtime.thread import ThreadHelper
+except ImportError:
+    from app.helper.thread import ThreadHelper
+
+try:
+    from app.sdk.config import settings
+    from app.sdk.logging import logger
+    from app.sdk.network import RequestUtils
+except ImportError:
+    from app.core.config import settings
+    from app.log import logger
+    from app.utils.http import RequestUtils
 
 from .download_marker import parse_download_marker
 from .library import safe_path_segment

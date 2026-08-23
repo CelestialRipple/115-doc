@@ -6,11 +6,20 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.chain.media import MediaChain
-from app.chain.scraping import ScrapingChain
 from app.schemas.file import FileItem
 from app.schemas.types import MediaType
-from app.sdk.logging import logger
-from app.sdk.media import MetaInfo
+
+try:
+    from app.chain.scraping import ScrapingChain
+except ImportError:
+    ScrapingChain = MediaChain
+
+try:
+    from app.sdk.logging import logger
+    from app.sdk.media import MetaInfo
+except ImportError:
+    from app.core.metainfo import MetaInfo
+    from app.log import logger
 
 from .resolver import ShareResolutionError, ShareResolver
 from .storage_limit import configured_limit_bytes, directory_size
@@ -180,7 +189,7 @@ class LibraryBuilder:
     def _scrape(self, directory: Path, meta: Any, mediainfo: Any) -> None:
         if not self.config_provider().get("scrape_metadata", True):
             return
-        success, message = ScrapingChain().scrape_metadata(
+        result = ScrapingChain().scrape_metadata(
             fileitem=self._file_item(directory),
             meta=meta,
             mediainfo=mediainfo,
@@ -188,6 +197,10 @@ class LibraryBuilder:
             overwrite=False,
             recursive=True,
         )
+        if isinstance(result, tuple):
+            success, message = result
+        else:
+            success, message = result is not False, ""
         if not success:
             raise LibraryBuildError(f"MoviePilot 刮削失败：{message}")
 
@@ -360,7 +373,11 @@ class LibraryBuilder:
                     self.store.update_resource_status(
                         resource["resource_id"],
                         "ready",
-                        media_source=str(mediainfo.media_source or ""),
+                        media_source=str(
+                            getattr(mediainfo, "media_source", None)
+                            or getattr(mediainfo, "source", None)
+                            or ""
+                        ),
                         media_id=str(mediainfo.media_id or ""),
                         tmdb_id=str(mediainfo.tmdb_id or ""),
                         strm_path=output_path,

@@ -10,6 +10,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 from tencentdoc115library import TencentDoc115Library
 from tencentdoc115library.download_marker import parse_download_marker
+from tencentdoc115library import library as library_module
 from app.plugins import _PluginBase
 from app.schemas.types import TorrentStatus
 
@@ -54,6 +55,18 @@ def main() -> None:
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()
         (output_root / "usage.bin").write_bytes(b"12")
+
+        original_scraping_chain = library_module.ScrapingChain
+
+        class LegacyScrapingChain:
+            @staticmethod
+            def scrape_metadata(**kwargs):
+                return None
+
+        library_module.ScrapingChain = LegacyScrapingChain
+        plugin._builder._scrape(output_root, object(), object())
+        library_module.ScrapingChain = original_scraping_chain
+
         plugin._config["output_size_limit_gb"] = 1 / (1024 ** 3)
         limited_build = plugin._builder.build()
         assert limited_build["status"] == "space_limit"

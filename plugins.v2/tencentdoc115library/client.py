@@ -3,9 +3,14 @@ from time import sleep, time
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote, urlsplit
 
-from app.sdk.config import settings
-from app.sdk.logging import logger
-from app.sdk.network import RequestUtils
+try:
+    from app.sdk.config import settings
+    from app.sdk.logging import logger
+    from app.sdk.network import RequestUtils
+except ImportError:
+    from app.core.config import settings
+    from app.log import logger
+    from app.utils.http import RequestUtils
 
 
 TENCENT_DOCS_BASE_URL = "https://docs.qq.com"
