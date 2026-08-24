@@ -3,11 +3,12 @@
         "name": "腾讯文档115媒体库",
         "description": "同步多个腾讯文档中的115分享资源，支持断点、MoviePilot刮削、原生检索下载和内置Emby 302直链网关",
         "labels": "媒体库,115网盘,STRM,直链下载,Emby",
-        "version": "0.6.2",
+        "version": "0.6.3",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.6.3": "参考 MediaWarp 改用 MediaSourceId 与 ItemsService 定位原始 STRM，兼容 mediasource_ 前缀并保留用户权限校验",
             "v0.6.2": "兼容 Emby 将原始 STRM 放在 MediaSources 的情况，并在未接管下载时记录实际路径和配置前缀",
             "v0.6.1": "修复 Emby 压缩响应被网关重复解压导致登录接口返回200但客户端无法解析的问题",
             "v0.6.0": "内置 Emby 直链网关：代理媒体库接口并拦截本插件 STRM 播放与下载，客户端经302直接连接115，支持路径映射、状态展示和一键重启",

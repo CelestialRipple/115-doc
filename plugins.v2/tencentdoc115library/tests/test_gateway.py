@@ -117,6 +117,35 @@ def test_playback_info_forces_gateway_direct_stream():
     assert "TranscodingUrl" not in source
 
 
+def test_playback_info_uses_original_media_source_path():
+    config = {"emby_strm_paths": "/media/tencentdoc115"}
+    gateway = DirectPlayGateway(lambda: config, object())
+    payload = {
+        "MediaSources": [
+            {
+                "Id": "mediasource_31",
+                "Path": "http://moviepilot/private-play-url",
+                "SupportsDirectPlay": True,
+                "SupportsDirectStream": False,
+                "SupportsTranscoding": True,
+            }
+        ]
+    }
+
+    modified = gateway._modify_playback_info(
+        payload,
+        config,
+        source_paths={
+            "mediasource_31": "/media/tencentdoc115/电影/测试.strm"
+        },
+    )
+
+    source = modified["MediaSources"][0]
+    assert source["SupportsDirectPlay"] is False
+    assert source["SupportsDirectStream"] is True
+    assert source["SupportsTranscoding"] is False
+
+
 def test_gateway_redirects_managed_strm_and_proxies_other_requests():
     async def scenario():
         with TemporaryDirectory() as temporary_directory:
@@ -127,10 +156,16 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                 encoding="utf-8",
             )
 
-            async def item_handler(request):
+            async def items_handler(request):
                 if request.query.get("api_key") != "client-key":
                     raise web.HTTPUnauthorized()
-                return web.json_response({"Path": str(strm_path)})
+                assert request.query.get("Ids") == "source-1"
+                assert request.query.get("Limit") == "1"
+                assert request.query.get("Fields") == "Path,MediaSources"
+                assert request.query.get("Recursive") == "true"
+                return web.json_response(
+                    {"Items": [{"Path": str(strm_path)}]}
+                )
 
             async def public_info_handler(_request):
                 return web.json_response({"ServerName": "fake-emby"})
@@ -148,7 +183,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                 )
 
             emby_app = web.Application()
-            emby_app.router.add_get("/emby/Items/{item_id}", item_handler)
+            emby_app.router.add_get("/emby/Items", items_handler)
             emby_app.router.add_get(
                 "/emby/System/Info/Public",
                 public_info_handler,
@@ -186,7 +221,10 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                 async with ClientSession() as client:
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Items/1/Download",
-                        params={"api_key": "client-key"},
+                        params={
+                            "api_key": "client-key",
+                            "mediaSourceId": "mediasource_source-1",
+                        },
                         headers={"User-Agent": "gateway-test"},
                         allow_redirects=False,
                     ) as response:

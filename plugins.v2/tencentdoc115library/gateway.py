@@ -17,6 +17,8 @@ except ImportError:
 from .resolver import ShareResolutionError, ShareResolver
 
 
+# Emby MediaSourceId 查询流程参考 MediaWarp
+# https://github.com/AkimioJR/MediaWarp
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -143,9 +145,84 @@ class DirectPlayGateway:
         return base_url + "/" + path_qs.lstrip("/")
 
     @staticmethod
-    def _item_api_path(request_path: str, item_id: str) -> str:
+    def _items_api_path(request_path: str) -> str:
         prefix = "/emby" if request_path.lower().startswith("/emby/") else ""
-        return f"{prefix}/Items/{item_id}"
+        return f"{prefix}/Items"
+
+    @staticmethod
+    def _normalize_media_source_id(value: str) -> str:
+        return re.sub(
+            r"^mediasource_",
+            "",
+            str(value or "").strip(),
+            flags=re.IGNORECASE,
+        )
+
+    @classmethod
+    def _media_source_id(cls, request: web.Request) -> str:
+        """
+        从请求参数中提取并规范化 Emby MediaSourceId
+
+        :param request (Request): 客户端播放或下载请求
+
+        :return str: 去掉 mediasource_ 前缀的媒体源 ID
+        """
+        for name, value in request.query.items():
+            if name.lower() == "mediasourceid":
+                return cls._normalize_media_source_id(value)
+        return ""
+
+    async def _query_item(
+        self,
+        request_path: str,
+        lookup_id: str,
+        config: Dict[str, Any],
+        headers: Dict[str, str],
+        auth_query: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Dict[str, Any], int]:
+        """
+        使用 MediaSourceId 从 Emby ItemsService 查询原始媒体项
+
+        :param request_path (str): 客户端请求路径
+        :param lookup_id (str): 媒体源 ID 或媒体项 ID
+        :param config (Dict): 插件配置
+        :param headers (Dict): Emby 身份认证请求头
+        :param auth_query (Dict): Emby 身份认证查询参数
+
+        :return Tuple: 媒体项响应与 HTTP 状态码
+        """
+        if not self._session or not lookup_id:
+            return {}, 0
+        target_url = self._emby_url(
+            config,
+            self._items_api_path(request_path),
+        )
+        query = dict(auth_query or {})
+        query.update(
+            {
+                "Ids": lookup_id,
+                "Limit": "1",
+                "Fields": "Path,MediaSources",
+                "Recursive": "true",
+            }
+        )
+        async with self._session.get(
+            target_url,
+            headers=headers,
+            params=query,
+        ) as response:
+            status = response.status
+            if status != 200:
+                return {}, status
+            payload = await response.json(content_type=None)
+        items = payload.get("Items") if isinstance(payload, dict) else None
+        if isinstance(items, list) and items:
+            return items[0], status
+        if isinstance(payload, dict) and (
+            payload.get("Path") or payload.get("MediaSources")
+        ):
+            return payload, status
+        return {}, status
 
     @classmethod
     def _select_item_path(
@@ -226,15 +303,19 @@ class DirectPlayGateway:
         cached = self._item_paths.get(item_id)
         if cached:
             return cached
-        if not self._session:
-            return ""
-        api_path = self._item_api_path(request_path, item_id)
-        target_url = self._emby_url(config, api_path)
         headers = {"X-Emby-Token": str(config.get("emby_api_key") or "")}
-        async with self._session.get(target_url, headers=headers) as response:
-            if response.status != 200:
-                return ""
-            payload = await response.json(content_type=None)
+        payload, status = await self._query_item(
+            request_path,
+            item_id,
+            config,
+            headers,
+        )
+        if status != 200:
+            logger.warning(
+                f"直链网关使用配置密钥查询 Emby 媒体项 {item_id} "
+                f"失败：HTTP {status}"
+            )
+            return ""
         emby_path = self._select_item_path(payload, config)
         if emby_path:
             self._item_paths[item_id] = emby_path
@@ -265,20 +346,52 @@ class DirectPlayGateway:
         headers, query = self._client_auth(request)
         if not headers and not query:
             return ""
-        api_path = self._item_api_path(request.path, item_id)
-        target_url = self._emby_url(config, api_path)
-        async with self._session.get(
-            target_url,
-            headers=headers,
-            params=query,
-        ) as response:
-            if response.status != 200:
-                return ""
-            payload = await response.json(content_type=None)
+        lookup_id = self._media_source_id(request) or item_id
+        payload, status = await self._query_item(
+            request.path,
+            lookup_id,
+            config,
+            headers,
+            query,
+        )
+        if status != 200:
+            logger.warning(
+                f"直链网关使用客户端身份查询 Emby 媒体源 {lookup_id} "
+                f"失败：HTTP {status}"
+            )
+            return ""
         emby_path = self._select_item_path(payload, config)
         if emby_path:
-            self._item_paths[item_id] = emby_path
+            self._item_paths[lookup_id] = emby_path
         return emby_path
+
+    async def _playback_source_paths(
+        self,
+        request_path: str,
+        payload: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """
+        按 MediaWarp 的 MediaSourceId 查询流程获取播放源原始路径
+
+        :param request_path (str): PlaybackInfo 请求路径
+        :param payload (Dict): Emby PlaybackInfo 响应
+        :param config (Dict): 插件配置
+
+        :return Dict: MediaSourceId 到原始媒体路径的映射
+        """
+        source_paths: Dict[str, str] = {}
+        for source in payload.get("MediaSources") or []:
+            source_id = str(source.get("Id") or "").strip()
+            lookup_id = self._normalize_media_source_id(source_id)
+            if not lookup_id:
+                continue
+            source_paths[source_id] = await self._item_path(
+                request_path,
+                lookup_id,
+                config,
+            )
+        return source_paths
 
     def _strm_target(self, emby_path: str, config: Dict[str, Any]) -> Tuple[str, str]:
         local_path = self.local_strm_path(
@@ -337,11 +450,18 @@ class DirectPlayGateway:
         payload: Dict[str, Any],
         config: Dict[str, Any],
         item_path: str = "",
+        source_paths: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         managed_item = self._is_managed_path(item_path, config)
         for source in payload.get("MediaSources") or []:
             emby_path = str(source.get("Path") or "")
-            if not managed_item and not self._is_managed_path(emby_path, config):
+            source_id = str(source.get("Id") or "")
+            original_path = str((source_paths or {}).get(source_id) or "")
+            if (
+                not managed_item
+                and not self._is_managed_path(original_path, config)
+                and not self._is_managed_path(emby_path, config)
+            ):
                 continue
             source["SupportsDirectPlay"] = False
             source["SupportsDirectStream"] = True
@@ -422,15 +542,23 @@ class DirectPlayGateway:
                 upstream_body = await upstream.read()
                 try:
                     payload = json.loads(upstream_body)
-                    item_path = await self._item_path(
+                    source_paths = await self._playback_source_paths(
                         request.path,
-                        playback_match.group(1),
+                        payload,
                         config,
                     )
+                    item_path = ""
+                    if not any(source_paths.values()):
+                        item_path = await self._item_path(
+                            request.path,
+                            playback_match.group(1),
+                            config,
+                        )
                     modified = self._modify_playback_info(
                         payload,
                         config,
                         item_path,
+                        source_paths,
                     )
                     return web.json_response(
                         modified,
