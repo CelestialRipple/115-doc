@@ -1,6 +1,8 @@
 import asyncio
+import gzip
 import json
 import re
+import zlib
 from pathlib import Path
 from secrets import compare_digest
 from threading import Lock, Thread
@@ -206,15 +208,28 @@ class DirectPlayGateway:
                 "Recursive": "true",
             }
         )
+        request_headers = dict(headers)
+        request_headers["Accept-Encoding"] = "identity"
         async with self._session.get(
             target_url,
-            headers=headers,
+            headers=request_headers,
             params=query,
         ) as response:
             status = response.status
             if status != 200:
                 return {}, status
-            payload = await response.json(content_type=None)
+            body = await response.read()
+            content_encoding = str(
+                response.headers.get("Content-Encoding") or ""
+            ).lower()
+            if content_encoding == "gzip":
+                body = gzip.decompress(body)
+            elif content_encoding == "deflate":
+                try:
+                    body = zlib.decompress(body)
+                except zlib.error:
+                    body = zlib.decompress(body, -zlib.MAX_WBITS)
+            payload = json.loads(body)
         items = payload.get("Items") if isinstance(payload, dict) else None
         if isinstance(items, list) and items:
             return items[0], status
@@ -419,7 +434,17 @@ class DirectPlayGateway:
         item_id: str,
         config: Dict[str, Any],
     ) -> Optional[web.Response]:
-        emby_path = await self._authorized_item_path(request, item_id, config)
+        try:
+            emby_path = await self._authorized_item_path(request, item_id, config)
+        except Exception as error:
+            logger.error(
+                f"直链网关查询 Emby 媒体项 {item_id} 失败：{error}",
+                exc_info=True,
+            )
+            return web.json_response(
+                {"success": False, "message": f"查询 Emby 媒体项失败：{error}"},
+                status=502,
+            )
         if not self._is_managed_path(emby_path, config):
             self._log_unmanaged_item(item_id, emby_path, config)
             return None

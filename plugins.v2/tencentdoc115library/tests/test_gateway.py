@@ -159,12 +159,19 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
             async def items_handler(request):
                 if request.query.get("api_key") != "client-key":
                     raise web.HTTPUnauthorized()
+                assert request.headers.get("Accept-Encoding") == "identity"
                 assert request.query.get("Ids") == "source-1"
                 assert request.query.get("Limit") == "1"
                 assert request.query.get("Fields") == "Path,MediaSources"
                 assert request.query.get("Recursive") == "true"
-                return web.json_response(
-                    {"Items": [{"Path": str(strm_path)}]}
+                body = json.dumps(
+                    {"Items": [{"Path": str(strm_path)}]},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                return web.Response(
+                    body=zlib.compress(body),
+                    content_type="application/json",
+                    headers={"Content-Encoding": "deflate"},
                 )
 
             async def public_info_handler(_request):
