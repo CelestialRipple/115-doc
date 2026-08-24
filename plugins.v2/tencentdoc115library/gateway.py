@@ -71,6 +71,7 @@ class DirectPlayGateway:
         self._state = "disabled"
         self._last_error = ""
         self._item_paths: Dict[str, str] = {}
+        self._unmanaged_items: Dict[str, str] = {}
 
     @staticmethod
     def parse_path_mappings(value: str) -> List[Tuple[str, str]]:
@@ -146,6 +147,64 @@ class DirectPlayGateway:
         prefix = "/emby" if request_path.lower().startswith("/emby/") else ""
         return f"{prefix}/Items/{item_id}"
 
+    @classmethod
+    def _select_item_path(
+        cls,
+        payload: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> str:
+        """
+        从媒体项及媒体源中选择原始 STRM 路径
+
+        优先返回符合已配置媒体库前缀的 STRM，避免 Emby 顶层 Path
+        是播放地址时忽略 MediaSources 中的原始文件路径
+
+        :param payload (Dict): Emby 媒体项响应
+        :param config (Dict): 插件配置
+
+        :return str: 最合适的媒体路径，找不到时返回空字符串
+        """
+        candidates: List[str] = []
+        item_path = str(payload.get("Path") or "").strip()
+        if item_path:
+            candidates.append(item_path)
+        for source in payload.get("MediaSources") or []:
+            candidate = str(source.get("Path") or "").strip()
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            if cls._is_managed_path(candidate, config):
+                return candidate
+        for candidate in candidates:
+            if candidate.lower().endswith(".strm"):
+                return candidate
+        return candidates[0] if candidates else ""
+
+    def _log_unmanaged_item(
+        self,
+        item_id: str,
+        emby_path: str,
+        config: Dict[str, Any],
+    ) -> None:
+        """
+        首次遇到未接管媒体项时记录路径诊断信息
+
+        :param item_id (str): Emby 媒体项 ID
+        :param emby_path (str): Emby 返回的媒体路径
+        :param config (Dict): 插件配置
+        """
+        signature = f"{emby_path}|{'|'.join(self._prefixes(config))}"
+        if self._unmanaged_items.get(item_id) == signature:
+            return
+        if len(self._unmanaged_items) >= 200:
+            self._unmanaged_items.pop(next(iter(self._unmanaged_items)))
+        self._unmanaged_items[item_id] = signature
+        logger.warning(
+            f"直链网关未接管 Emby 媒体项 {item_id}："
+            f"媒体路径={emby_path or '未取得'}，"
+            f"配置前缀={self._prefixes(config)}"
+        )
+
     def _validate(self, config: Dict[str, Any]) -> None:
         internal_url = str(config.get("emby_internal_url") or "").strip()
         if not internal_url.startswith(("http://", "https://")):
@@ -176,13 +235,7 @@ class DirectPlayGateway:
             if response.status != 200:
                 return ""
             payload = await response.json(content_type=None)
-        emby_path = str(payload.get("Path") or "")
-        if not emby_path:
-            for source in payload.get("MediaSources") or []:
-                candidate = str(source.get("Path") or "")
-                if candidate:
-                    emby_path = candidate
-                    break
+        emby_path = self._select_item_path(payload, config)
         if emby_path:
             self._item_paths[item_id] = emby_path
         return emby_path
@@ -222,13 +275,7 @@ class DirectPlayGateway:
             if response.status != 200:
                 return ""
             payload = await response.json(content_type=None)
-        emby_path = str(payload.get("Path") or "")
-        if not emby_path:
-            for source in payload.get("MediaSources") or []:
-                candidate = str(source.get("Path") or "")
-                if candidate:
-                    emby_path = candidate
-                    break
+        emby_path = self._select_item_path(payload, config)
         if emby_path:
             self._item_paths[item_id] = emby_path
         return emby_path
@@ -261,6 +308,7 @@ class DirectPlayGateway:
     ) -> Optional[web.Response]:
         emby_path = await self._authorized_item_path(request, item_id, config)
         if not self._is_managed_path(emby_path, config):
+            self._log_unmanaged_item(item_id, emby_path, config)
             return None
         try:
             resource_id, file_id = self._strm_target(emby_path, config)

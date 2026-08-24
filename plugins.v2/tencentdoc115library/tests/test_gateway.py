@@ -53,6 +53,33 @@ def test_managed_path_requires_strm_and_configured_prefix():
     )
 
 
+def test_select_item_path_prefers_managed_media_source():
+    config = {"emby_strm_paths": "/media/tencentdoc115"}
+    payload = {
+        "Path": "http://moviepilot/private-play-url",
+        "MediaSources": [
+            {"Path": "http://moviepilot/another-play-url"},
+            {"Path": "/media/tencentdoc115/电影/测试.strm"},
+        ],
+    }
+
+    assert DirectPlayGateway._select_item_path(payload, config) == (
+        "/media/tencentdoc115/电影/测试.strm"
+    )
+
+
+def test_select_item_path_returns_unmatched_strm_for_diagnostics():
+    config = {"emby_strm_paths": "/wrong-prefix"}
+    payload = {
+        "Path": "http://moviepilot/private-play-url",
+        "MediaSources": [{"Path": "/media/tencentdoc115/电影/测试.strm"}],
+    }
+
+    assert DirectPlayGateway._select_item_path(payload, config) == (
+        "/media/tencentdoc115/电影/测试.strm"
+    )
+
+
 def test_emby_url_avoids_duplicate_emby_prefix():
     config = {"emby_internal_url": "http://emby:8096/emby"}
 
