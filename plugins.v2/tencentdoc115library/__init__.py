@@ -22,7 +22,12 @@ try:
 except ImportError:
     from app.helper.thread import ThreadHelper
 
-from .catalog import CatalogSynchronizer, default_group_for_title, sheet_config_key
+from .catalog import (
+    CatalogSynchronizer,
+    default_group_for_title,
+    default_media_mode_for_title,
+    sheet_config_key,
+)
 from .client import TencentDocumentClient
 from .downloader import (
     DIRECT_DOWNLOADER_NAME,
@@ -77,6 +82,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "emby_api_key": "",
     "emby_strm_paths": "/data/tencentdoc115",
     "emby_path_mappings": "",
+    "clear_confirmation": False,
 }
 
 
@@ -86,7 +92,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.6.4"
+    plugin_version = "0.7.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -603,6 +609,54 @@ class TencentDoc115Library(_PluginBase):
         self._gateway.restart_background()
         return Response(success=True, message="直链网关正在后台重启")
 
+    def clear_all_data(self) -> Response:
+        """清空插件数据库以及输出目录中的 STRM 和元数据文件"""
+        if self._future and not self._future.done():
+            return Response(success=False, message="请先停止并等待后台任务结束")
+        if not self._config.get("clear_confirmation"):
+            return Response(
+                success=False,
+                message=(
+                    "请先在插件配置中开启“我确认清空全部插件数据和生成元数据”"
+                    "并保存"
+                ),
+            )
+        if not self._store or not self._builder:
+            return Response(success=False, message="插件尚未初始化")
+        try:
+            cleanup = self._builder.clear_generated_output()
+            self._store.clear_all()
+            if self._gateway:
+                self._gateway.clear_cache()
+            updated_config = dict(self._config)
+            for key in list(updated_config):
+                if key.startswith("sheet_") and key.endswith(
+                    ("_enabled", "_group", "_media_mode")
+                ):
+                    updated_config.pop(key, None)
+            updated_config["clear_confirmation"] = False
+            self._replace_config(updated_config)
+            self._set_pipeline_status(
+                phase="idle",
+                message="数据已清空，请重新发现工作表并开始同步",
+                synced_pages=0,
+                synced_rows=0,
+                built=0,
+                success=0,
+                failed=0,
+            )
+            retained_files = int(cleanup.get("retained_files") or 0)
+            message = (
+                f"已清空数据库并删除 {int(cleanup.get('deleted_files') or 0)} 个 "
+                "STRM/元数据文件"
+            )
+            if retained_files:
+                message += f"；为安全起见保留了 {retained_files} 个其它文件"
+            return Response(success=True, message=message, data=cleanup)
+        except Exception as error:
+            logger.error(f"清空腾讯文档115媒体库失败：{error}", exc_info=True)
+            return Response(success=False, message=str(error))
+
     def play(
         self,
         resource_id: str,
@@ -706,6 +760,13 @@ class TencentDoc115Library(_PluginBase):
                 "endpoint": self.restart_gateway,
                 "methods": ["POST"],
                 "summary": "重启内置 Emby 直链网关",
+                "auth": "bear",
+            },
+            {
+                "path": "/clear-all",
+                "endpoint": self.clear_all_data,
+                "methods": ["POST"],
+                "summary": "清空插件数据库和生成内容",
                 "auth": "bear",
             },
             {
@@ -832,7 +893,7 @@ class TencentDoc115Library(_PluginBase):
                     "content": [
                         {
                             "component": "VCol",
-                            "props": {"cols": 12, "md": 4},
+                            "props": {"cols": 12, "md": 3},
                             "content": [
                                 {
                                     "component": "VSwitch",
@@ -846,8 +907,36 @@ class TencentDoc115Library(_PluginBase):
                         self._text_field(
                             f"sheet_{key}_group",
                             "输出分组（相同名称即合并）",
-                            cols=8,
+                            cols=5,
                         ),
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": f"sheet_{key}_media_mode",
+                                        "label": "媒体类型",
+                                        "items": [
+                                            {"title": "电影", "value": "movie"},
+                                            {"title": "剧集", "value": "tv"},
+                                            {
+                                                "title": "混合（按类型列分流）",
+                                                "value": "mixed",
+                                            },
+                                        ],
+                                        "item-title": "title",
+                                        "item-value": "value",
+                                        "persistent-hint": True,
+                                        "hint": (
+                                            "混合模式中，类型列含“剧集”则输出到"
+                                            "基础分组-剧集，其余按电影处理"
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
                     ],
                 }
             )
@@ -1117,7 +1206,56 @@ class TencentDoc115Library(_PluginBase):
                         "props": {"class": "text-h6 mb-2"},
                         "text": "工作表与输出分组",
                     },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "class": "mb-3",
+                            "text": (
+                                "每个工作表必须指定电影、剧集或混合类型。"
+                                "混合类型逐行读取“类型”列：含剧集关键词的行输出到"
+                                "“基础分组-剧集”，其它行输出到基础分组。"
+                            ),
+                        },
+                    },
                     *sheet_rows,
+                    {
+                        "component": "VDivider",
+                        "props": {"class": "my-4"},
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "error",
+                            "variant": "tonal",
+                            "class": "mb-3",
+                            "text": (
+                                "危险操作：开启确认开关并保存后，详情页的清空按钮会"
+                                "清空 SQLite，并删除输出目录内的 STRM、NFO 和图片。"
+                                "其它类型文件会保留。"
+                            ),
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "clear_confirmation",
+                                            "label": "我确认清空全部插件数据和生成元数据",
+                                            "color": "error",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
                 ],
             }
         ]
@@ -1136,6 +1274,10 @@ class TencentDoc115Library(_PluginBase):
             defaults.setdefault(
                 f"sheet_{key}_group",
                 default_group_for_title(sheet["title"]),
+            )
+            defaults.setdefault(
+                f"sheet_{key}_media_mode",
+                default_media_mode_for_title(sheet["title"]),
             )
         return form, defaults
 
@@ -1189,6 +1331,12 @@ class TencentDoc115Library(_PluginBase):
                 "gateway/restart",
                 "info",
             ),
+            (
+                "清空并重新开始",
+                "mdi-delete-alert",
+                "clear-all",
+                "error",
+            ),
         ]
         button_components = [
             {
@@ -1210,6 +1358,11 @@ class TencentDoc115Library(_PluginBase):
             for label, icon, endpoint, color in buttons
         ]
         sheet_items: List[Dict[str, Any]] = []
+        media_mode_labels = {
+            "movie": "电影",
+            "tv": "剧集",
+            "mixed": "混合",
+        }
         for sheet in snapshot.get("sheets", []):
             total = int(sheet.get("used_row_count") or sheet.get("row_count") or 0)
             checkpoint = max(int(sheet.get("checkpoint_row") or 1) - 1, 0)
@@ -1220,6 +1373,7 @@ class TencentDoc115Library(_PluginBase):
                         "title": str(sheet.get("title") or ""),
                         "subtitle": (
                             f"分组：{sheet.get('group_name') or '未设置'} · "
+                            f"类型：{media_mode_labels.get(str(sheet.get('media_mode')), '电影')} · "
                             f"状态：{sheet.get('scan_status')} · "
                             f"检查点：{checkpoint}/{total or '?'}"
                         ),

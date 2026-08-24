@@ -30,6 +30,8 @@ DEFAULT_COLUMN_INDEX = {
     "rating": 4,
     "year": 5,
 }
+SHEET_MEDIA_MODES = {"movie", "tv", "mixed"}
+TV_ROW_KEYWORDS = ("剧集", "电视剧", "连续剧", "tv", "番剧")
 
 
 def document_sources(config: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -86,6 +88,55 @@ def default_group_for_title(title: str) -> str:
     if "蚂蚁" in normalized:
         return "蚂蚁"
     return "电影合集"
+
+
+def default_media_mode_for_title(title: str) -> str:
+    """
+    根据工作表标题选择首次发现时的媒体类型模式
+
+    :param title (str): 工作表标题
+
+    :return str: movie、tv 或 mixed
+    """
+    normalized = str(title or "").strip().lower()
+    if "星火" in normalized:
+        return "mixed"
+    if any(keyword in normalized for keyword in TV_ROW_KEYWORDS):
+        return "tv"
+    return "movie"
+
+
+def normalize_media_mode(value: str, sheet_title: str = "") -> str:
+    """
+    标准化工作表媒体类型模式
+
+    :param value (str): 配置中的媒体类型模式
+    :param sheet_title (str): 用于缺省推断的工作表标题
+
+    :return str: movie、tv 或 mixed
+    """
+    normalized = str(value or "").strip().lower()
+    return (
+        normalized
+        if normalized in SHEET_MEDIA_MODES
+        else default_media_mode_for_title(sheet_title)
+    )
+
+
+def output_group_for_row(group_name: str, media_mode: str, is_tv: bool) -> str:
+    """
+    计算当前表格行的输出分组
+
+    :param group_name (str): 工作表基础输出分组
+    :param media_mode (str): 工作表媒体类型模式
+    :param is_tv (bool): 当前行是否为剧集
+
+    :return str: 当前行实际输出分组
+    """
+    base_group = str(group_name or "").strip()
+    if media_mode == "mixed" and is_tv:
+        return base_group if base_group.endswith("-剧集") else f"{base_group}-剧集"
+    return base_group
 
 
 class CatalogParser:
@@ -175,6 +226,7 @@ class CatalogParser:
         row_number: int,
         row: List[str],
         header_map: Dict[str, int],
+        media_mode: str = "auto",
     ) -> Optional[Dict[str, Any]]:
         """
         解析一行媒体资源
@@ -185,6 +237,7 @@ class CatalogParser:
         :param row_number (int): 表格行号
         :param row (List): 单元格文本列表
         :param header_map (Dict): 表头映射
+        :param media_mode (str): movie、tv、mixed 或兼容旧行为的 auto
 
         :return Dict: 标准资源，非资源行返回 None
         """
@@ -194,11 +247,31 @@ class CatalogParser:
         share_url = cls._extract_share_url(raw_link, row)
         if not title or not share_url or not looks_like_url(share_url):
             return None
-        media_type = cls._value(row, header_map, "media_type")
-        if not media_type and any(
-            keyword in sheet_title for keyword in ("剧集", "电视剧", "连续剧")
-        ):
+        raw_media_type = cls._value(row, header_map, "media_type")
+        normalized_mode = str(media_mode or "auto").strip().lower()
+        if normalized_mode == "tv":
             media_type = "电视剧"
+            actual_group_name = output_group_for_row(group_name, normalized_mode, True)
+        elif normalized_mode == "movie":
+            media_type = "电影"
+            actual_group_name = output_group_for_row(group_name, normalized_mode, False)
+        elif normalized_mode == "mixed":
+            is_tv = any(
+                keyword in raw_media_type.lower() for keyword in TV_ROW_KEYWORDS
+            )
+            media_type = "电视剧" if is_tv else "电影"
+            actual_group_name = output_group_for_row(
+                group_name,
+                normalized_mode,
+                is_tv,
+            )
+        else:
+            media_type = raw_media_type
+            if not media_type and any(
+                keyword in sheet_title for keyword in ("剧集", "电视剧", "连续剧")
+            ):
+                media_type = "电视剧"
+            actual_group_name = group_name
         values = [
             title,
             version,
@@ -221,8 +294,8 @@ class CatalogParser:
             "media_type": media_type,
             "rating": values[4],
             "year": values[5],
-            "group_name": group_name,
-            "row_hash": cls._row_hash(values, group_name),
+            "group_name": actual_group_name,
+            "row_hash": cls._row_hash(values, actual_group_name),
         }
 
 
@@ -271,6 +344,10 @@ class CatalogSynchronizer:
                     config.get(f"sheet_{key}_group")
                     or default_group_for_title(sheet["title"])
                 ).strip(),
+                "media_mode": normalize_media_mode(
+                    str(config.get(f"sheet_{key}_media_mode") or ""),
+                    str(sheet["title"]),
+                ),
             }
         return mappings
 
@@ -315,11 +392,15 @@ class CatalogSynchronizer:
             key = sheet_config_key(sheet["sheet_id"])
             enabled_key = f"sheet_{key}_enabled"
             group_key = f"sheet_{key}_group"
+            media_mode_key = f"sheet_{key}_media_mode"
             if enabled_key not in config:
                 config[enabled_key] = False
                 config_changed = True
             if not config.get(group_key):
                 config[group_key] = default_group_for_title(sheet["title"])
+                config_changed = True
+            if media_mode_key not in config:
+                config[media_mode_key] = default_media_mode_for_title(sheet["title"])
                 config_changed = True
         if config_changed:
             self.config_updater(config)
@@ -427,6 +508,7 @@ class CatalogSynchronizer:
                             row_number=row_number,
                             row=row,
                             header_map=header_map,
+                            media_mode=str(sheet.get("media_mode") or "movie"),
                         )
                         if resource:
                             resources.append(resource)

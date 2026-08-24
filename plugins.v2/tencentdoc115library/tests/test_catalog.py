@@ -4,6 +4,7 @@ from tencentdoc115library.catalog import (
     CatalogParser,
     CatalogSynchronizer,
     default_group_for_title,
+    default_media_mode_for_title,
     document_sources,
     namespaced_sheet_id,
 )
@@ -18,6 +19,9 @@ def test_default_groups_match_expected_library_layout() -> None:
     assert default_group_for_title("剧集") == "剧集"
     assert default_group_for_title("星火4K全站资源") == "星火"
     assert default_group_for_title("蚂蚁4K") == "蚂蚁"
+    assert default_media_mode_for_title("电影大全") == "movie"
+    assert default_media_mode_for_title("剧集大全") == "tv"
+    assert default_media_mode_for_title("星火4K全站资源") == "mixed"
 
 
 def test_multiple_document_sources_support_aliases_and_unique_sheet_ids() -> None:
@@ -126,6 +130,78 @@ def test_parser_prioritizes_share_path_across_alternate_domains() -> None:
     )
     assert resource is not None
     assert resource["share_url"] == ("https://115cdn.com/s/swsbevb3hkk?password=sk4k&")
+
+
+def test_mixed_sheet_splits_tv_rows_into_separate_group() -> None:
+    mapping = CatalogParser.identify_headers(
+        ["影片名称", "资源版本", "资源链接", "类型", "年份"]
+    )
+    tv_resource = CatalogParser.parse_row(
+        sheet_id="spark",
+        sheet_title="星火4K全站资源",
+        group_name="星火",
+        row_number=2,
+        row=[
+            "林肯律师",
+            "4K",
+            "https://115.com/s/tv",
+            "欧美剧集",
+            "2022",
+        ],
+        header_map=mapping,
+        media_mode="mixed",
+    )
+    movie_resource = CatalogParser.parse_row(
+        sheet_id="spark",
+        sheet_title="星火4K全站资源",
+        group_name="星火",
+        row_number=3,
+        row=[
+            "流浪地球",
+            "4K",
+            "https://115.com/s/movie",
+            "科幻",
+            "2019",
+        ],
+        header_map=mapping,
+        media_mode="mixed",
+    )
+
+    assert tv_resource is not None
+    assert tv_resource["media_type"] == "电视剧"
+    assert tv_resource["group_name"] == "星火-剧集"
+    assert movie_resource is not None
+    assert movie_resource["media_type"] == "电影"
+    assert movie_resource["group_name"] == "星火"
+
+
+def test_fixed_sheet_mode_overrides_row_type_column() -> None:
+    mapping = {"title": 0, "share_url": 1, "media_type": 2}
+    movie_resource = CatalogParser.parse_row(
+        sheet_id="movie",
+        sheet_title="自定义",
+        group_name="电影库",
+        row_number=2,
+        row=["测试", "https://115.com/s/movie", "剧集"],
+        header_map=mapping,
+        media_mode="movie",
+    )
+    tv_resource = CatalogParser.parse_row(
+        sheet_id="tv",
+        sheet_title="自定义",
+        group_name="剧集库",
+        row_number=2,
+        row=["测试", "https://115.com/s/tv", "电影"],
+        header_map=mapping,
+        media_mode="tv",
+    )
+
+    assert movie_resource is not None
+    assert movie_resource["media_type"] == "电影"
+    assert movie_resource["group_name"] == "电影库"
+    assert tv_resource is not None
+    assert tv_resource["media_type"] == "电视剧"
+    assert tv_resource["group_name"] == "剧集库"
 
 
 def test_tencent_range_limits_never_exceed_cell_limit() -> None:

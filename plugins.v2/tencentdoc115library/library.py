@@ -28,6 +28,20 @@ from .store import CatalogStore
 
 INVALID_PATH_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 TV_TYPE_KEYWORDS = ("电视剧", "剧集", "连续剧", "tv", "番剧")
+MOVIE_TYPE_KEYWORDS = ("电影", "movie", "影片")
+GENERATED_METADATA_SUFFIXES = {
+    ".strm",
+    ".nfo",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".tbn",
+    ".tmp",
+}
 CHINESE_DIGITS = {
     "零": 0,
     "〇": 0,
@@ -139,9 +153,11 @@ class LibraryBuilder:
     ) -> MediaType:
         raw_type = str(resource.get("media_type") or "").lower()
         group_name = str(resource.get("group_name") or "").lower()
-        if any(
-            keyword in raw_type or keyword in group_name for keyword in TV_TYPE_KEYWORDS
-        ):
+        if any(keyword in raw_type for keyword in TV_TYPE_KEYWORDS):
+            return MediaType.TV
+        if any(keyword in raw_type for keyword in MOVIE_TYPE_KEYWORDS):
+            return MediaType.MOVIE
+        if any(keyword in group_name for keyword in TV_TYPE_KEYWORDS):
             return MediaType.TV
         if source_files and any(
             LibraryBuilder._looks_like_tv_path(
@@ -186,6 +202,13 @@ class LibraryBuilder:
             raise LibraryBuildError(
                 f"MoviePilot 返回了不支持的媒体类型：{mediainfo.type}"
             )
+        if mediainfo.type != media_type:
+            expected_type = getattr(media_type, "value", str(media_type))
+            actual_type = getattr(mediainfo.type, "value", str(mediainfo.type))
+            raise LibraryBuildError(
+                f"MoviePilot 媒体类型不匹配：要求 {expected_type}，"
+                f"实际返回 {actual_type}；已拒绝写入错误元数据"
+            )
         return meta, mediainfo
 
     @staticmethod
@@ -224,6 +247,70 @@ class LibraryBuilder:
             "usage_bytes": usage_bytes,
             "limit_bytes": limit_bytes,
             "limit_reached": bool(limit_bytes and usage_bytes >= limit_bytes),
+        }
+
+    def clear_generated_output(self) -> Dict[str, int]:
+        """
+        清除输出目录内的 STRM、NFO、图片和临时文件并保留其它文件
+
+        :return Dict: 删除文件数、保留文件数和释放字节数
+
+        :raises LibraryBuildError: 输出目录过宽或是符号链接时拒绝清空
+        """
+        raw_root = str(self.config_provider().get("output_root") or "").strip()
+        if not raw_root:
+            raise LibraryBuildError("未配置 STRM 输出目录")
+        configured_root = Path(raw_root).expanduser()
+        if configured_root.is_symlink():
+            raise LibraryBuildError("输出目录是符号链接，为避免误删已拒绝清空")
+        root = configured_root.resolve()
+        forbidden_paths = {
+            Path("/"),
+            Path("/config"),
+            Path("/data"),
+            Path("/media"),
+            Path("/mnt"),
+            Path.home().resolve(),
+        }
+        if root in forbidden_paths or len(root.parts) < 3:
+            raise LibraryBuildError(f"输出目录范围过大，已拒绝清空：{root}")
+        if not root.exists():
+            return {"deleted_files": 0, "retained_files": 0, "freed_bytes": 0}
+        if not root.is_dir():
+            raise LibraryBuildError(f"输出路径不是目录：{root}")
+        deleted_files = 0
+        retained_files = 0
+        freed_bytes = 0
+        directories: List[Path] = []
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                retained_files += 1
+                continue
+            if path.is_dir():
+                directories.append(path)
+                continue
+            if path.suffix.lower() not in GENERATED_METADATA_SUFFIXES:
+                retained_files += 1
+                continue
+            try:
+                freed_bytes += path.stat().st_size
+            except OSError:
+                pass
+            path.unlink()
+            deleted_files += 1
+        for directory in sorted(
+            directories,
+            key=lambda item: len(item.parts),
+            reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        return {
+            "deleted_files": deleted_files,
+            "retained_files": retained_files,
+            "freed_bytes": freed_bytes,
         }
 
     def _play_url(self, resource_id: str, file_id: Optional[str] = None) -> str:

@@ -32,7 +32,15 @@ def _store(tmp_path: Path) -> CatalogStore:
             }
         ]
     )
-    store.configure_sheets({"sheet-1": {"enabled": True, "group_name": "电影合集"}})
+    store.configure_sheets(
+        {
+            "sheet-1": {
+                "enabled": True,
+                "group_name": "电影合集",
+                "media_mode": "movie",
+            }
+        }
+    )
     return store
 
 
@@ -79,11 +87,54 @@ def test_group_change_requeues_existing_resource(tmp_path: Path) -> None:
     store.update_resource_status(
         "resource-1", "ready", strm_path="/old/group/movie.strm"
     )
-    store.configure_sheets({"sheet-1": {"enabled": True, "group_name": "星火"}})
+    store.configure_sheets(
+        {
+            "sheet-1": {
+                "enabled": True,
+                "group_name": "星火",
+                "media_mode": "movie",
+            }
+        }
+    )
     resource = store.get_resource("resource-1")
     assert resource["status"] == "pending"
     assert resource["group_name"] == "星火"
     assert resource["strm_path"] is None
+
+
+def test_media_mode_change_requires_fresh_sheet_sync(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+    store.update_resource_status("resource-1", "ready", strm_path="/old/movie.strm")
+
+    store.configure_sheets(
+        {
+            "sheet-1": {
+                "enabled": True,
+                "group_name": "星火",
+                "media_mode": "mixed",
+            }
+        }
+    )
+
+    sheet = store.get_sheet("sheet-1")
+    assert sheet["media_mode"] == "mixed"
+    assert sheet["checkpoint_row"] == 1
+    assert sheet["scan_status"] == "idle"
+    assert store.get_resource("resource-1")["status"] == "removed"
+
+
+def test_clear_all_removes_database_records(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+
+    store.clear_all()
+
+    assert store.list_sheets() == []
+    assert store.get_resource("resource-1") is None
+    assert store.status_snapshot()["total_resources"] == 0
 
 
 def test_local_search_defaults_to_ready_resources(tmp_path: Path) -> None:

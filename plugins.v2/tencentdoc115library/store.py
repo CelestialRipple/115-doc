@@ -7,7 +7,7 @@ from threading import RLock
 from typing import Any, Dict, Generator, List, Optional, Tuple
 from uuid import uuid4
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def utc_now() -> str:
@@ -73,6 +73,7 @@ class CatalogStore:
                     used_column_count INTEGER NOT NULL DEFAULT 0,
                     enabled INTEGER NOT NULL DEFAULT 0,
                     group_name TEXT NOT NULL DEFAULT '',
+                    media_mode TEXT NOT NULL DEFAULT 'movie',
                     checkpoint_row INTEGER NOT NULL DEFAULT 1,
                     scan_id TEXT,
                     scan_status TEXT NOT NULL DEFAULT 'idle',
@@ -196,6 +197,11 @@ class CatalogStore:
                     connection.execute(
                         f"ALTER TABLE sheet_state ADD COLUMN {column_name} TEXT"
                     )
+            if "media_mode" not in sheet_columns:
+                connection.execute(
+                    "ALTER TABLE sheet_state ADD COLUMN media_mode "
+                    "TEXT NOT NULL DEFAULT 'movie'"
+                )
             resource_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(resource)").fetchall()
@@ -322,7 +328,7 @@ class CatalogStore:
 
     def configure_sheets(self, mappings: Dict[str, Dict[str, Any]]) -> None:
         """
-        更新工作表启用状态和输出分组
+        更新工作表启用状态、输出分组和媒体类型模式
 
         :param mappings (Dict): 以工作表 ID 为键的配置映射
         """
@@ -330,27 +336,74 @@ class CatalogStore:
             for sheet_id, mapping in mappings.items():
                 group_name = str(mapping.get("group_name") or "").strip()
                 current = connection.execute(
-                    "SELECT group_name FROM sheet_state WHERE sheet_id = ?",
+                    "SELECT group_name, media_mode FROM sheet_state "
+                    "WHERE sheet_id = ?",
                     (sheet_id,),
                 ).fetchone()
+                requested_mode = str(mapping.get("media_mode") or "").strip().lower()
+                media_mode = (
+                    requested_mode
+                    if requested_mode in {"movie", "tv", "mixed"}
+                    else str(current["media_mode"] if current else "movie")
+                )
                 connection.execute(
-                    "UPDATE sheet_state SET enabled = ?, group_name = ?, updated_at = ? "
+                    "UPDATE sheet_state SET enabled = ?, group_name = ?, "
+                    "media_mode = ?, updated_at = ? "
                     "WHERE sheet_id = ?",
                     (
                         1 if mapping.get("enabled") else 0,
                         group_name,
+                        media_mode,
                         utc_now(),
                         sheet_id,
                     ),
                 )
-                if current and current["group_name"] != group_name:
+                group_changed = bool(
+                    current and current["group_name"] != group_name
+                )
+                mode_changed = bool(
+                    current and current["media_mode"] != media_mode
+                )
+                if group_changed and not mode_changed:
+                    tv_group = (
+                        group_name
+                        if group_name.endswith("-剧集")
+                        else f"{group_name}-剧集"
+                    )
                     connection.execute(
-                        "UPDATE resource SET group_name = ?, status = 'pending', "
+                        "UPDATE resource SET group_name = CASE "
+                        "WHEN ? = 'mixed' AND (media_type LIKE '%剧集%' "
+                        "OR LOWER(media_type) LIKE '%tv%' OR media_type LIKE '%番剧%') "
+                        "THEN ? ELSE ? END, status = 'pending', "
                         "strm_status = 'pending', scrape_status = 'pending', "
                         "strm_path = NULL, last_error = NULL, updated_at = ? "
                         "WHERE sheet_id = ? AND status <> 'removed'",
-                        (group_name, utc_now(), sheet_id),
+                        (media_mode, tv_group, group_name, utc_now(), sheet_id),
                     )
+                if mode_changed:
+                    connection.execute(
+                        "UPDATE sheet_state SET checkpoint_row = 1, scan_id = NULL, "
+                        "scan_status = 'idle', header_json = '{}', processed_rows = 0, "
+                        "last_error = NULL, updated_at = ? WHERE sheet_id = ?",
+                        (utc_now(), sheet_id),
+                    )
+                    connection.execute(
+                        "UPDATE resource SET status = 'removed', strm_status = 'pending', "
+                        "scrape_status = 'pending', strm_path = NULL, last_error = NULL, "
+                        "updated_at = ? WHERE sheet_id = ?",
+                        (utc_now(), sheet_id),
+                    )
+
+    def clear_all(self) -> None:
+        """清空全部工作表、资源、下载任务和同步历史记录"""
+        with self._lock, self.connection() as connection:
+            connection.execute("DELETE FROM direct_download_task")
+            connection.execute("DELETE FROM resource_file")
+            connection.execute("DELETE FROM resource")
+            connection.execute("DELETE FROM sheet_state")
+            connection.execute("DELETE FROM sync_run")
+        with self._lock, self.connection() as connection:
+            connection.execute("VACUUM")
 
     def list_sheets(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
         """

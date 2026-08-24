@@ -53,10 +53,12 @@ def main() -> None:
         assert "/tasks/stop" in api_paths
         assert "/resources/retry-all" in api_paths
         assert "/gateway/restart" in api_paths
+        assert "/clear-all" in api_paths
         page_text = str(plugin.get_page())
         assert "STRM 与刮削进度" in page_text
         assert "重试全部失败并生成" in page_text
         assert "内置直链网关" in page_text
+        assert "清空并重新开始" in page_text
 
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()
@@ -83,12 +85,34 @@ def main() -> None:
             MediaType.MOVIE,
         )
         assert recognized.type == MediaType.MOVIE
+
+        class WrongTypeMediaChain:
+            @staticmethod
+            def recognize_by_meta(metainfo, obtain_images=False):
+                return SimpleNamespace(type=MediaType.MOVIE)
+
+        library_module.MediaChain = WrongTypeMediaChain
+        try:
+            plugin._builder._recognize(
+                {"title": "林肯律师", "year": "2022", "version": ""},
+                MediaType.TV,
+            )
+            raise AssertionError("电影识别结果不应写入剧集目录")
+        except library_module.LibraryBuildError as error:
+            assert "媒体类型不匹配" in str(error)
         library_module.MediaChain = original_media_chain
         library_module.MetaInfo = original_meta_info
 
         assert (
             plugin._builder._media_type(
                 {"media_type": "电影", "group_name": "电影合集"},
+                [{"file_path": "/某剧/Show.S01E02.mkv"}],
+            )
+            == MediaType.MOVIE
+        )
+        assert (
+            plugin._builder._media_type(
+                {"media_type": "", "group_name": "未分类"},
                 [{"file_path": "/某剧/Show.S01E02.mkv"}],
             )
             == MediaType.TV
@@ -287,6 +311,17 @@ def main() -> None:
             )
             == []
         )
+
+        (output_root / "movie.nfo").write_text("metadata", encoding="utf-8")
+        (output_root / "keep.txt").write_text("keep", encoding="utf-8")
+        plugin._config["clear_confirmation"] = True
+        clear_response = plugin.clear_all_data()
+        assert clear_response.success is True
+        assert store.list_sheets() == []
+        assert not list(output_root.rglob("*.strm"))
+        assert not list(output_root.rglob("*.nfo"))
+        assert (output_root / "keep.txt").is_file()
+        assert plugin._config["clear_confirmation"] is False
 
         class FakeSynchronizer:
             calls = 0

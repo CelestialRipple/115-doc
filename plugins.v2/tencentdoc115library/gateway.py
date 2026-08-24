@@ -690,6 +690,11 @@ class DirectPlayGateway:
         self.stop()
         self.start_background()
 
+    def clear_cache(self) -> None:
+        """清空媒体项路径和未接管诊断缓存"""
+        self._item_paths.clear()
+        self._unmanaged_items.clear()
+
     def stop(self) -> None:
         """停止内置 Emby 直链网关"""
         loop = self._loop
