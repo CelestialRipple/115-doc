@@ -1,5 +1,7 @@
 import asyncio
+import json
 import socket
+import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -106,11 +108,27 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
             async def public_info_handler(_request):
                 return web.json_response({"ServerName": "fake-emby"})
 
+            async def login_handler(request):
+                assert request.headers.get("Accept-Encoding") == "identity"
+                assert (await request.post())["Username"] == "test-user"
+                body = json.dumps(
+                    {"AccessToken": "login-token", "User": {"Name": "test-user"}}
+                ).encode("utf-8")
+                return web.Response(
+                    body=zlib.compress(body),
+                    content_type="application/json",
+                    headers={"Content-Encoding": "deflate"},
+                )
+
             emby_app = web.Application()
             emby_app.router.add_get("/emby/Items/{item_id}", item_handler)
             emby_app.router.add_get(
                 "/emby/System/Info/Public",
                 public_info_handler,
+            )
+            emby_app.router.add_post(
+                "/emby/Users/authenticatebyname",
+                login_handler,
             )
             emby_runner = web.AppRunner(emby_app)
             await emby_runner.setup()
@@ -160,6 +178,13 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                     ) as response:
                         assert response.status == 200
                         assert (await response.json())["ServerName"] == "fake-emby"
+                    async with client.post(
+                        f"http://127.0.0.1:{gateway_port}/emby/Users/authenticatebyname",
+                        data={"Username": "test-user", "Pw": "test-password"},
+                    ) as response:
+                        assert response.status == 200
+                        assert response.headers["Content-Encoding"] == "deflate"
+                        assert (await response.json())["AccessToken"] == "login-token"
             finally:
                 await gateway._cleanup()
                 await emby_runner.cleanup()

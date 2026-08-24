@@ -354,6 +354,12 @@ class DirectPlayGateway:
         if not self._session:
             raise web.HTTPServiceUnavailable(text="直链网关尚未初始化")
         headers = self._filtered_headers(request.headers)
+        headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() != "accept-encoding"
+        }
+        headers["Accept-Encoding"] = "identity"
         request_body = await request.read()
         async with self._session.request(
             request.method,
@@ -409,7 +415,11 @@ class DirectPlayGateway:
         config = self.config_provider()
         self._validate(config)
         timeout = ClientTimeout(total=None, connect=15, sock_read=None)
-        self._session = ClientSession(timeout=timeout, trust_env=False)
+        self._session = ClientSession(
+            timeout=timeout,
+            trust_env=False,
+            auto_decompress=False,
+        )
         application = web.Application(client_max_size=64 * 1024 * 1024)
         application.router.add_route("*", "/{path:.*}", self._proxy)
         self._runner = web.AppRunner(application, access_log=None)
