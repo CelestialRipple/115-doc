@@ -52,9 +52,11 @@ def main() -> None:
         assert "/sync-all" in api_paths
         assert "/tasks/stop" in api_paths
         assert "/resources/retry-all" in api_paths
+        assert "/gateway/restart" in api_paths
         page_text = str(plugin.get_page())
         assert "STRM 与刮削进度" in page_text
         assert "重试全部失败并生成" in page_text
+        assert "内置直链网关" in page_text
 
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()

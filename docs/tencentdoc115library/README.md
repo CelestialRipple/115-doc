@@ -24,6 +24,7 @@
 - 接入 MoviePilot 原生手动检索和下载：检索只查询插件 SQLite 本地镜像，默认只展示已经生成 STRM 的资源，不会现场请求腾讯文档或 115。
 - 点击下载后由插件接管任务，按需生成 115 临时直链并下载到 MoviePilot 选择的下载目录；支持 `.part` 文件和 HTTP Range 断点续传，并向 MoviePilot 报告进度和完成状态。
 - 播放入口带插件自动生成的随机密钥，115 Cookie、腾讯令牌和播放密钥不会写入源码或日志。
+- 可选启用内置 Emby 直链网关；客户端连接网关后，本插件 STRM 的播放和 Emby 原生下载请求会返回115临时地址的302，视频数据不经过 NAS，其余 Emby 请求原样转发。
 
 ## 工作表分组
 
@@ -77,6 +78,22 @@
 
 剧集判定后，插件会把 `MediaType.TV` 交给 MoviePilot 识别和刮削；电影则使用 `MediaType.MOVIE`，两类不会混用同一套元数据类型。路径中明确出现季集标记时，即使腾讯文档没有可匹配的“类型”列，也会按剧集处理。
 
+## 内置 Emby 直链网关
+
+只在 STRM 中写入 MoviePilot 的302入口时，Emby 仍可能在服务端跟随跳转并把视频转发给客户端。启用内置网关后，客户端改为连接网关端口；网关识别本插件生成的 STRM，在播放或下载请求到达时直接向客户端返回115临时地址。NAS 仍处理 Emby 登录、媒体库、封面和播放信息等小流量，但不转发视频正文。
+
+插件配置：
+
+- `启用直链网关`：开启后监听 `0.0.0.0` 的指定端口，默认 `8097`。
+- `Emby 内部地址`：MoviePilot 容器能够访问的 Emby 地址，例如 `http://192.168.5.192:8096`。
+- `Emby API Key`：仅用于查询媒体项对应的 STRM 路径；外部客户端仍由 Emby 正常鉴权。
+- `Emby STRM 媒体库路径`：填写 Emby 容器中看到的路径，一行一个，例如 `/media/tencentdoc115`。
+- `Emby → MoviePilot 路径映射`：两边容器路径不同时填写，例如 `/media/tencentdoc115|/data/tencentdoc115`。
+
+MoviePilot 容器必须额外映射 `-p 8097:8097`，内网穿透或公网反向代理也必须指向 `8097`。Infuse、Emby App 和浏览器中的服务器地址应改为网关地址，不能继续连接 Emby 的 `8096`，否则请求不会经过插件。
+
+网关使用独立的无代理 HTTP 会话连接 Emby，避免 MoviePilot 的全局代理把局域网请求转发到代理服务器。只有直接播放可以绕过 NAS；客户端要求转码时无法返回115直链，因此插件会为受管 STRM 关闭转码能力。不属于本插件输出目录的普通媒体仍由 Emby 按原方式处理。
+
 ## MoviePilot 原生检索和下载
 
 - 原生检索搜索的是已经同步到插件 SQLite 的目录记录，而不是每次重新读取腾讯文档。默认开启“只检索已生成 STRM 资源”，因此搜索结果与已经构建好的 STRM 库一致。
@@ -94,6 +111,7 @@ docker run -d \
   --name moviepilot-tencentdoc115-test \
   --restart unless-stopped \
   -p 3000:3000 \
+  -p 8097:8097 \
   -e TZ=Asia/Shanghai \
   -e PUID=501 \
   -e PGID=20 \
@@ -119,6 +137,8 @@ docker run -d \
 - 插件“STRM/元数据输出目录”：`/data/tencentdoc115`
 - 宿主机实际目录：`/mnt/user/data/tencentdoc115`
 - 插件“Emby 可访问的 MoviePilot 地址”：`http://UNRAID局域网IP:MoviePilot映射端口`，不能使用 `127.0.0.1`
+- 插件“内置 Emby 直链网关端口”：`8097`
+- 插件“Emby 内部地址”：`http://UNRAID局域网IP:8096`
 
 在 Emby 容器中新增一条只读路径映射：
 
@@ -127,6 +147,14 @@ docker run -d \
 | `/mnt/user/data/tencentdoc115` | `/media/tencentdoc115` | Read Only |
 
 然后在 Emby 中建立媒体库：电影库可加入 `/media/tencentdoc115/电影合集`、`/media/tencentdoc115/星火` 和 `/media/tencentdoc115/蚂蚁`；电视剧库加入 `/media/tencentdoc115/剧集`。如果在插件中使用了自定义分组名称，则按实际生成的子目录添加。
+
+由于示例中 Emby 看到的路径是 `/media/tencentdoc115`，MoviePilot 看到的是 `/data/tencentdoc115`，直链网关的路径映射填写：
+
+```text
+/media/tencentdoc115|/data/tencentdoc115
+```
+
+把 MoviePilot Docker 命令增加 `-p 8097:8097`，然后把 Infuse 和内网穿透目标改为 `UNRAID地址:8097`。确认播放请求返回302后，可以停止对公网暴露 Emby 原始 `8096` 端口。
 
 ## 尚未包含在首个版本中的功能
 

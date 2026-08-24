@@ -29,6 +29,7 @@ from .downloader import (
     DirectDownloadManager,
 )
 from .download_marker import build_download_marker
+from .gateway import DirectPlayGateway
 from .library import LibraryBuilder
 from .resolver import ShareResolutionError, ShareResolver
 from .schemas import BuildActionRequest, ResourceRetryRequest, SyncActionRequest
@@ -70,6 +71,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "download_retries": 4,
     "download_chunk_size": 1048576,
     "video_extensions": ".mp4,.mkv,.ts,.m2ts,.avi,.mov,.wmv,.flv,.webm,.iso",
+    "direct_gateway_enabled": False,
+    "direct_gateway_port": 8097,
+    "emby_internal_url": "http://127.0.0.1:8096",
+    "emby_api_key": "",
+    "emby_strm_paths": "/data/tencentdoc115",
+    "emby_path_mappings": "",
 }
 
 
@@ -79,7 +86,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.5.1"
+    plugin_version = "0.6.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -100,6 +107,7 @@ class TencentDoc115Library(_PluginBase):
         self._resolver: Optional[ShareResolver] = None
         self._builder: Optional[LibraryBuilder] = None
         self._direct_downloader: Optional[DirectDownloadManager] = None
+        self._gateway: Optional[DirectPlayGateway] = None
         self._pipeline_status: Dict[str, Any] = {
             "phase": "idle",
             "message": "尚未启动同步全部任务",
@@ -130,6 +138,10 @@ class TencentDoc115Library(_PluginBase):
             store=self._store,
             config_provider=self._current_config,
         )
+        self._gateway = DirectPlayGateway(
+            config_provider=self._current_config,
+            resolver=self._resolver,
+        )
         self._synchronizer = CatalogSynchronizer(
             store=self._store,
             client_factory=self._create_client,
@@ -148,6 +160,7 @@ class TencentDoc115Library(_PluginBase):
             resolver=self._resolver,
             config_provider=self._current_config,
         )
+        self._gateway.start_background()
 
     def _current_config(self) -> Dict[str, Any]:
         """返回当前配置的副本。"""
@@ -576,7 +589,19 @@ class TencentDoc115Library(_PluginBase):
         snapshot["task_running"] = bool(self._future and not self._future.done())
         snapshot["pipeline"] = self._pipeline_snapshot()
         snapshot["storage"] = self._builder.storage_snapshot() if self._builder else {}
+        snapshot["direct_gateway"] = (
+            self._gateway.status() if self._gateway else {"state": "disabled"}
+        )
         return Response(success=True, data=snapshot)
+
+    def restart_gateway(self) -> Response:
+        """按当前配置重启内置 Emby 直链网关。"""
+        if not self._gateway:
+            return Response(success=False, message="直链网关尚未初始化")
+        if not self._config.get("direct_gateway_enabled"):
+            return Response(success=False, message="请先在插件配置中启用直链网关")
+        self._gateway.restart_background()
+        return Response(success=True, message="直链网关正在后台重启")
 
     def play(
         self,
@@ -674,6 +699,13 @@ class TencentDoc115Library(_PluginBase):
                 "endpoint": self.status,
                 "methods": ["GET"],
                 "summary": "查看插件状态",
+                "auth": "bear",
+            },
+            {
+                "path": "/gateway/restart",
+                "endpoint": self.restart_gateway,
+                "methods": ["POST"],
+                "summary": "重启内置 Emby 直链网关",
                 "auth": "bear",
             },
             {
@@ -1004,6 +1036,85 @@ class TencentDoc115Library(_PluginBase):
                     {
                         "component": "div",
                         "props": {"class": "text-h6 mb-2"},
+                        "text": "内置 Emby 直链网关",
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "class": "mb-3",
+                            "text": (
+                                "客户端必须连接网关端口而不是 Emby 8096；"
+                                "网关只为本插件 STRM 返回115直链，"
+                                "其余 Emby 请求原样转发。MoviePilot Docker 还需要映射网关端口。"
+                            ),
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "direct_gateway_enabled",
+                                            "label": "启用直链网关",
+                                        },
+                                    }
+                                ],
+                            },
+                            self._text_field(
+                                "direct_gateway_port",
+                                "网关监听端口",
+                                3,
+                                hint="默认8097；Docker需要映射相同端口",
+                            ),
+                            self._text_field(
+                                "emby_internal_url",
+                                "Emby 内部地址",
+                                6,
+                                hint="MoviePilot 容器可访问的地址，如 http://192.168.5.192:8096",
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._text_field(
+                                "emby_api_key",
+                                "Emby API Key",
+                                12,
+                                True,
+                                "仅用于查询媒体项对应的 STRM 路径",
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._textarea_field(
+                                "emby_strm_paths",
+                                "Emby STRM 媒体库路径（一行一个）",
+                                "必须填写 Emby 容器内看到的路径，如 /data/tencentdoc115",
+                            ),
+                            self._textarea_field(
+                                "emby_path_mappings",
+                                "Emby → MoviePilot 路径映射（可选）",
+                                "两边路径不同时填写：/Emby路径|/MoviePilot路径，每行一条",
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VDivider",
+                        "props": {"class": "my-4"},
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-h6 mb-2"},
                         "text": "工作表与输出分组",
                     },
                     *sheet_rows,
@@ -1054,6 +1165,11 @@ class TencentDoc115Library(_PluginBase):
             }
         )
         pipeline = self._pipeline_snapshot()
+        gateway = (
+            self._gateway.status()
+            if self._gateway
+            else {"enabled": False, "state": "disabled", "port": 8097}
+        )
         buttons = [
             ("发现工作表", "mdi-table-search", "discover", "primary"),
             ("继续同步", "mdi-sync", "sync", "primary"),
@@ -1067,6 +1183,12 @@ class TencentDoc115Library(_PluginBase):
                 "warning",
             ),
             ("停止后台任务", "mdi-stop-circle", "tasks/stop", "error"),
+            (
+                "重启直链网关",
+                "mdi-lan-connect",
+                "gateway/restart",
+                "info",
+            ),
         ]
         button_components = [
             {
@@ -1183,6 +1305,20 @@ class TencentDoc115Library(_PluginBase):
             f"{int(pipeline.get('failed') or 0)} 失败。"
             f"{pipeline.get('message') or ''}"
         )
+        gateway_labels = {
+            "disabled": "未启用",
+            "starting": "正在启动",
+            "running": "运行中",
+            "stopped": "已停止",
+            "error": "启动失败",
+        }
+        gateway_state = str(gateway.get("state") or "disabled")
+        gateway_text = (
+            f"内置直链网关：{gateway_labels.get(gateway_state, gateway_state)} · "
+            f"端口：{int(gateway.get('port') or 8097)}"
+        )
+        if gateway.get("last_error"):
+            gateway_text += f" · 错误：{gateway.get('last_error')}"
         error_items: List[Dict[str, Any]] = []
         for item in snapshot.get("recent_errors", [])[:10]:
             error_items.append(
@@ -1237,6 +1373,18 @@ class TencentDoc115Library(_PluginBase):
                                 f"{pipeline_text} 输出目录占用：{usage_text} / {limit_text}。"
                                 "“同步全部并生成”会在后台跑完已勾选工作表，再逐批处理 pending；"
                                 "可随时安全停止，重新点击会从断点继续。重新打开本页可刷新状态。"
+                            ),
+                        },
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "success" if gateway_state == "running" else "warning",
+                            "variant": "tonal",
+                            "class": "mt-2",
+                            "text": (
+                                f"{gateway_text}。客户端需要连接此端口，不能继续连接 Emby 8096；"
+                                "直链播放时视频数据由客户端直接从115获取。"
                             ),
                         },
                     },
@@ -1343,3 +1491,5 @@ class TencentDoc115Library(_PluginBase):
         self._stop_event.set()
         if self._direct_downloader:
             self._direct_downloader.stop_all()
+        if self._gateway:
+            self._gateway.stop()
