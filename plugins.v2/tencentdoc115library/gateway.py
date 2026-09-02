@@ -796,7 +796,7 @@ class DirectPlayGateway:
                 ),
                 "",
             )
-            container, file_size, _ = self._strm_media_details(
+            container, file_size, file_name = self._strm_media_details(
                 managed_path,
                 config,
             )
@@ -810,7 +810,21 @@ class DirectPlayGateway:
                 source["Container"] = container
             if container == "iso":
                 source["VideoType"] = "Iso"
+                iso_name = file_name.lower()
+                source["IsoType"] = (
+                    "Dvd"
+                    if "dvd" in iso_name or "video_ts" in iso_name
+                    else "BluRay"
+                )
                 source["SupportsProbing"] = True
+                if managed_path:
+                    source["Path"] = managed_path
+                source["Protocol"] = "File"
+                source["IsRemote"] = False
+                logger.info(
+                    f"已将 Emby 媒体项 {item_id or '未知'} 的 ISO 源 "
+                    f"{source_id or '未知'} 恢复为文件播放语义"
+                )
             if file_size:
                 source["Size"] = file_size
             for key in (

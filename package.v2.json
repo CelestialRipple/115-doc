@@ -3,11 +3,12 @@
         "name": "腾讯文档115媒体库",
         "description": "同步多个腾讯文档中的115分享资源，支持断点、MoviePilot刮削、原生检索下载和内置Emby直链网关",
         "labels": "媒体库,115网盘,STRM,直链下载,Emby",
-        "version": "0.8.1",
+        "version": "0.8.2",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.8.2": "修复 ISO 仍被 Emby 识别为远程 HTTP 流：仅对 ISO 恢复 File 协议与原始 STRM 路径，并补充 BluRay/DVD 镜像类型",
             "v0.8.1": "修复 Infuse ISO 秒退：保留 Emby 原始媒体路径和协议，补充 ISO 类型与播放鉴权；增加115直链缓存并增强网关断流和异常处理",
             "v0.8.0": "移植 go-emby2openlist 核心播放流程：接管stream/universal/original、使用307保留Range/HEAD语义、ISO按需触发Emby媒体探测，并让播放地址携带真实扩展名",
             "v0.7.2": "修复 ISO 直链播放：从115文件记录还原真实 Container 和 Size，并使用带真实扩展名的静态播放入口",

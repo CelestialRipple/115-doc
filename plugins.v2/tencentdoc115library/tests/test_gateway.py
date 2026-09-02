@@ -247,14 +247,15 @@ def test_playback_info_restores_iso_container_size_and_route():
         source = modified["MediaSources"][0]
         assert source["Container"] == "iso"
         assert source["VideoType"] == "Iso"
+        assert source["IsoType"] == "BluRay"
         assert source["SupportsProbing"] is True
         assert source["Size"] == 42_000_000_000
         assert source["SupportsDirectPlay"] is True
         assert source["SupportsDirectStream"] is True
         assert source["SupportsTranscoding"] is False
-        assert source["Path"] == "http://moviepilot/private-play-url"
-        assert "Protocol" not in source
-        assert "IsRemote" not in source
+        assert source["Path"] == str(strm_path)
+        assert source["Protocol"] == "File"
+        assert source["IsRemote"] is False
         assert source["DirectStreamUrl"] == (
             "/videos/item-iso/stream.iso?Static=true&MediaSourceId=source-iso"
         )

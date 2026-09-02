@@ -27,7 +27,7 @@
 - 点击下载后由插件接管任务，按需生成 115 临时直链并下载到 MoviePilot 选择的下载目录；支持 `.part` 文件和 HTTP Range 断点续传，并向 MoviePilot 报告进度和完成状态。
 - 播放入口带插件自动生成的随机密钥，115 Cookie、腾讯令牌和播放密钥不会写入源码或日志。
 - 可选启用内置 Emby 直链网关；客户端连接网关后，本插件 STRM 的播放和 Emby 原生下载请求会重定向到115临时地址，视频数据不经过 NAS，其余 Emby 请求原样转发。
-- 内置网关会为 Infuse 等客户端强制 DirectPlay、提供静态 DirectStreamUrl，并从115文件记录还原 MKV、ISO 等真实容器和文件大小；ISO 会声明 `VideoType=Iso`，但保留 Emby 原始 Path、Protocol 和 IsRemote，让客户端继续通过 Emby 播放入口协商；网关同时接管 `stream`、`universal`、`original` 和下载入口，直链使用307保留 Range/HEAD 请求语义。
+- 内置网关会为 Infuse 等客户端强制 DirectPlay、提供静态 DirectStreamUrl，并从115文件记录还原 MKV、ISO 等真实容器和文件大小；ISO 会声明 `VideoType=Iso` 和 BluRay/DVD 镜像类型，并恢复为 Emby 托管文件语义，让客户端继续通过 Emby 播放入口协商；网关同时接管 `stream`、`universal`、`original` 和下载入口，直链使用307保留 Range/HEAD 请求语义。
 
 ## 工作表分组
 
@@ -99,7 +99,7 @@ MoviePilot 容器必须额外映射 `-p 8097:8097`，内网穿透或公网反向
 
 网关使用独立的无代理 HTTP 会话连接 Emby，避免 MoviePilot 的全局代理把局域网请求转发到代理服务器。只有直接播放可以绕过 NAS；客户端要求转码时无法返回115直链，因此插件会为受管 STRM 关闭转码能力。不属于本插件输出目录的普通媒体仍由 Emby 按原方式处理。
 
-对于受管 STRM，网关同时声明支持 DirectPlay 和 DirectStream、关闭转码，并将 DirectStreamUrl 指向带真实扩展名的网关静态媒体入口，同时保留原 DirectStreamUrl 或客户端请求中的 Emby API Key 与 PlaySessionId。网关会用 SQLite 中匿名展开115分享时保存的原文件名与大小覆盖 Emby 的 `Container` 和 `Size`；ISO 额外声明 `VideoType=Iso`，但不会把媒体源 Path 改成 MoviePilot HTTP 地址，也不会把 Protocol 强制改成 Http。最终直链响应使用 HTTP 307，使 GET、HEAD 和 Range 行为保持不变。
+对于受管 STRM，网关同时声明支持 DirectPlay 和 DirectStream、关闭转码，并将 DirectStreamUrl 指向带真实扩展名的网关静态媒体入口，同时保留原 DirectStreamUrl 或客户端请求中的 Emby API Key 与 PlaySessionId。网关会用 SQLite 中匿名展开115分享时保存的原文件名与大小覆盖 Emby 的 `Container` 和 `Size`。ISO 额外声明 `VideoType=Iso` 与 `IsoType=BluRay/Dvd`，把 Path 恢复为 Emby 中的原始 STRM 文件路径，并设置 `Protocol=File`、`IsRemote=false`；实际媒体请求仍进入8097后重定向115。最终直链响应使用 HTTP 307，使 GET、HEAD 和 Range 行为保持不变。
 
 115 临时直链只缓存在内存中，默认100分钟、最多4096条，插件重启即清空。由于客户端收到307后直接访问115，网关看不到115最终返回的403或410，不能在该响应发生时主动失效缓存；缓存时间明显短于通常的临时地址有效期，用于在稳定性和接口频率之间取平衡。
 
