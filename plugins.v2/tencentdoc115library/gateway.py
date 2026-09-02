@@ -540,6 +540,48 @@ class DirectPlayGateway:
         file_id = str((query.get("file_id") or [""])[0])
         return match.group(1), file_id
 
+    def _strm_media_details(
+        self,
+        emby_path: str,
+        config: Dict[str, Any],
+    ) -> Tuple[str, int]:
+        """
+        查询 STRM 背后的真实容器和文件大小
+
+        Emby 扫描本插件的播放入口时只能看到 ``.strm`` 或无扩展名 URL，
+        Infuse 播放 ISO 等光盘镜像前需要从 PlaybackInfo 得知真实容器。
+
+        :param emby_path (str): Emby 中的 STRM 路径
+        :param config (Dict): 网关配置
+
+        :return Tuple: 小写扩展名（不含点）与字节数
+        """
+        try:
+            resource_id, file_id = self._strm_target(emby_path, config)
+            store = getattr(self.resolver, "store", None)
+            if store is None:
+                return "", 0
+            resource = store.get_resource(resource_id) or {}
+            target_file_id = file_id or str(
+                resource.get("resolved_file_id") or ""
+            ).strip()
+            resource_file = (
+                store.get_resource_file(resource_id, target_file_id)
+                if target_file_id
+                else None
+            ) or {}
+            file_name = str(
+                resource_file.get("file_name")
+                or resource.get("resolved_file_name")
+                or ""
+            ).strip()
+            container = Path(file_name).suffix.lower().lstrip(".")
+            file_size = int(resource_file.get("file_size") or 0)
+            return container, max(file_size, 0)
+        except Exception as error:
+            logger.warning(f"读取 STRM 真实媒体信息失败：{emby_path} - {error}")
+            return "", 0
+
     async def _direct_response(
         self,
         request: web.Request,
@@ -603,9 +645,25 @@ class DirectPlayGateway:
                 and not self._is_managed_path(emby_path, config)
             ):
                 continue
+            managed_path = next(
+                (
+                    candidate
+                    for candidate in (original_path, emby_path, item_path)
+                    if self._is_managed_path(candidate, config)
+                ),
+                "",
+            )
+            container, file_size = self._strm_media_details(
+                managed_path,
+                config,
+            )
             source["SupportsDirectPlay"] = True
             source["SupportsDirectStream"] = True
             source["SupportsTranscoding"] = False
+            if container:
+                source["Container"] = container
+            if file_size:
+                source["Size"] = file_size
             for key in (
                 "TranscodingUrl",
                 "TranscodingContainer",
@@ -619,8 +677,11 @@ class DirectPlayGateway:
                     if str(source.get("Type") or "").lower() == "audio"
                     else "videos"
                 )
+                stream_name = "stream"
+                if container and re.fullmatch(r"[a-z0-9]+", container):
+                    stream_name += f".{container}"
                 source["DirectStreamUrl"] = (
-                    f"/{media_route}/{quote(item_id, safe='')}/stream"
+                    f"/{media_route}/{quote(item_id, safe='')}/{stream_name}"
                     f"?Static=true&MediaSourceId={quote(source_id, safe='')}"
                 )
         return payload

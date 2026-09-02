@@ -159,6 +159,72 @@ def test_playback_info_uses_original_media_source_path():
     )
 
 
+def test_playback_info_restores_iso_container_size_and_route():
+    with TemporaryDirectory() as temporary_directory:
+        strm_path = Path(temporary_directory) / "光盘.strm"
+        strm_path.write_text(
+            "http://moviepilot:3000/api/v1/plugin/"
+            "TencentDoc115Library/play/resource-iso"
+            "?token=secret&file_id=file-iso",
+            encoding="utf-8",
+        )
+
+        class FakeStore:
+            @staticmethod
+            def get_resource(resource_id):
+                assert resource_id == "resource-iso"
+                return {}
+
+            @staticmethod
+            def get_resource_file(resource_id, file_id):
+                assert resource_id == "resource-iso"
+                assert file_id == "file-iso"
+                return {
+                    "file_name": "BDMV/电影原盘.ISO",
+                    "file_size": 42_000_000_000,
+                }
+
+        class FakeResolver:
+            store = FakeStore()
+
+        config = {
+            "emby_strm_paths": temporary_directory,
+            "emby_path_mappings": "",
+            "playback_token": "secret",
+        }
+        gateway = DirectPlayGateway(lambda: config, FakeResolver())
+        payload = {
+            "MediaSources": [
+                {
+                    "Id": "source-iso",
+                    "Path": "http://moviepilot/private-play-url",
+                    "Container": "strm",
+                    "Size": 176,
+                    "SupportsDirectPlay": False,
+                    "SupportsDirectStream": False,
+                    "SupportsTranscoding": True,
+                }
+            ]
+        }
+
+        modified = gateway._modify_playback_info(
+            payload,
+            config,
+            str(strm_path),
+            item_id="item-iso",
+        )
+
+        source = modified["MediaSources"][0]
+        assert source["Container"] == "iso"
+        assert source["Size"] == 42_000_000_000
+        assert source["SupportsDirectPlay"] is True
+        assert source["SupportsDirectStream"] is True
+        assert source["SupportsTranscoding"] is False
+        assert source["DirectStreamUrl"] == (
+            "/videos/item-iso/stream.iso?Static=true&MediaSourceId=source-iso"
+        )
+
+
 def test_gateway_redirects_managed_strm_and_proxies_other_requests():
     async def scenario():
         with TemporaryDirectory() as temporary_directory:
