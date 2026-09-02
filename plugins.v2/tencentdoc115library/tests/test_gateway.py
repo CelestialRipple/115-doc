@@ -89,17 +89,20 @@ def test_emby_url_avoids_duplicate_emby_prefix():
     ) == "http://emby:8096/emby/Items/1?api_key=test"
 
 
-def test_playback_info_forces_gateway_direct_stream():
+def test_playback_info_forces_gateway_direct_play():
     config = {"emby_strm_paths": "/data/tencentdoc115"}
     gateway = DirectPlayGateway(lambda: config, object())
     payload = {
         "MediaSources": [
             {
+                "Id": "source-1",
                 "Path": "http://moviepilot/private-play-url",
                 "SupportsDirectPlay": True,
                 "SupportsDirectStream": False,
                 "SupportsTranscoding": True,
                 "TranscodingUrl": "/Videos/1/master.m3u8",
+                "TranscodingContainer": "ts",
+                "TranscodingSubProtocol": "hls",
             }
         ]
     }
@@ -108,13 +111,19 @@ def test_playback_info_forces_gateway_direct_stream():
         payload,
         config,
         "/data/tencentdoc115/电影/测试.strm",
+        item_id="item-1",
     )
 
     source = modified["MediaSources"][0]
-    assert source["SupportsDirectPlay"] is False
+    assert source["SupportsDirectPlay"] is True
     assert source["SupportsDirectStream"] is True
     assert source["SupportsTranscoding"] is False
     assert "TranscodingUrl" not in source
+    assert "TranscodingContainer" not in source
+    assert "TranscodingSubProtocol" not in source
+    assert source["DirectStreamUrl"] == (
+        "/videos/item-1/stream?Static=true&MediaSourceId=source-1"
+    )
 
 
 def test_playback_info_uses_original_media_source_path():
@@ -138,12 +147,16 @@ def test_playback_info_uses_original_media_source_path():
         source_paths={
             "mediasource_31": "/media/tencentdoc115/电影/测试.strm"
         },
+        item_id="item 31",
     )
 
     source = modified["MediaSources"][0]
-    assert source["SupportsDirectPlay"] is False
+    assert source["SupportsDirectPlay"] is True
     assert source["SupportsDirectStream"] is True
     assert source["SupportsTranscoding"] is False
+    assert source["DirectStreamUrl"] == (
+        "/videos/item%2031/stream?Static=true&MediaSourceId=mediasource_31"
+    )
 
 
 def test_gateway_redirects_managed_strm_and_proxies_other_requests():
@@ -157,7 +170,9 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
             )
 
             async def items_handler(request):
-                if request.query.get("api_key") != "client-key":
+                query_key = request.query.get("api_key")
+                header_key = request.headers.get("X-Emby-Token")
+                if query_key != "client-key" and header_key != "emby-key":
                     raise web.HTTPUnauthorized()
                 assert request.headers.get("Accept-Encoding") == "identity"
                 assert request.query.get("Ids") == "source-1"
@@ -172,6 +187,24 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                     body=zlib.compress(body),
                     content_type="application/json",
                     headers={"Content-Encoding": "deflate"},
+                )
+
+            async def playback_info_handler(request):
+                if request.query.get("api_key") != "client-key":
+                    raise web.HTTPUnauthorized()
+                return web.json_response(
+                    {
+                        "MediaSources": [
+                            {
+                                "Id": "mediasource_source-1",
+                                "Path": "http://moviepilot/private-play-url",
+                                "SupportsDirectPlay": False,
+                                "SupportsDirectStream": False,
+                                "SupportsTranscoding": True,
+                                "TranscodingUrl": "/Videos/1/master.m3u8",
+                            }
+                        ]
+                    }
                 )
 
             async def public_info_handler(_request):
@@ -191,6 +224,10 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
 
             emby_app = web.Application()
             emby_app.router.add_get("/emby/Items", items_handler)
+            emby_app.router.add_post(
+                "/emby/Items/1/PlaybackInfo",
+                playback_info_handler,
+            )
             emby_app.router.add_get(
                 "/emby/System/Info/Public",
                 public_info_handler,
@@ -209,7 +246,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                 def resolve(resource_id, file_id=None, user_agent=""):
                     assert resource_id == "resource-1"
                     assert file_id == "file-1"
-                    assert user_agent == "gateway-test"
+                    assert user_agent in {"gateway-test", "infuse-test"}
                     return "https://115cdn.example/video.mkv?temporary=1"
 
             gateway_port = _unused_port()
@@ -239,6 +276,38 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/video.mkv"
                         )
+                    async with client.post(
+                        f"http://127.0.0.1:{gateway_port}/emby/Items/1/PlaybackInfo",
+                        params={"api_key": "client-key"},
+                        headers={"User-Agent": "infuse-test"},
+                        json={},
+                    ) as response:
+                        assert response.status == 200
+                        source = (await response.json())["MediaSources"][0]
+                        assert source["SupportsDirectPlay"] is True
+                        assert source["SupportsDirectStream"] is True
+                        assert source["SupportsTranscoding"] is False
+                        assert source["DirectStreamUrl"] == (
+                            "/videos/1/stream?Static=true&"
+                            "MediaSourceId=mediasource_source-1"
+                        )
+                    async with client.get(
+                        f"http://127.0.0.1:{gateway_port}/emby/Videos/1/stream.mkv",
+                        params={"MediaSourceId": "mediasource_source-1"},
+                        headers={"User-Agent": "infuse-test"},
+                        allow_redirects=False,
+                    ) as response:
+                        assert response.status == 302
+                        assert response.headers["Location"].startswith(
+                            "https://115cdn.example/video.mkv"
+                        )
+                    async with client.get(
+                        f"http://127.0.0.1:{gateway_port}/emby/Videos/1/stream.mkv",
+                        params={"MediaSourceId": "mediasource_source-1"},
+                        headers={"User-Agent": "different-client"},
+                        allow_redirects=False,
+                    ) as response:
+                        assert response.status != 302
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Items/1/Download",
                         headers={"User-Agent": "gateway-test"},
