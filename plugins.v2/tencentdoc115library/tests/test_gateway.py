@@ -220,6 +220,14 @@ def test_playback_info_restores_iso_container_size_and_route():
         assert source["SupportsDirectPlay"] is True
         assert source["SupportsDirectStream"] is True
         assert source["SupportsTranscoding"] is False
+        assert source["Path"] == (
+            "http://moviepilot:3000/api/v1/plugin/"
+            "TencentDoc115Library/play/resource-iso/"
+            "%E7%94%B5%E5%BD%B1%E5%8E%9F%E7%9B%98.ISO"
+            "?token=secret&file_id=file-iso"
+        )
+        assert source["Protocol"] == "Http"
+        assert source["IsRemote"] is True
         assert source["DirectStreamUrl"] == (
             "/videos/item-iso/stream.iso?Static=true&MediaSourceId=source-iso"
         )
@@ -338,7 +346,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         headers={"User-Agent": "gateway-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status == 302
+                        assert response.status == 307
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/video.mkv"
                         )
@@ -363,23 +371,35 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         headers={"User-Agent": "infuse-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status == 302
+                        assert response.status == 307
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/video.mkv"
                         )
+                    for media_endpoint in ("universal", "original.mkv"):
+                        async with client.get(
+                            f"http://127.0.0.1:{gateway_port}/emby/Audio/1/"
+                            f"{media_endpoint}",
+                            params={"MediaSourceId": "mediasource_source-1"},
+                            headers={"User-Agent": "infuse-test"},
+                            allow_redirects=False,
+                        ) as response:
+                            assert response.status == 307
+                            assert response.headers["Location"].startswith(
+                                "https://115cdn.example/video.mkv"
+                            )
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Videos/1/stream.mkv",
                         params={"MediaSourceId": "mediasource_source-1"},
                         headers={"User-Agent": "different-client"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status != 302
+                        assert response.status != 307
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Items/1/Download",
                         headers={"User-Agent": "gateway-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status != 302
+                        assert response.status != 307
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/System/Info/Public"
                     ) as response:
@@ -392,6 +412,117 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         assert response.status == 200
                         assert response.headers["Content-Encoding"] == "deflate"
                         assert (await response.json())["AccessToken"] == "login-token"
+            finally:
+                await gateway._cleanup()
+                await emby_runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_iso_stream_uses_temporary_redirect_and_schedules_emby_probe():
+    async def scenario():
+        with TemporaryDirectory() as temporary_directory:
+            strm_path = Path(temporary_directory) / "测试ISO.strm"
+            strm_path.write_text(
+                "http://moviepilot:3000/api/v1/plugin/"
+                "TencentDoc115Library/play/resource-iso"
+                "?token=secret&file_id=file-iso",
+                encoding="utf-8",
+            )
+            probe_received = asyncio.Event()
+            probe_request = {}
+
+            async def items_handler(request):
+                assert request.query.get("Ids") == "source-iso"
+                return web.json_response(
+                    {"Items": [{"Path": str(strm_path)}]}
+                )
+
+            async def playback_info_handler(request):
+                probe_request["query"] = dict(request.query)
+                probe_request["header_key"] = request.headers.get(
+                    "X-Emby-Token"
+                )
+                probe_request["body"] = await request.json()
+                probe_received.set()
+                return web.json_response({"MediaSources": []})
+
+            emby_app = web.Application()
+            emby_app.router.add_get("/emby/Items", items_handler)
+            emby_app.router.add_post(
+                "/emby/Items/1/PlaybackInfo",
+                playback_info_handler,
+            )
+            emby_runner = web.AppRunner(emby_app)
+            await emby_runner.setup()
+            emby_port = _unused_port()
+            await web.TCPSite(emby_runner, "127.0.0.1", emby_port).start()
+
+            class FakeStore:
+                @staticmethod
+                def get_resource(resource_id):
+                    assert resource_id == "resource-iso"
+                    return {}
+
+                @staticmethod
+                def get_resource_file(resource_id, file_id):
+                    assert resource_id == "resource-iso"
+                    assert file_id == "file-iso"
+                    return {
+                        "file_name": "测试ISO.iso",
+                        "file_size": 8_000_000_000,
+                    }
+
+            class FakeResolver:
+                store = FakeStore()
+
+                @staticmethod
+                def resolve(resource_id, file_id=None, user_agent=""):
+                    assert resource_id == "resource-iso"
+                    assert file_id == "file-iso"
+                    return "https://115cdn.example/test.iso?temporary=1"
+
+            gateway_port = _unused_port()
+            config = {
+                "direct_gateway_enabled": True,
+                "direct_gateway_port": gateway_port,
+                "emby_internal_url": f"http://127.0.0.1:{emby_port}",
+                "emby_api_key": "emby-key",
+                "emby_strm_paths": temporary_directory,
+                "emby_path_mappings": "",
+                "playback_token": "secret",
+            }
+            gateway = DirectPlayGateway(lambda: config, FakeResolver())
+            await gateway._serve()
+            try:
+                async with ClientSession() as client:
+                    async with client.get(
+                        f"http://127.0.0.1:{gateway_port}/emby/Videos/1/original.iso",
+                        params={
+                            "api_key": "client-key",
+                            "MediaSourceId": "mediasource_source-iso",
+                        },
+                        headers={"User-Agent": "infuse-iso-test"},
+                        allow_redirects=False,
+                    ) as response:
+                        assert response.status == 307
+                        assert response.headers["Location"].startswith(
+                            "https://115cdn.example/test.iso"
+                        )
+                    await asyncio.wait_for(probe_received.wait(), timeout=2)
+                    assert probe_request["query"] == {
+                        "api_key": "emby-key",
+                        "IsPlayback": "true",
+                        "AutoOpenLiveStream": "true",
+                        "MediaSourceId": "mediasource_source-iso",
+                    }
+                    assert probe_request["header_key"] == "emby-key"
+                    direct_profiles = probe_request["body"]["DeviceProfile"][
+                        "DirectPlayProfiles"
+                    ]
+                    assert direct_profiles == [
+                        {"Container": "iso", "Type": "Video"}
+                    ]
             finally:
                 await gateway._cleanup()
                 await emby_runner.cleanup()

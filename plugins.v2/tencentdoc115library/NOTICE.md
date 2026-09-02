@@ -8,5 +8,13 @@
 - License：修改版 GNU Affero General Public License 3，附加非商业使用、
   开源修改及注明来源的要求
 
-本插件针对 MoviePilot 与腾讯文档 115 分享按需解析场景重新实现相关流程，
-源代码继续在 https://github.com/CelestialRipple/115-doc 公开提供
+ISO 媒体按需触发 Emby OpenStream 探测、为直链使用 HTTP 307 以及保持
+MediaSourceId 的流程还参考：
+
+- go-emby2openlist：https://github.com/AmbitiousJun/go-emby2openlist
+- Copyright (C) AmbitiousJun
+- License：GNU General Public License v3.0
+
+本插件针对 MoviePilot 与腾讯文档 115 分享按需解析场景独立重新实现上述流程，
+没有直接复制 Go 源文件；源代码继续在
+https://github.com/CelestialRipple/115-doc 公开提供。

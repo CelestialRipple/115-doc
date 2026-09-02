@@ -4,7 +4,7 @@ from inspect import signature
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from app.chain.media import MediaChain
 from app.schemas.file import FileItem
@@ -313,7 +313,12 @@ class LibraryBuilder:
             "freed_bytes": freed_bytes,
         }
 
-    def _play_url(self, resource_id: str, file_id: Optional[str] = None) -> str:
+    def _play_url(
+        self,
+        resource_id: str,
+        file_id: Optional[str] = None,
+        file_name: str = "",
+    ) -> str:
         public_base_url = str(
             self.config_provider().get("public_base_url") or ""
         ).strip()
@@ -323,6 +328,9 @@ class LibraryBuilder:
             f"{public_base_url.rstrip('/')}/api/v1/plugin/"
             f"TencentDoc115Library/play/{resource_id}"
         )
+        name_hint = Path(str(file_name or "")).name
+        if name_hint:
+            url += "/" + quote(name_hint, safe="")
         query = {"token": str(self.config_provider().get("playback_token") or "")}
         if not query["token"]:
             raise LibraryBuildError("插件播放密钥尚未初始化")
@@ -390,7 +398,11 @@ class LibraryBuilder:
         strm_path = directory / filename
         self._write_strm(
             strm_path,
-            self._play_url(resource["resource_id"], selected_file["file_id"]),
+            self._play_url(
+                resource["resource_id"],
+                selected_file["file_id"],
+                selected_file["file_name"],
+            ),
         )
         self.store.replace_resource_files(
             resource["resource_id"],
@@ -472,7 +484,11 @@ class LibraryBuilder:
                 )
             self._write_strm(
                 strm_path,
-                self._play_url(resource["resource_id"], source_file["file_id"]),
+                self._play_url(
+                    resource["resource_id"],
+                    source_file["file_id"],
+                    source_file["file_name"],
+                ),
             )
             expanded_files.append(
                 {

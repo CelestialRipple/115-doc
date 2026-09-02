@@ -92,7 +92,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.7.2"
+    plugin_version = "0.8.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -661,10 +661,11 @@ class TencentDoc115Library(_PluginBase):
         self,
         resource_id: str,
         request: Request,
+        filename: Optional[str] = None,
         token: str = Query(default=""),
         file_id: Optional[str] = Query(default=None),
     ) -> HttpResponse:
-        """校验 STRM 密钥，按需解析 115 临时地址并返回 302。"""
+        """校验 STRM 密钥，按需解析 115 临时地址并返回 307。"""
         expected_token = str(self._config.get("playback_token") or "")
         if not expected_token or not compare_digest(token, expected_token):
             return JSONResponse(
@@ -682,7 +683,7 @@ class TencentDoc115Library(_PluginBase):
                 file_id=file_id,
                 user_agent=request.headers.get("user-agent", ""),
             )
-            return RedirectResponse(url=direct_url, status_code=302)
+            return RedirectResponse(url=direct_url, status_code=307)
         except ShareResolutionError as error:
             return JSONResponse(
                 status_code=error.status_code,
@@ -768,6 +769,13 @@ class TencentDoc115Library(_PluginBase):
                 "methods": ["POST"],
                 "summary": "清空插件数据库和生成内容",
                 "auth": "bear",
+            },
+            {
+                "path": "/play/{resource_id}/{filename}",
+                "endpoint": self.play,
+                "methods": ["GET", "HEAD"],
+                "summary": "按真实文件名识别格式并解析 115 分享",
+                "allow_anonymous": True,
             },
             {
                 "path": "/play/{resource_id}",
@@ -1178,7 +1186,7 @@ class TencentDoc115Library(_PluginBase):
                                 "Emby API Key",
                                 12,
                                 True,
-                                "仅用于查询媒体项对应的 STRM 路径",
+                                "用于查询 STRM 路径和按需触发 ISO 媒体探测",
                             ),
                         ],
                     },

@@ -26,8 +26,8 @@
 - 接入 MoviePilot 原生手动检索和下载：检索只查询插件 SQLite 本地镜像，默认只展示已经生成 STRM 的资源，不会现场请求腾讯文档或 115。
 - 点击下载后由插件接管任务，按需生成 115 临时直链并下载到 MoviePilot 选择的下载目录；支持 `.part` 文件和 HTTP Range 断点续传，并向 MoviePilot 报告进度和完成状态。
 - 播放入口带插件自动生成的随机密钥，115 Cookie、腾讯令牌和播放密钥不会写入源码或日志。
-- 可选启用内置 Emby 直链网关；客户端连接网关后，本插件 STRM 的播放和 Emby 原生下载请求会返回115临时地址的302，视频数据不经过 NAS，其余 Emby 请求原样转发。
-- 内置网关会为 Infuse 等客户端强制 DirectPlay、提供静态 DirectStreamUrl，并从115文件记录还原 MKV、ISO 等真实容器和文件大小；在已认证 PlaybackInfo 后短期关联同一设备的媒体请求，兼容后续 Stream 请求不重复携带 Emby Token 的情况。
+- 可选启用内置 Emby 直链网关；客户端连接网关后，本插件 STRM 的播放和 Emby 原生下载请求会重定向到115临时地址，视频数据不经过 NAS，其余 Emby 请求原样转发。
+- 内置网关会为 Infuse 等客户端强制 DirectPlay、提供静态 DirectStreamUrl，并从115文件记录还原 MKV、ISO 等真实容器和文件大小；同时接管 `stream`、`universal`、`original` 和下载入口，播放地址携带真实扩展名，直链使用307保留 Range/HEAD 请求语义，ISO 首次请求会触发一次受限的 Emby 媒体探测。
 
 ## 工作表分组
 
@@ -85,7 +85,7 @@
 
 ## 内置 Emby 直链网关
 
-只在 STRM 中写入 MoviePilot 的302入口时，Emby 仍可能在服务端跟随跳转并把视频转发给客户端。启用内置网关后，客户端改为连接网关端口；网关识别本插件生成的 STRM，在播放或下载请求到达时直接向客户端返回115临时地址。NAS 仍处理 Emby 登录、媒体库、封面和播放信息等小流量，但不转发视频正文。
+只在 STRM 中写入 MoviePilot 的重定向入口时，Emby 仍可能在服务端跟随跳转并把视频转发给客户端。启用内置网关后，客户端改为连接网关端口；网关识别本插件生成的 STRM，在播放或下载请求到达时直接向客户端返回115临时地址。NAS 仍处理 Emby 登录、媒体库、封面和播放信息等小流量，但不转发视频正文。
 
 插件配置：
 
@@ -99,7 +99,11 @@ MoviePilot 容器必须额外映射 `-p 8097:8097`，内网穿透或公网反向
 
 网关使用独立的无代理 HTTP 会话连接 Emby，避免 MoviePilot 的全局代理把局域网请求转发到代理服务器。只有直接播放可以绕过 NAS；客户端要求转码时无法返回115直链，因此插件会为受管 STRM 关闭转码能力。不属于本插件输出目录的普通媒体仍由 Emby 按原方式处理。
 
-对于受管 STRM，网关同时声明支持 DirectPlay 和 DirectStream、关闭转码，并将 DirectStreamUrl 指向带真实扩展名的网关静态媒体入口。网关还会用 SQLite 中匿名展开115分享时保存的原文件名与大小覆盖 Emby 的 `Container` 和 `Size`，避免 ISO 被错误识别成 STRM。PlaybackInfo 请求已通过 Emby 认证后，网关会按客户端 IP、User-Agent、媒体项和媒体源保存最多 10 分钟的短期路径关联；缓存最多 2048 条且插件重启或清空时立即释放。这样 Infuse 后续未重复携带 Token 的 Stream 请求仍能安全命中对应 STRM，而其它设备不能复用该关联。
+对于受管 STRM，网关同时声明支持 DirectPlay 和 DirectStream、关闭转码，并将 DirectStreamUrl 指向带真实扩展名的网关静态媒体入口。网关还会用 SQLite 中匿名展开115分享时保存的原文件名与大小覆盖 Emby 的 `Container` 和 `Size`，并把 PlaybackInfo 中的源地址改成带真实文件名的插件地址，避免 ISO 被错误识别成 STRM。最终直链响应使用 HTTP 307，使 GET、HEAD 和 Range 行为保持不变。
+
+参考 go-emby2openlist 的做法，ISO 第一次命中播放入口时，网关会在后台请求一次 Emby 的 `PlaybackInfo` 并设置 `IsPlayback=true`、`AutoOpenLiveStream=true`，让 Emby 跟随插件地址探测真实媒体。相同媒体项和 MediaSourceId 在10分钟内只触发一次；失败会解除限制供下次重试，任务在网关停止时会被取消，不会无限积累。这个探测可能由 NAS 从115读取少量媒体头部，但实际播放数据仍由客户端从115直链读取。
+
+PlaybackInfo 请求已通过 Emby 认证后，网关会按客户端 IP、User-Agent、媒体项和媒体源保存最多 10 分钟的短期路径关联；缓存最多 2048 条且插件重启或清空时立即释放。这样 Infuse 后续未重复携带 Token 的 Stream 请求仍能安全命中对应 STRM，而其它设备不能复用该关联。
 
 ## MoviePilot 原生检索和下载
 
@@ -161,7 +165,7 @@ docker run -d \
 /media/tencentdoc115|/data/tencentdoc115
 ```
 
-把 MoviePilot Docker 命令增加 `-p 8097:8097`，然后把 Infuse 和内网穿透目标改为 `UNRAID地址:8097`。确认播放请求返回302后，可以停止对公网暴露 Emby 原始 `8096` 端口。
+把 MoviePilot Docker 命令增加 `-p 8097:8097`，然后把 Infuse 和内网穿透目标改为 `UNRAID地址:8097`。确认播放请求返回307后，可以停止对公网暴露 Emby 原始 `8096` 端口。
 
 ## 尚未包含的功能
 
