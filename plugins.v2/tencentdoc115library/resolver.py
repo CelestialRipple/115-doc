@@ -234,6 +234,13 @@ class ShareResolver:
                 status_code=422,
                 retryable=False,
             )
+        match = re.search(r"/(?:s|share)/([^/?#&]+)", parsed.path, re.IGNORECASE)
+        if not match:
+            raise ShareResolutionError(
+                "无法从资源链接中识别 115 分享码",
+                status_code=422,
+                retryable=False,
+            )
         try:
             from p115client.util import share_extract_payload
 
@@ -244,7 +251,6 @@ class ShareResolver:
                 return share_code, receive_code
         except Exception:
             pass
-        match = re.search(r"/(?:s|share)/([^/?#&]+)", parsed.path, re.IGNORECASE)
         share_code = match.group(1) if match else ""
         query = parse_qs(parsed.query)
         receive_code = str(

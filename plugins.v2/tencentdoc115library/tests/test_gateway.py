@@ -251,9 +251,9 @@ def test_playback_info_restores_iso_container_size_and_route():
         assert source["SupportsProbing"] is True
         assert source["Size"] == 42_000_000_000
         assert source["SupportsDirectPlay"] is True
-        assert source["SupportsDirectStream"] is True
+        assert source["SupportsDirectStream"] is False
         assert source["SupportsTranscoding"] is False
-        assert source["Path"] == str(strm_path)
+        assert source["Path"] == str(strm_path.with_suffix(".iso"))
         assert source["Protocol"] == "File"
         assert source["IsRemote"] is False
         assert source["DirectStreamUrl"] == (
@@ -448,7 +448,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
     asyncio.run(scenario())
 
 
-def test_iso_stream_uses_temporary_redirect_and_schedules_emby_probe():
+def test_iso_stream_uses_temporary_redirect_without_emby_probe():
     async def scenario():
         with TemporaryDirectory() as temporary_directory:
             strm_path = Path(temporary_directory) / "测试ISO.strm"
@@ -458,30 +458,14 @@ def test_iso_stream_uses_temporary_redirect_and_schedules_emby_probe():
                 "?token=secret&file_id=file-iso",
                 encoding="utf-8",
             )
-            probe_received = asyncio.Event()
-            probe_request = {}
-
             async def items_handler(request):
                 assert request.query.get("Ids") == "source-iso"
                 return web.json_response(
                     {"Items": [{"Path": str(strm_path)}]}
                 )
 
-            async def playback_info_handler(request):
-                probe_request["query"] = dict(request.query)
-                probe_request["header_key"] = request.headers.get(
-                    "X-Emby-Token"
-                )
-                probe_request["body"] = await request.json()
-                probe_received.set()
-                return web.json_response({"MediaSources": []})
-
             emby_app = web.Application()
             emby_app.router.add_get("/emby/Items", items_handler)
-            emby_app.router.add_post(
-                "/emby/Items/1/PlaybackInfo",
-                playback_info_handler,
-            )
             emby_runner = web.AppRunner(emby_app)
             await emby_runner.setup()
             emby_port = _unused_port()
@@ -538,20 +522,6 @@ def test_iso_stream_uses_temporary_redirect_and_schedules_emby_probe():
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/test.iso"
                         )
-                    await asyncio.wait_for(probe_received.wait(), timeout=2)
-                    assert probe_request["query"] == {
-                        "api_key": "emby-key",
-                        "IsPlayback": "true",
-                        "AutoOpenLiveStream": "true",
-                        "MediaSourceId": "mediasource_source-iso",
-                    }
-                    assert probe_request["header_key"] == "emby-key"
-                    direct_profiles = probe_request["body"]["DeviceProfile"][
-                        "DirectPlayProfiles"
-                    ]
-                    assert direct_profiles == [
-                        {"Container": "iso", "Type": "Video"}
-                    ]
             finally:
                 await gateway._cleanup()
                 await emby_runner.cleanup()

@@ -7,7 +7,7 @@ from pathlib import Path
 from secrets import compare_digest
 from threading import Lock, Thread
 from time import monotonic
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
@@ -50,8 +50,6 @@ PLAYBACK_INFO_PATTERN = re.compile(
 )
 PLAYBACK_PATH_CACHE_TTL_SECONDS = 10 * 60
 PLAYBACK_PATH_CACHE_MAX_SIZE = 2048
-MEDIA_PROBE_COOLDOWN_SECONDS = 10 * 60
-MEDIA_PROBE_CACHE_MAX_SIZE = 2048
 
 
 class DirectPlayGateway:
@@ -89,8 +87,6 @@ class DirectPlayGateway:
             Tuple[str, str, str, str],
             Tuple[str, float],
         ] = {}
-        self._media_probe_times: Dict[Tuple[str, str], float] = {}
-        self._media_probe_tasks: Set[asyncio.Task] = set()
         self._cache_lock = Lock()
 
     @staticmethod
@@ -594,135 +590,6 @@ class DirectPlayGateway:
             logger.warning(f"读取 STRM 真实媒体信息失败：{emby_path} - {error}")
             return "", 0, ""
 
-    @staticmethod
-    def _raw_media_source_id(request: web.Request) -> str:
-        for name, value in request.query.items():
-            if name.lower() == "mediasourceid":
-                return str(value or "").strip()
-        return ""
-
-    async def _probe_emby_media(
-        self,
-        request_path: str,
-        item_id: str,
-        source_id: str,
-        config: Dict[str, Any],
-    ) -> bool:
-        """触发 Emby 打开 ISO 源地址并探测真实媒体信息。"""
-        if not self._session:
-            return False
-        prefix = "/emby" if request_path.lower().startswith("/emby/") else ""
-        target_url = self._emby_url(
-            config,
-            f"{prefix}/Items/{quote(item_id, safe='')}/PlaybackInfo",
-        )
-        query = {
-            "api_key": str(config.get("emby_api_key") or ""),
-            "IsPlayback": "true",
-            "AutoOpenLiveStream": "true",
-        }
-        if source_id:
-            query["MediaSourceId"] = source_id
-        payload = {
-            "DeviceProfile": {
-                "MaxStaticBitrate": 1_000_000_000,
-                "MaxStreamingBitrate": 1_000_000_000,
-                "DirectPlayProfiles": [
-                    {"Container": "iso", "Type": "Video"},
-                ],
-                "TranscodingProfiles": [],
-                "ContainerProfiles": [],
-                "CodecProfiles": [],
-                "SubtitleProfiles": [],
-            }
-        }
-        try:
-            async with self._session.post(
-                target_url,
-                params=query,
-                headers={
-                    "X-Emby-Token": str(config.get("emby_api_key") or ""),
-                    "Accept-Encoding": "identity",
-                },
-                json=payload,
-                allow_redirects=False,
-                timeout=ClientTimeout(total=30, connect=10),
-            ) as response:
-                await response.read()
-                if response.status == 200:
-                    logger.info(
-                        f"已触发 Emby 探测 ISO 媒体项 {item_id}"
-                    )
-                    return True
-                logger.warning(
-                    f"Emby 探测 ISO 媒体项 {item_id} 失败："
-                    f"HTTP {response.status}"
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.warning(f"Emby 探测 ISO 媒体项 {item_id} 失败：{error}")
-        return False
-
-    def _finish_media_probe(
-        self,
-        cache_key: Tuple[str, str],
-        task: asyncio.Task,
-    ) -> None:
-        self._media_probe_tasks.discard(task)
-        succeeded = False
-        if not task.cancelled():
-            try:
-                succeeded = bool(task.result())
-            except Exception:
-                succeeded = False
-        if not succeeded:
-            with self._cache_lock:
-                self._media_probe_times.pop(cache_key, None)
-
-    def _schedule_media_probe(
-        self,
-        request: web.Request,
-        item_id: str,
-        emby_path: str,
-        config: Dict[str, Any],
-    ) -> None:
-        """按媒体项和源 ID 去重调度 ISO 探测，避免重复访问115。"""
-        container, _, _ = self._strm_media_details(emby_path, config)
-        if container != "iso":
-            return
-        source_id = self._raw_media_source_id(request)
-        cache_key = (item_id, source_id)
-        now = monotonic()
-        with self._cache_lock:
-            expired_keys = [
-                key
-                for key, timestamp in self._media_probe_times.items()
-                if timestamp + MEDIA_PROBE_COOLDOWN_SECONDS <= now
-            ]
-            for key in expired_keys:
-                self._media_probe_times.pop(key, None)
-            if cache_key in self._media_probe_times:
-                return
-            self._media_probe_times[cache_key] = now
-            while len(self._media_probe_times) > MEDIA_PROBE_CACHE_MAX_SIZE:
-                self._media_probe_times.pop(next(iter(self._media_probe_times)))
-        task = asyncio.create_task(
-            self._probe_emby_media(
-                request.path,
-                item_id,
-                source_id,
-                config,
-            )
-        )
-        self._media_probe_tasks.add(task)
-        task.add_done_callback(
-            lambda completed, key=cache_key: self._finish_media_probe(
-                key,
-                completed,
-            )
-        )
-
     async def _direct_response(
         self,
         request: web.Request,
@@ -753,7 +620,6 @@ class DirectPlayGateway:
                 file_id or None,
                 request.headers.get("user-agent", ""),
             )
-            self._schedule_media_probe(request, item_id, emby_path, config)
             logger.info(f"直链网关已为 Emby 媒体项 {item_id} 返回115直链")
             return web.Response(status=307, headers={"Location": direct_url})
         except ShareResolutionError as error:
@@ -818,9 +684,15 @@ class DirectPlayGateway:
                 )
                 source["SupportsProbing"] = True
                 if managed_path:
-                    source["Path"] = managed_path
+                    # Infuse 会结合 Path 扩展名判断光盘镜像。Emby 真实
+                    # ISO 媒体源的 Path 以 .iso 结尾；若仍暴露 .strm，
+                    # Infuse 8.5 可能在发起媒体请求前就拒绝该源。
+                    source["Path"] = str(Path(managed_path).with_suffix(".iso"))
                 source["Protocol"] = "File"
                 source["IsRemote"] = False
+                # 光盘镜像需由客户端按文件随机读取并自行挂载，
+                # 不是 Emby 的容器直流（remux）。
+                source["SupportsDirectStream"] = False
                 logger.info(
                     f"已将 Emby 媒体项 {item_id or '未知'} 的 ISO 源 "
                     f"{source_id or '未知'} 恢复为文件播放语义"
@@ -1084,12 +956,6 @@ class DirectPlayGateway:
             self._loop = None
 
     async def _cleanup(self) -> None:
-        probe_tasks = list(self._media_probe_tasks)
-        for task in probe_tasks:
-            task.cancel()
-        if probe_tasks:
-            await asyncio.gather(*probe_tasks, return_exceptions=True)
-        self._media_probe_tasks.clear()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -1133,7 +999,6 @@ class DirectPlayGateway:
             self._item_paths.clear()
             self._unmanaged_items.clear()
             self._playback_paths.clear()
-            self._media_probe_times.clear()
 
     def stop(self) -> None:
         """停止内置 Emby 直链网关"""
