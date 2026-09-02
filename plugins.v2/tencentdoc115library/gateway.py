@@ -4,7 +4,7 @@ import json
 import re
 import zlib
 from pathlib import Path
-from secrets import compare_digest
+from secrets import compare_digest, token_hex
 from threading import Lock, Thread
 from time import monotonic
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -590,6 +590,89 @@ class DirectPlayGateway:
             logger.warning(f"读取 STRM 真实媒体信息失败：{emby_path} - {error}")
             return "", 0, ""
 
+    @staticmethod
+    def _iso_placeholder_stream(file_name: str) -> Dict[str, Any]:
+        """生成仅用于 Emby 客户端选源的 ISO 视频流描述。"""
+        lowered = str(file_name or "").lower()
+        is_uhd = any(
+            marker in lowered
+            for marker in ("2160p", "uhd", "4k", "hevc", "h.265", "h265")
+        )
+        codec = "hevc" if is_uhd else "h264"
+        width, height = (3840, 2160) if is_uhd else (1920, 1080)
+        return {
+            "Codec": codec,
+            "Protocol": "File",
+            "DisplayTitle": f"{height}p {codec.upper()}",
+            "IsInterlaced": False,
+            "IsDefault": True,
+            "IsForced": False,
+            "Type": "Video",
+            "Index": 0,
+            "IsExternal": False,
+            "IsTextSubtitleStream": False,
+            "SupportsExternalStream": False,
+            "Width": width,
+            "Height": height,
+        }
+
+    async def _iso_playback_info_response(
+        self,
+        request: web.Request,
+        item_id: str,
+        config: Dict[str, Any],
+    ) -> Optional[web.Response]:
+        """为受管 ISO 直接构造 PlaybackInfo，避免 Emby ffprobe 镜像。"""
+        if not self._session:
+            return None
+        headers, auth_query = self._client_auth(request)
+        if not headers and not auth_query:
+            return None
+        item, status = await self._query_item(
+            request.path,
+            item_id,
+            config,
+            headers,
+            auth_query,
+        )
+        if status != 200 or not item:
+            return None
+        item_path = self._select_item_path(item, config)
+        if not self._is_managed_path(item_path, config):
+            return None
+        container, _, _ = self._strm_media_details(item_path, config)
+        if container != "iso":
+            return None
+        media_sources = item.get("MediaSources") or []
+        if not media_sources:
+            return None
+        source_paths = {
+            str(source.get("Id") or ""): item_path
+            for source in media_sources
+            if str(source.get("Id") or "").strip()
+        }
+        payload = {
+            "MediaSources": media_sources,
+            "PlaySessionId": token_hex(16),
+        }
+        self._cache_playback_paths(
+            request,
+            item_id,
+            source_paths,
+            item_path,
+            config,
+        )
+        modified = self._modify_playback_info(
+            payload,
+            config,
+            item_path,
+            source_paths,
+            item_id,
+            auth_query,
+        )
+        logger.info(f"已绕过 Emby ffprobe 生成 ISO 媒体项 {item_id} 播放信息")
+        return web.json_response(modified)
+
     async def _direct_response(
         self,
         request: web.Request,
@@ -693,6 +776,10 @@ class DirectPlayGateway:
                 # 光盘镜像需由客户端按文件随机读取并自行挂载，
                 # 不是 Emby 的容器直流（remux）。
                 source["SupportsDirectStream"] = False
+                if not source.get("MediaStreams"):
+                    source["MediaStreams"] = [
+                        self._iso_placeholder_stream(file_name)
+                    ]
                 logger.info(
                     f"已将 Emby 媒体项 {item_id or '未知'} 的 ISO 源 "
                     f"{source_id or '未知'} 恢复为文件播放语义"
@@ -793,6 +880,15 @@ class DirectPlayGateway:
             )
             if direct_response is not None:
                 return direct_response
+        playback_match = PLAYBACK_INFO_PATTERN.search(request.path)
+        if playback_match and request.method == "POST":
+            iso_response = await self._iso_playback_info_response(
+                request,
+                playback_match.group(1),
+                config,
+            )
+            if iso_response is not None:
+                return iso_response
         if not self._session:
             raise web.HTTPServiceUnavailable(text="直链网关尚未初始化")
         headers = self._filtered_headers(request.headers)
@@ -811,7 +907,6 @@ class DirectPlayGateway:
             allow_redirects=False,
         ) as upstream:
             response_headers = self._filtered_headers(upstream.headers)
-            playback_match = PLAYBACK_INFO_PATTERN.search(request.path)
             if playback_match and upstream.status == 200:
                 upstream_body = await upstream.read()
                 try:

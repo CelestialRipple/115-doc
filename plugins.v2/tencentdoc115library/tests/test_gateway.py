@@ -256,6 +256,23 @@ def test_playback_info_restores_iso_container_size_and_route():
         assert source["Path"] == str(strm_path.with_suffix(".iso"))
         assert source["Protocol"] == "File"
         assert source["IsRemote"] is False
+        assert source["MediaStreams"] == [
+            {
+                "Codec": "h264",
+                "Protocol": "File",
+                "DisplayTitle": "1080p H264",
+                "IsInterlaced": False,
+                "IsDefault": True,
+                "IsForced": False,
+                "Type": "Video",
+                "Index": 0,
+                "IsExternal": False,
+                "IsTextSubtitleStream": False,
+                "SupportsExternalStream": False,
+                "Width": 1920,
+                "Height": 1080,
+            }
+        ]
         assert source["DirectStreamUrl"] == (
             "/videos/item-iso/stream.iso?Static=true&MediaSourceId=source-iso"
         )
@@ -458,14 +475,38 @@ def test_iso_stream_uses_temporary_redirect_without_emby_probe():
                 "?token=secret&file_id=file-iso",
                 encoding="utf-8",
             )
+            playback_requests = []
+
             async def items_handler(request):
-                assert request.query.get("Ids") == "source-iso"
+                assert request.query.get("Ids") in {"1", "source-iso"}
                 return web.json_response(
-                    {"Items": [{"Path": str(strm_path)}]}
+                    {
+                        "Items": [
+                            {
+                                "Path": str(strm_path),
+                                "MediaSources": [
+                                    {
+                                        "Id": "mediasource_source-iso",
+                                        "Path": "http://moviepilot/iso",
+                                        "Container": "strm",
+                                        "MediaStreams": [],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
                 )
+
+            async def playback_info_handler(_request):
+                playback_requests.append(True)
+                return web.json_response({}, status=500)
 
             emby_app = web.Application()
             emby_app.router.add_get("/emby/Items", items_handler)
+            emby_app.router.add_post(
+                "/emby/Items/1/PlaybackInfo",
+                playback_info_handler,
+            )
             emby_runner = web.AppRunner(emby_app)
             await emby_runner.setup()
             emby_port = _unused_port()
@@ -509,6 +550,17 @@ def test_iso_stream_uses_temporary_redirect_without_emby_probe():
             await gateway._serve()
             try:
                 async with ClientSession() as client:
+                    async with client.post(
+                        f"http://127.0.0.1:{gateway_port}/emby/Items/1/PlaybackInfo",
+                        params={"api_key": "client-key"},
+                        json={},
+                    ) as response:
+                        assert response.status == 200
+                        source = (await response.json())["MediaSources"][0]
+                        assert source["Container"] == "iso"
+                        assert source["SupportsDirectStream"] is False
+                        assert source["MediaStreams"][0]["Type"] == "Video"
+                    assert playback_requests == []
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Videos/1/original.iso",
                         params={
