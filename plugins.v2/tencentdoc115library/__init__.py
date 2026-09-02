@@ -74,6 +74,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "request_interval": 0.5,
     "request_retries": 4,
     "direct_url_cache_ttl": 6000,
+    "iso_fresh_redirect": True,
     "download_retries": 4,
     "download_chunk_size": 1048576,
     "video_extensions": ".mp4,.mkv,.ts,.m2ts,.avi,.mov,.wmv,.flv,.webm,.iso",
@@ -93,7 +94,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.8.6"
+    plugin_version = "0.8.7"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -686,7 +687,15 @@ class TencentDoc115Library(_PluginBase):
                 file_id=file_id,
                 user_agent=request.headers.get("user-agent", ""),
             )
-            return RedirectResponse(url=direct_url, status_code=307)
+            return RedirectResponse(
+                url=direct_url,
+                status_code=307,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
         except ShareResolutionError as error:
             return JSONResponse(
                 status_code=error.status_code,
@@ -1159,7 +1168,25 @@ class TencentDoc115Library(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "iso_fresh_redirect",
+                                            "label": "ISO 每次请求换新直链",
+                                            "hint": (
+                                                "实验性：规避115分享直链的请求次数限制；"
+                                                "会增加115接口调用"
+                                            ),
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -1173,7 +1200,7 @@ class TencentDoc115Library(_PluginBase):
                             self._text_field(
                                 "direct_gateway_port",
                                 "网关监听端口",
-                                3,
+                                4,
                                 hint="默认8097；Docker需要映射相同端口",
                             ),
                             self._text_field(

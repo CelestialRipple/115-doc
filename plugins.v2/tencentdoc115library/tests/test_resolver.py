@@ -104,3 +104,34 @@ def test_direct_url_cache_can_be_invalidated_and_disabled() -> None:
     disabled.resolve_file_url(share_url, "file-2", "infuse")
     disabled.resolve_file_url(share_url, "file-2", "infuse")
     assert len(calls) == 5
+
+
+def test_direct_url_force_refresh_bypasses_cache() -> None:
+    calls: list = []
+    resolver = _caching_resolver(calls)
+    share_url = "https://115.com/s/abcd1234?password=wxyz"
+
+    first = resolver.resolve_file_url(
+        share_url, "file-iso", "infuse", force_refresh=True
+    )
+    second = resolver.resolve_file_url(
+        share_url, "file-iso", "infuse", force_refresh=True
+    )
+
+    assert first != second
+    assert len(calls) == 2
+
+
+def test_iso_fresh_redirect_is_configurable() -> None:
+    enabled = ShareResolver(
+        store=object(),
+        config_provider=lambda: {"iso_fresh_redirect": True},
+    )
+    disabled = ShareResolver(
+        store=object(),
+        config_provider=lambda: {"iso_fresh_redirect": False},
+    )
+
+    assert enabled._fresh_redirect_for("movie.ISO") is True
+    assert enabled._fresh_redirect_for("movie.mkv") is False
+    assert disabled._fresh_redirect_for("movie.iso") is False

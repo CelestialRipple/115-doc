@@ -756,7 +756,15 @@ class DirectPlayGateway:
                 f"返回115直链：{request.method} {request.path}"
             )
             # 与 go-emby2openlist 一致使用 307，完整保留 GET、HEAD 和 Range 语义。
-            return web.Response(status=307, headers={"Location": direct_url})
+            return web.Response(
+                status=307,
+                headers={
+                    "Location": direct_url,
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
         except ShareResolutionError as error:
             return web.json_response(
                 {"success": False, "message": str(error)},

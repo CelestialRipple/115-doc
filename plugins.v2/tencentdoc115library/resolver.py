@@ -578,14 +578,22 @@ class ShareResolver:
         share_url: str,
         file_id: str,
         user_agent: str = "",
+        force_refresh: bool = False,
     ) -> str:
         """使用账户 Cookie 为一个已知分享文件生成临时下载地址。"""
-        cached = self._cached_url(share_url, file_id, user_agent)
-        if cached:
-            return cached
+        if not force_refresh:
+            cached = self._cached_url(share_url, file_id, user_agent)
+            if cached:
+                return cached
         url = self._download_url(share_url, file_id, user_agent)
-        self._store_url(share_url, file_id, user_agent, url)
+        if not force_refresh:
+            self._store_url(share_url, file_id, user_agent, url)
         return url
+
+    def _fresh_redirect_for(self, file_name: str) -> bool:
+        """ISO 随机读取时每次回源换签名，避免复用次数有限的分享直链。"""
+        enabled = self.config_provider().get("iso_fresh_redirect", True)
+        return bool(enabled) and Path(str(file_name or "")).suffix.lower() == ".iso"
 
     def resolve(
         self,
@@ -613,23 +621,33 @@ class ShareResolver:
             str(file_id or "").strip()
             or str(resource.get("resolved_file_id") or "").strip()
         )
-        if known_file_id:
-            cached = self._cached_url(
-                resource["share_url"],
-                known_file_id,
-                user_agent,
+        resource_file = None
+        known_file_name = str(resource.get("resolved_file_name") or "").strip()
+        if str(file_id or "").strip():
+            resource_file = self.store.get_resource_file(
+                resource_id,
+                str(file_id).strip(),
             )
-            if cached:
-                return cached
+            if resource_file:
+                known_file_name = str(resource_file.get("file_name") or "").strip()
+        force_refresh = self._fresh_redirect_for(known_file_name)
+        if known_file_id:
+            if not force_refresh:
+                cached = self._cached_url(
+                    resource["share_url"],
+                    known_file_id,
+                    user_agent,
+                )
+                if cached:
+                    return cached
         with self._resource_locks_guard:
             lock = self._resource_locks.setdefault(resource_id, Lock())
         with lock:
             try:
                 target_file_id = str(file_id or "").strip()
                 if target_file_id:
-                    resource_file = self.store.get_resource_file(
-                        resource_id,
-                        target_file_id,
+                    resource_file = resource_file or self.store.get_resource_file(
+                        resource_id, target_file_id
                     )
                     if not resource_file:
                         raise ShareResolutionError(
@@ -637,13 +655,16 @@ class ShareResolver:
                             status_code=404,
                             retryable=False,
                         )
+                    target_file_name = str(resource_file.get("file_name") or "")
                 else:
                     target_file_id = str(resource.get("resolved_file_id") or "").strip()
+                    target_file_name = str(resource.get("resolved_file_name") or "")
                     if not target_file_id:
                         selected = self.choose_movie_file(
                             self.list_video_files(resource["share_url"])
                         )
                         target_file_id = selected["file_id"]
+                        target_file_name = selected["file_name"]
                         self.store.update_resource_status(
                             resource_id,
                             resource.get("status") or "ready",
@@ -655,6 +676,7 @@ class ShareResolver:
                     resource["share_url"],
                     target_file_id,
                     user_agent,
+                    force_refresh=self._fresh_redirect_for(target_file_name),
                 )
             except ShareResolutionError as error:
                 status = "invalid_share" if not error.retryable else "ready"
