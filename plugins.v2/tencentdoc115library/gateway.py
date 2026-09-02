@@ -988,9 +988,42 @@ class DirectPlayGateway:
                 async for chunk in upstream.content.iter_chunked(256 * 1024):
                     await response.write(chunk)
                 await response.write_eof()
-            except (ConnectionResetError, ClientError):
-                logger.debug(f"客户端提前结束代理请求：{request.path}")
+            except (
+                ConnectionResetError,
+                ClientError,
+                asyncio.TimeoutError,
+            ):
+                logger.debug(f"直链网关转发连接提前结束：{request.path}")
             return response
+
+    @web.middleware
+    async def _error_middleware(
+        self,
+        request: web.Request,
+        handler: Callable[[web.Request], Any],
+    ) -> web.StreamResponse:
+        """把未预期的转发异常收敛成 502，避免 aiohttp 直接回 500。"""
+        try:
+            return await handler(request)
+        except web.HTTPException:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionResetError, ClientError, asyncio.TimeoutError) as error:
+            logger.warning(f"直链网关转发 {request.path} 失败：{error}")
+            return web.json_response(
+                {"success": False, "message": f"转发 Emby 请求失败：{error}"},
+                status=502,
+            )
+        except Exception as error:
+            logger.error(
+                f"直链网关处理 {request.path} 异常：{error}",
+                exc_info=True,
+            )
+            return web.json_response(
+                {"success": False, "message": "直链网关内部错误"},
+                status=502,
+            )
 
     async def _serve(self) -> None:
         config = self.config_provider()
@@ -1002,27 +1035,9 @@ class DirectPlayGateway:
             auto_decompress=False,
         )
 
-        @web.middleware
-        async def gateway_error_middleware(request, handler):
-            try:
-                return await handler(request)
-            except web.HTTPException:
-                raise
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.error(
-                    f"直链网关处理请求失败：{request.path} - {error}",
-                    exc_info=True,
-                )
-                return web.json_response(
-                    {"success": False, "message": "直链网关请求失败"},
-                    status=502,
-                )
-
         application = web.Application(
             client_max_size=64 * 1024 * 1024,
-            middlewares=[gateway_error_middleware],
+            middlewares=[self._error_middleware],
         )
         application.router.add_route("*", "/{path:.*}", self._proxy)
         self._runner = web.AppRunner(application, access_log=None)

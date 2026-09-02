@@ -60,39 +60,47 @@ def test_share_listing_is_anonymous_and_does_not_load_cookie() -> None:
     assert files[0]["file_name"] == "电影.mkv"
 
 
-def test_playback_direct_url_is_cached_per_file_and_user_agent() -> None:
-    class FakeStore:
-        @staticmethod
-        def get_resource(resource_id):
-            assert resource_id == "resource-1"
-            return {
-                "status": "ready",
-                "share_url": "https://115.com/s/share-1?password=abcd",
-            }
-
-        @staticmethod
-        def get_resource_file(resource_id, file_id):
-            assert resource_id == "resource-1"
-            assert file_id == "file-1"
-            return {"file_name": "电影.iso"}
-
-        @staticmethod
-        def update_resource_status(*_args, **_kwargs):
-            return None
-
-    resolver = ShareResolver(FakeStore(), lambda: {})
-    calls = []
-
-    def resolve_file_url(share_url, file_id, user_agent=""):
+def _caching_resolver(calls: list, ttl: int = 600) -> ShareResolver:
+    resolver = ShareResolver(
+        store=object(),
+        config_provider=lambda: {"direct_url_cache_ttl": ttl},
+    )
+    resolver._download_url = lambda share_url, file_id, user_agent="": (
         calls.append((share_url, file_id, user_agent))
-        return f"https://115cdn.example/{len(calls)}.iso"
+        or f"https://115cdn.example/{file_id}?n={len(calls)}"
+    )
+    return resolver
 
-    resolver.resolve_file_url = resolve_file_url
 
-    first = resolver.resolve("resource-1", "file-1", "Infuse")
-    second = resolver.resolve("resource-1", "file-1", "Infuse")
-    other_client = resolver.resolve("resource-1", "file-1", "Emby")
+def test_direct_url_is_cached_per_file_and_user_agent() -> None:
+    calls: list = []
+    resolver = _caching_resolver(calls)
+    share_url = "https://115.com/s/abcd1234?password=wxyz"
 
-    assert first == second == "https://115cdn.example/1.iso"
-    assert other_client == "https://115cdn.example/2.iso"
+    first = resolver.resolve_file_url(share_url, "file-1", "infuse")
+    second = resolver.resolve_file_url(share_url, "file-1", "infuse")
+
+    assert first == second
+    assert len(calls) == 1
+    resolver.resolve_file_url(share_url, "file-1", "emby")
     assert len(calls) == 2
+
+
+def test_direct_url_cache_can_be_invalidated_and_disabled() -> None:
+    calls: list = []
+    resolver = _caching_resolver(calls)
+    share_url = "https://115.com/s/abcd1234?password=wxyz"
+
+    resolver.resolve_file_url(share_url, "file-1", "infuse")
+    resolver.invalidate_file_url(share_url, "file-1")
+    resolver.resolve_file_url(share_url, "file-1", "infuse")
+    assert len(calls) == 2
+
+    resolver.clear_url_cache()
+    resolver.resolve_file_url(share_url, "file-1", "infuse")
+    assert len(calls) == 3
+
+    disabled = _caching_resolver(calls, ttl=0)
+    disabled.resolve_file_url(share_url, "file-2", "infuse")
+    disabled.resolve_file_url(share_url, "file-2", "infuse")
+    assert len(calls) == 5

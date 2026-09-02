@@ -73,6 +73,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "share_max_depth": 20,
     "request_interval": 0.5,
     "request_retries": 4,
+    "direct_url_cache_ttl": 6000,
     "download_retries": 4,
     "download_chunk_size": 1048576,
     "video_extensions": ".mp4,.mkv,.ts,.m2ts,.avi,.mov,.wmv,.flv,.webm,.iso",
@@ -628,6 +629,8 @@ class TencentDoc115Library(_PluginBase):
             self._store.clear_all()
             if self._gateway:
                 self._gateway.clear_cache()
+            if self._resolver:
+                self._resolver.clear_url_cache()
             updated_config = dict(self._config)
             for key in list(updated_config):
                 if key.startswith("sheet_") and key.endswith(
@@ -1101,6 +1104,9 @@ class TencentDoc115Library(_PluginBase):
                                 "request_interval", "115请求间隔（秒）", 3
                             ),
                             self._text_field("request_retries", "临时错误重试次数", 3),
+                            self._text_field(
+                                "direct_url_cache_ttl", "直链缓存时长（秒）", 3
+                            ),
                             self._text_field("search_page_size", "本地检索每页条数", 3),
                             self._text_field("download_retries", "直链下载重试次数", 3),
                         ],
