@@ -8,9 +8,9 @@ from secrets import compare_digest
 from threading import Lock, Thread
 from time import monotonic
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType, web
 
 try:
     from app.sdk.logging import logger
@@ -594,29 +594,6 @@ class DirectPlayGateway:
             logger.warning(f"读取 STRM 真实媒体信息失败：{emby_path} - {error}")
             return "", 0, ""
 
-    def _named_play_url(
-        self,
-        emby_path: str,
-        file_name: str,
-        config: Dict[str, Any],
-    ) -> str:
-        """为旧 STRM 的播放地址补上仅用于格式识别的原文件名。"""
-        if not file_name:
-            return ""
-        try:
-            content = self._strm_content(emby_path, config)
-            parsed = urlsplit(content)
-            if not PLAY_PATH_PATTERN.search(parsed.path):
-                return ""
-            suffix = "/" + quote(Path(file_name).name, safe="")
-            if parsed.path.endswith(suffix):
-                return content
-            return urlunsplit(
-                parsed._replace(path=parsed.path.rstrip("/") + suffix)
-            )
-        except Exception:
-            return ""
-
     @staticmethod
     def _raw_media_source_id(request: web.Request) -> str:
         for name, value in request.query.items():
@@ -798,6 +775,7 @@ class DirectPlayGateway:
         item_path: str = "",
         source_paths: Optional[Dict[str, str]] = None,
         item_id: str = "",
+        auth_query: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         managed_item = self._is_managed_path(item_path, config)
         for source in payload.get("MediaSources") or []:
@@ -818,26 +796,23 @@ class DirectPlayGateway:
                 ),
                 "",
             )
-            container, file_size, file_name = self._strm_media_details(
+            container, file_size, _ = self._strm_media_details(
                 managed_path,
                 config,
+            )
+            original_direct_stream_url = str(
+                source.get("DirectStreamUrl") or ""
             )
             source["SupportsDirectPlay"] = True
             source["SupportsDirectStream"] = True
             source["SupportsTranscoding"] = False
             if container:
                 source["Container"] = container
+            if container == "iso":
+                source["VideoType"] = "Iso"
+                source["SupportsProbing"] = True
             if file_size:
                 source["Size"] = file_size
-            named_play_url = self._named_play_url(
-                managed_path,
-                file_name,
-                config,
-            )
-            if named_play_url:
-                source["Path"] = named_play_url
-                source["Protocol"] = "Http"
-                source["IsRemote"] = True
             for key in (
                 "TranscodingUrl",
                 "TranscodingContainer",
@@ -854,9 +829,27 @@ class DirectPlayGateway:
                 stream_name = "stream"
                 if container and re.fullmatch(r"[a-z0-9]+", container):
                     stream_name += f".{container}"
+                stream_query = {
+                    "Static": "true",
+                    "MediaSourceId": source_id,
+                }
+                original_query = parse_qs(
+                    urlsplit(original_direct_stream_url).query
+                )
+                for key in ("api_key", "X-Emby-Token", "PlaySessionId"):
+                    value = str(
+                        (original_query.get(key) or [""])[0]
+                        or (auth_query or {}).get(key)
+                        or ""
+                    ).strip()
+                    if value:
+                        stream_query[key] = value
+                play_session_id = str(payload.get("PlaySessionId") or "").strip()
+                if play_session_id:
+                    stream_query["PlaySessionId"] = play_session_id
                 source["DirectStreamUrl"] = (
                     f"/{media_route}/{quote(item_id, safe='')}/{stream_name}"
-                    f"?Static=true&MediaSourceId={quote(source_id, safe='')}"
+                    f"?{urlencode(stream_query)}"
                 )
         return payload
 
@@ -956,12 +949,14 @@ class DirectPlayGateway:
                         item_path,
                         config,
                     )
+                    _, auth_query = self._client_auth(request)
                     modified = self._modify_playback_info(
                         payload,
                         config,
                         item_path,
                         source_paths,
                         playback_match.group(1),
+                        auth_query,
                     )
                     return web.json_response(
                         modified,
@@ -982,12 +977,19 @@ class DirectPlayGateway:
             response = web.StreamResponse(
                 status=upstream.status,
                 reason=upstream.reason,
-                headers=response_headers,
+                headers={
+                    key: value
+                    for key, value in response_headers.items()
+                    if key.lower() != "content-length"
+                },
             )
             await response.prepare(request)
-            async for chunk in upstream.content.iter_chunked(256 * 1024):
-                await response.write(chunk)
-            await response.write_eof()
+            try:
+                async for chunk in upstream.content.iter_chunked(256 * 1024):
+                    await response.write(chunk)
+                await response.write_eof()
+            except (ConnectionResetError, ClientError):
+                logger.debug(f"客户端提前结束代理请求：{request.path}")
             return response
 
     async def _serve(self) -> None:
@@ -999,7 +1001,29 @@ class DirectPlayGateway:
             trust_env=False,
             auto_decompress=False,
         )
-        application = web.Application(client_max_size=64 * 1024 * 1024)
+
+        @web.middleware
+        async def gateway_error_middleware(request, handler):
+            try:
+                return await handler(request)
+            except web.HTTPException:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error(
+                    f"直链网关处理请求失败：{request.path} - {error}",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    {"success": False, "message": "直链网关请求失败"},
+                    status=502,
+                )
+
+        application = web.Application(
+            client_max_size=64 * 1024 * 1024,
+            middlewares=[gateway_error_middleware],
+        )
         application.router.add_route("*", "/{path:.*}", self._proxy)
         self._runner = web.AppRunner(application, access_log=None)
         await self._runner.setup()

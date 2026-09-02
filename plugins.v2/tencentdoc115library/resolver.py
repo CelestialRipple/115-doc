@@ -19,6 +19,9 @@ except ImportError:
 
 from .store import CatalogStore, utc_now
 
+DIRECT_URL_CACHE_TTL_SECONDS = 100 * 60
+DIRECT_URL_CACHE_MAX_SIZE = 4096
+
 DEFAULT_VIDEO_EXTENSIONS = {
     ".3gp",
     ".avi",
@@ -88,6 +91,10 @@ class ShareResolver:
         self._last_request_at = 0.0
         self._resource_locks: Dict[str, Lock] = {}
         self._resource_locks_guard = Lock()
+        self._direct_url_cache: Dict[
+            Tuple[str, str, str], Tuple[str, float]
+        ] = {}
+        self._direct_url_cache_lock = Lock()
         self._anonymous_request = RequestUtils(
             proxies=settings.PROXY,
             timeout=30,
@@ -492,6 +499,36 @@ class ShareResolver:
         """使用账户 Cookie 为一个已知分享文件生成临时下载地址。"""
         return self._download_url(share_url, file_id, user_agent)
 
+    def _cached_direct_url(
+        self,
+        resource_id: str,
+        file_id: str,
+        user_agent: str,
+    ) -> str:
+        key = (resource_id, file_id, user_agent)
+        now = monotonic()
+        with self._direct_url_cache_lock:
+            cached = self._direct_url_cache.get(key)
+            if cached and cached[1] > now:
+                return cached[0]
+            if cached:
+                self._direct_url_cache.pop(key, None)
+        return ""
+
+    def _remember_direct_url(
+        self,
+        resource_id: str,
+        file_id: str,
+        user_agent: str,
+        url: str,
+    ) -> None:
+        key = (resource_id, file_id, user_agent)
+        expires_at = monotonic() + DIRECT_URL_CACHE_TTL_SECONDS
+        with self._direct_url_cache_lock:
+            self._direct_url_cache[key] = (url, expires_at)
+            while len(self._direct_url_cache) > DIRECT_URL_CACHE_MAX_SIZE:
+                self._direct_url_cache.pop(next(iter(self._direct_url_cache)))
+
     def resolve(
         self,
         resource_id: str,
@@ -544,11 +581,25 @@ class ShareResolver:
                             resolved_file_name=selected["file_name"],
                             resolved_at=utc_now(),
                         )
-                return self.resolve_file_url(
+                cached_url = self._cached_direct_url(
+                    resource_id,
+                    target_file_id,
+                    user_agent,
+                )
+                if cached_url:
+                    return cached_url
+                direct_url = self.resolve_file_url(
                     resource["share_url"],
                     target_file_id,
                     user_agent,
                 )
+                self._remember_direct_url(
+                    resource_id,
+                    target_file_id,
+                    user_agent,
+                    direct_url,
+                )
+                return direct_url
             except ShareResolutionError as error:
                 status = "invalid_share" if not error.retryable else "ready"
                 self.store.update_resource_status(resource_id, status, str(error))

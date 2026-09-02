@@ -4,6 +4,7 @@ import socket
 import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import parse_qs, urlsplit
 
 from aiohttp import ClientSession, web
 
@@ -159,6 +160,35 @@ def test_playback_info_uses_original_media_source_path():
     )
 
 
+def test_playback_info_preserves_auth_and_play_session_in_stream_url():
+    config = {"emby_strm_paths": "/media/tencentdoc115"}
+    gateway = DirectPlayGateway(lambda: config, object())
+    payload = {
+        "PlaySessionId": "session-1",
+        "MediaSources": [
+            {
+                "Id": "source-1",
+                "Path": "/media/tencentdoc115/电影/测试.strm",
+                "DirectStreamUrl": (
+                    "/Videos/1/stream?api_key=old-key&Static=true"
+                ),
+            }
+        ],
+    }
+
+    modified = gateway._modify_playback_info(
+        payload,
+        config,
+        item_id="item-1",
+        auth_query={"api_key": "client-key"},
+    )
+
+    parsed = urlsplit(modified["MediaSources"][0]["DirectStreamUrl"])
+    query = parse_qs(parsed.query)
+    assert query["api_key"] == ["old-key"]
+    assert query["PlaySessionId"] == ["session-1"]
+
+
 def test_playback_info_restores_iso_container_size_and_route():
     with TemporaryDirectory() as temporary_directory:
         strm_path = Path(temporary_directory) / "光盘.strm"
@@ -216,18 +246,15 @@ def test_playback_info_restores_iso_container_size_and_route():
 
         source = modified["MediaSources"][0]
         assert source["Container"] == "iso"
+        assert source["VideoType"] == "Iso"
+        assert source["SupportsProbing"] is True
         assert source["Size"] == 42_000_000_000
         assert source["SupportsDirectPlay"] is True
         assert source["SupportsDirectStream"] is True
         assert source["SupportsTranscoding"] is False
-        assert source["Path"] == (
-            "http://moviepilot:3000/api/v1/plugin/"
-            "TencentDoc115Library/play/resource-iso/"
-            "%E7%94%B5%E5%BD%B1%E5%8E%9F%E7%9B%98.ISO"
-            "?token=secret&file_id=file-iso"
-        )
-        assert source["Protocol"] == "Http"
-        assert source["IsRemote"] is True
+        assert source["Path"] == "http://moviepilot/private-play-url"
+        assert "Protocol" not in source
+        assert "IsRemote" not in source
         assert source["DirectStreamUrl"] == (
             "/videos/item-iso/stream.iso?Static=true&MediaSourceId=source-iso"
         )
@@ -363,7 +390,8 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         assert source["SupportsTranscoding"] is False
                         assert source["DirectStreamUrl"] == (
                             "/videos/1/stream?Static=true&"
-                            "MediaSourceId=mediasource_source-1"
+                            "MediaSourceId=mediasource_source-1&"
+                            "api_key=client-key"
                         )
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Videos/1/stream.mkv",
