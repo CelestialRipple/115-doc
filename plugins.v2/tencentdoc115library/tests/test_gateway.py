@@ -189,7 +189,7 @@ def test_playback_info_preserves_auth_and_play_session_in_stream_url():
     assert query["PlaySessionId"] == ["session-1"]
 
 
-def test_playback_info_restores_iso_container_size_and_route():
+def test_playback_info_preserves_emby_iso_source_and_only_disables_transcoding():
     with TemporaryDirectory() as temporary_directory:
         strm_path = Path(temporary_directory) / "光盘.strm"
         strm_path.write_text(
@@ -227,9 +227,12 @@ def test_playback_info_restores_iso_container_size_and_route():
             "MediaSources": [
                 {
                     "Id": "source-iso",
-                    "Path": "http://moviepilot/private-play-url",
+                    "Path": "http://moviepilot/private-play-url/movie.iso",
+                    "Protocol": "Http",
+                    "IsRemote": True,
                     "Container": "strm",
                     "Size": 176,
+                    "MediaStreams": [],
                     "SupportsDirectPlay": False,
                     "SupportsDirectStream": False,
                     "SupportsTranscoding": True,
@@ -245,36 +248,19 @@ def test_playback_info_restores_iso_container_size_and_route():
         )
 
         source = modified["MediaSources"][0]
-        assert source["Container"] == "iso"
-        assert source["VideoType"] == "Iso"
-        assert source["IsoType"] == "BluRay"
-        assert source["SupportsProbing"] is True
-        assert source["Size"] == 42_000_000_000
+        assert source["Container"] == "strm"
+        assert source["Size"] == 176
         assert source["SupportsDirectPlay"] is True
-        assert source["SupportsDirectStream"] is False
+        assert source["SupportsDirectStream"] is True
         assert source["SupportsTranscoding"] is False
-        assert source["Path"] == str(strm_path.with_suffix(".iso"))
-        assert source["Protocol"] == "File"
-        assert source["IsRemote"] is False
-        assert source["MediaStreams"] == [
-            {
-                "Codec": "h264",
-                "Protocol": "File",
-                "DisplayTitle": "1080p H264",
-                "IsInterlaced": False,
-                "IsDefault": True,
-                "IsForced": False,
-                "Type": "Video",
-                "Index": 0,
-                "IsExternal": False,
-                "IsTextSubtitleStream": False,
-                "SupportsExternalStream": False,
-                "Width": 1920,
-                "Height": 1080,
-            }
-        ]
+        assert source["Path"] == "http://moviepilot/private-play-url/movie.iso"
+        assert source["Protocol"] == "Http"
+        assert source["IsRemote"] is True
+        assert source["MediaStreams"] == []
+        assert "VideoType" not in source
+        assert "IsoType" not in source
         assert source["DirectStreamUrl"] == (
-            "/videos/item-iso/stream.iso?Static=true&MediaSourceId=source-iso"
+            "/videos/item-iso/stream?Static=true&MediaSourceId=source-iso"
         )
 
 
@@ -391,7 +377,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         headers={"User-Agent": "gateway-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status == 302
+                        assert response.status == 307
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/video.mkv"
                         )
@@ -417,7 +403,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         headers={"User-Agent": "infuse-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status == 302
+                        assert response.status == 307
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/video.mkv"
                         )
@@ -429,7 +415,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                             headers={"User-Agent": "infuse-test"},
                             allow_redirects=False,
                         ) as response:
-                            assert response.status == 302
+                            assert response.status == 307
                             assert response.headers["Location"].startswith(
                                 "https://115cdn.example/video.mkv"
                             )
@@ -465,7 +451,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
     asyncio.run(scenario())
 
 
-def test_iso_stream_uses_temporary_redirect_without_emby_probe():
+def test_iso_stream_preserves_origin_playback_info_and_notifies_emby():
     async def scenario():
         with TemporaryDirectory() as temporary_directory:
             strm_path = Path(temporary_directory) / "测试ISO.strm"
@@ -497,9 +483,25 @@ def test_iso_stream_uses_temporary_redirect_without_emby_probe():
                     }
                 )
 
-            async def playback_info_handler(_request):
-                playback_requests.append(True)
-                return web.json_response({}, status=500)
+            async def playback_info_handler(request):
+                playback_requests.append(dict(request.query))
+                return web.json_response(
+                    {
+                        "MediaSources": [
+                            {
+                                "Id": "mediasource_source-iso",
+                                "Path": "http://moviepilot/play/movie.iso",
+                                "Protocol": "Http",
+                                "IsRemote": True,
+                                "Container": "strm",
+                                "MediaStreams": [],
+                                "SupportsDirectPlay": True,
+                                "SupportsDirectStream": True,
+                                "SupportsTranscoding": True,
+                            }
+                        ]
+                    }
+                )
 
             emby_app = web.Application()
             emby_app.router.add_get("/emby/Items", items_handler)
@@ -557,10 +559,15 @@ def test_iso_stream_uses_temporary_redirect_without_emby_probe():
                     ) as response:
                         assert response.status == 200
                         source = (await response.json())["MediaSources"][0]
-                        assert source["Container"] == "iso"
-                        assert source["SupportsDirectStream"] is False
-                        assert source["MediaStreams"][0]["Type"] == "Video"
-                    assert playback_requests == []
+                        assert source["Container"] == "strm"
+                        assert source["Protocol"] == "Http"
+                        assert source["IsRemote"] is True
+                        assert source["Path"].endswith("/movie.iso")
+                        assert source["SupportsDirectStream"] is True
+                        assert source["SupportsTranscoding"] is False
+                        assert source["MediaStreams"] == []
+                    await asyncio.sleep(0)
+                    assert playback_requests
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Videos/1/original.iso",
                         params={
@@ -570,10 +577,16 @@ def test_iso_stream_uses_temporary_redirect_without_emby_probe():
                         headers={"User-Agent": "infuse-iso-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status == 302
+                        assert response.status == 307
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/test.iso"
                         )
+                    await asyncio.sleep(0)
+                    assert any(
+                        request.get("IsPlayback") == "true"
+                        and request.get("AutoOpenLiveStream") == "true"
+                        for request in playback_requests
+                    )
             finally:
                 await gateway._cleanup()
                 await emby_runner.cleanup()

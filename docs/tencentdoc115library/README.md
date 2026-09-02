@@ -27,7 +27,7 @@
 - 点击下载后由插件接管任务，按需生成 115 临时直链并下载到 MoviePilot 选择的下载目录；支持 `.part` 文件和 HTTP Range 断点续传，并向 MoviePilot 报告进度和完成状态。
 - 播放入口带插件自动生成的随机密钥，115 Cookie、腾讯令牌和播放密钥不会写入源码或日志。
 - 可选启用内置 Emby 直链网关；客户端连接网关后，本插件 STRM 的播放和 Emby 原生下载请求会重定向到115临时地址，视频数据不经过 NAS，其余 Emby 请求原样转发。
-- 内置网关会为 Infuse 等客户端强制 DirectPlay、提供静态 DirectStreamUrl，并从115文件记录还原 MKV、ISO 等真实容器和文件大小；ISO 会声明 `VideoType=Iso` 和 BluRay/DVD 镜像类型，并恢复为 Emby 托管文件语义，让客户端继续通过 Emby 播放入口协商；网关同时接管 `stream`、`universal`、`original` 和下载入口，直链使用307保留 Range/HEAD 请求语义。
+- 内置网关会为 Infuse 等客户端强制 DirectPlay、提供静态 DirectStreamUrl，并关闭服务端转码；网关同时接管 `stream`、`universal`、`original` 和下载入口，直链使用307保留 Range/HEAD 请求语义。对于 ISO，网关按 go-emby2openlist 的方式完整保留 Emby 返回的远程 Path、Protocol、IsRemote、Container 与 MediaStreams，不再伪造本地 ISO 媒体源。
 
 ## 工作表分组
 
@@ -99,13 +99,13 @@ MoviePilot 容器必须额外映射 `-p 8097:8097`，内网穿透或公网反向
 
 网关使用独立的无代理 HTTP 会话连接 Emby，避免 MoviePilot 的全局代理把局域网请求转发到代理服务器。只有直接播放可以绕过 NAS；客户端要求转码时无法返回115直链，因此插件会为受管 STRM 关闭转码能力。不属于本插件输出目录的普通媒体仍由 Emby 按原方式处理。
 
-对于受管 STRM，网关同时声明支持 DirectPlay 和 DirectStream、关闭转码，并将 DirectStreamUrl 指向带真实扩展名的网关静态媒体入口，同时保留原 DirectStreamUrl 或客户端请求中的 Emby API Key 与 PlaySessionId。网关会用 SQLite 中匿名展开115分享时保存的原文件名与大小覆盖 Emby 的 `Container` 和 `Size`。ISO 额外声明 `VideoType=Iso` 与 `IsoType=BluRay/Dvd`，把 Path 恢复为 Emby 中的原始 STRM 文件路径，并设置 `Protocol=File`、`IsRemote=false`；实际媒体请求仍进入8097后重定向115。最终直链响应使用 HTTP 307，使 GET、HEAD 和 Range 行为保持不变。
+对于受管 STRM，网关同时声明支持 DirectPlay 和 DirectStream、关闭转码，并将 DirectStreamUrl 指向通用的网关静态媒体入口，同时保留原 DirectStreamUrl 或客户端请求中的 Emby API Key 与 PlaySessionId。Path、Protocol、IsRemote、Container、VideoType 与 MediaStreams 均保留 Emby 原值；远程 Path 自身带有真实文件扩展名，Infuse 可据此选择 ISO 挂载流程。最终直链响应使用 HTTP 307，使 GET、HEAD 和 Range 行为保持不变。
 
 115 临时直链只缓存在内存中，默认100分钟、最多4096条，插件重启即清空。由于客户端收到307后直接访问115，网关看不到115最终返回的403或410，不能在该响应发生时主动失效缓存；缓存时间明显短于通常的临时地址有效期，用于在稳定性和接口频率之间取平衡。
 
 代理普通 Emby 响应时，网关不再照搬上游 `Content-Length`，并将播放器拖动、切换或退出造成的连接中断视为正常结束；未预料异常统一记录后返回502，避免 aiohttp 裸露500页面。
 
-参考 go-emby2openlist 的做法，ISO 第一次命中播放入口时，网关会在后台请求一次 Emby 的 `PlaybackInfo` 并设置 `IsPlayback=true`、`AutoOpenLiveStream=true`，让 Emby 跟随插件地址探测真实媒体。相同媒体项和 MediaSourceId 在10分钟内只触发一次；失败会解除限制供下次重试，任务在网关停止时会被取消，不会无限积累。这个探测可能由 NAS 从115读取少量媒体头部，但实际播放数据仍由客户端从115直链读取。
+参考 go-emby2openlist 的做法，远程 STRM 返回 PlaybackInfo 或第一次命中播放入口时，网关会在后台请求一次 Emby 的 `PlaybackInfo` 并设置 `IsPlayback=true`、`AutoOpenLiveStream=true`，通知 Emby 打开远程媒体。相同媒体项和 MediaSourceId 在10分钟内只触发一次；失败会解除限制供下次重试，任务在网关停止时会被取消，不会无限积累。这个过程可能由 NAS 从115读取少量媒体头部，但实际播放数据仍由客户端从115直链读取。
 
 PlaybackInfo 请求已通过 Emby 认证后，网关会按客户端 IP、User-Agent、媒体项和媒体源保存最多 10 分钟的短期路径关联；缓存最多 2048 条且插件重启或清空时立即释放。这样 Infuse 后续未重复携带 Token 的 Stream 请求仍能安全命中对应 STRM，而其它设备不能复用该关联。
 
