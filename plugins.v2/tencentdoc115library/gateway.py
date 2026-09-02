@@ -703,8 +703,13 @@ class DirectPlayGateway:
                 file_id or None,
                 request.headers.get("user-agent", ""),
             )
-            logger.info(f"直链网关已为 Emby 媒体项 {item_id} 返回115直链")
-            return web.Response(status=307, headers={"Location": direct_url})
+            logger.info(
+                f"直链网关已为 Emby 媒体项 {item_id} "
+                f"返回115直链：{request.method} {request.path}"
+            )
+            # Infuse 的 ISO 随机读取对 302 的兼容性高于 307；
+            # MediaWarp 与 go-emby2openlist 也均使用 302。
+            return web.Response(status=302, headers={"Location": direct_url})
         except ShareResolutionError as error:
             return web.json_response(
                 {"success": False, "message": str(error)},
