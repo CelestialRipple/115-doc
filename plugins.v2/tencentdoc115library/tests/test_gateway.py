@@ -189,7 +189,7 @@ def test_playback_info_preserves_auth_and_play_session_in_stream_url():
     assert query["PlaySessionId"] == ["session-1"]
 
 
-def test_playback_info_preserves_emby_iso_source_and_only_disables_transcoding():
+def test_playback_info_enriches_iso_source_and_uses_iso_stream_route():
     with TemporaryDirectory() as temporary_directory:
         strm_path = Path(temporary_directory) / "光盘.strm"
         strm_path.write_text(
@@ -248,8 +248,10 @@ def test_playback_info_preserves_emby_iso_source_and_only_disables_transcoding()
         )
 
         source = modified["MediaSources"][0]
-        assert source["Container"] == "strm"
-        assert source["Size"] == 176
+        assert source["Container"] == "iso"
+        assert source["VideoType"] == "Iso"
+        assert source["IsoType"] == "BluRay"
+        assert source["Size"] == 42_000_000_000
         assert source["SupportsDirectPlay"] is True
         assert source["SupportsDirectStream"] is True
         assert source["SupportsTranscoding"] is False
@@ -257,10 +259,8 @@ def test_playback_info_preserves_emby_iso_source_and_only_disables_transcoding()
         assert source["Protocol"] == "Http"
         assert source["IsRemote"] is True
         assert source["MediaStreams"] == []
-        assert "VideoType" not in source
-        assert "IsoType" not in source
         assert source["DirectStreamUrl"] == (
-            "/videos/item-iso/stream?Static=true&MediaSourceId=source-iso"
+            "/videos/item-iso/stream.iso?Static=true&MediaSourceId=source-iso"
         )
 
 
@@ -451,7 +451,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
     asyncio.run(scenario())
 
 
-def test_iso_stream_preserves_origin_playback_info_and_notifies_emby():
+def test_iso_stream_enriches_playback_info_without_probing_emby():
     async def scenario():
         with TemporaryDirectory() as temporary_directory:
             strm_path = Path(temporary_directory) / "测试ISO.strm"
@@ -559,15 +559,19 @@ def test_iso_stream_preserves_origin_playback_info_and_notifies_emby():
                     ) as response:
                         assert response.status == 200
                         source = (await response.json())["MediaSources"][0]
-                        assert source["Container"] == "strm"
+                        assert source["Container"] == "iso"
+                        assert source["VideoType"] == "Iso"
+                        assert source["IsoType"] == "BluRay"
+                        assert source["Size"] == 8_000_000_000
                         assert source["Protocol"] == "Http"
                         assert source["IsRemote"] is True
                         assert source["Path"].endswith("/movie.iso")
                         assert source["SupportsDirectStream"] is True
                         assert source["SupportsTranscoding"] is False
                         assert source["MediaStreams"] == []
+                        assert "/stream.iso?" in source["DirectStreamUrl"]
                     await asyncio.sleep(0)
-                    assert playback_requests
+                    assert len(playback_requests) == 1
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Videos/1/original.iso",
                         params={
@@ -582,11 +586,7 @@ def test_iso_stream_preserves_origin_playback_info_and_notifies_emby():
                             "https://115cdn.example/test.iso"
                         )
                     await asyncio.sleep(0)
-                    assert any(
-                        request.get("IsPlayback") == "true"
-                        and request.get("AutoOpenLiveStream") == "true"
-                        for request in playback_requests
-                    )
+                    assert len(playback_requests) == 1
             finally:
                 await gateway._cleanup()
                 await emby_runner.cleanup()

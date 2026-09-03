@@ -688,6 +688,12 @@ class DirectPlayGateway:
         """去重调度 Emby 远程 STRM 打开通知。"""
         if not self._is_managed_path(emby_path, config):
             return
+        # Emby 无法用 ffprobe 解析整盘 ISO 的 HTTP 入口。继续发送
+        # AutoOpenLiveStream 只会制造一次 500，而且不会补出有效媒体流；
+        # ISO 所需的容器、镜像类型和大小由 PlaybackInfo 修正逻辑提供。
+        container, _, _ = self._strm_media_details(emby_path, config)
+        if container == "iso":
+            return
         source_id = source_id or self._raw_media_source_id(request)
         cache_key = (item_id, source_id)
         now = monotonic()
@@ -797,15 +803,35 @@ class DirectPlayGateway:
                 and not self._is_managed_path(emby_path, config)
             ):
                 continue
+            managed_path = original_path or (
+                item_path if managed_item else emby_path
+            )
+            container, file_size, file_name = self._strm_media_details(
+                managed_path,
+                config,
+            )
+            is_iso = container == "iso"
             original_direct_stream_url = str(
                 source.get("DirectStreamUrl") or ""
             )
             source["SupportsDirectPlay"] = True
             source["SupportsDirectStream"] = True
             source["SupportsTranscoding"] = False
-            # Path、Protocol、IsRemote、Container、VideoType、MediaStreams
-            # 必须保留 Emby 原值。go-emby2openlist 也不伪装这些字段；
-            # 尤其 ISO 依赖远程 Path 中真实的 .iso 后缀进入挂载流程。
+            # 普通视频保留 Emby 原值；ISO 则必须纠正 STRM 扫描产生的
+            # Container=strm、Size=STRM文本大小和缺失的 VideoType。
+            # Infuse 会根据这些字段决定是否按光盘镜像挂载，而不是把
+            # ISO 头部当作普通流媒体容器解析。
+            if is_iso:
+                source["Container"] = "iso"
+                source["VideoType"] = "Iso"
+                lower_name = file_name.lower()
+                source["IsoType"] = (
+                    "Dvd"
+                    if "dvd" in lower_name and "bluray" not in lower_name
+                    else "BluRay"
+                )
+                if file_size > 0:
+                    source["Size"] = file_size
             for key in (
                 "TranscodingUrl",
                 "TranscodingContainer",
@@ -839,6 +865,7 @@ class DirectPlayGateway:
                     stream_query["PlaySessionId"] = play_session_id
                 source["DirectStreamUrl"] = (
                     f"/{media_route}/{quote(item_id, safe='')}/stream"
+                    f"{'.iso' if is_iso else ''}"
                     f"?{urlencode(stream_query)}"
                 )
         return payload
