@@ -75,6 +75,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "request_retries": 4,
     "direct_url_cache_ttl": 6000,
     "iso_fresh_redirect": True,
+    "playback_transfer_enabled": False,
+    "playback_transfer_path": "/temp",
+    "playback_transfer_retention_hours": 24,
+    "playback_transfer_wait_seconds": 30,
+    "playback_transfer_permanent_delete": True,
+    "playback_transfer_recycle_password": "",
+    "playback_transfer_cleanup_cron": "17 * * * *",
     "download_retries": 4,
     "download_chunk_size": 1048576,
     "video_extensions": ".mp4,.mkv,.ts,.m2ts,.avi,.mov,.wmv,.flv,.webm,.iso",
@@ -94,7 +101,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.8.7"
+    plugin_version = "0.9.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -600,6 +607,7 @@ class TencentDoc115Library(_PluginBase):
         snapshot["direct_gateway"] = (
             self._gateway.status() if self._gateway else {"state": "disabled"}
         )
+        snapshot["playback_transfer"] = self._store.playback_transfer_snapshot()
         return Response(success=True, data=snapshot)
 
     def restart_gateway(self) -> Response:
@@ -610,6 +618,20 @@ class TencentDoc115Library(_PluginBase):
             return Response(success=False, message="请先在插件配置中启用直链网关")
         self._gateway.restart_background()
         return Response(success=True, message="直链网关正在后台重启")
+
+    def cleanup_playback_transfers(self) -> Response:
+        """立即清理全部已到期的115播放临时转存。"""
+        if not self._resolver:
+            return Response(success=False, message="插件尚未初始化")
+        result = self._resolver.cleanup_temporary_transfers()
+        return Response(
+            success=int(result.get("failed") or 0) == 0,
+            message=(
+                f"已检查 {result['checked']} 项，清理 {result['removed']} 项，"
+                f"失败 {result['failed']} 项"
+            ),
+            data=result,
+        )
 
     def clear_all_data(self) -> Response:
         """清空插件数据库以及输出目录中的 STRM 和元数据文件"""
@@ -626,6 +648,19 @@ class TencentDoc115Library(_PluginBase):
         if not self._store or not self._builder:
             return Response(success=False, message="插件尚未初始化")
         try:
+            if self._resolver:
+                remote_cleanup = self._resolver.cleanup_temporary_transfers(
+                    include_all=True
+                )
+                if remote_cleanup.get("failed"):
+                    return Response(
+                        success=False,
+                        message=(
+                            "115临时转存仍有清理失败项，已保留SQLite记录供重试；"
+                            "请检查Cookie或安全密钥后再清空"
+                        ),
+                        data=remote_cleanup,
+                    )
             cleanup = self._builder.clear_generated_output()
             self._store.clear_all()
             if self._gateway:
@@ -776,6 +811,13 @@ class TencentDoc115Library(_PluginBase):
                 "auth": "bear",
             },
             {
+                "path": "/transfers/cleanup",
+                "endpoint": self.cleanup_playback_transfers,
+                "methods": ["POST"],
+                "summary": "清理到期的115播放临时转存",
+                "auth": "bear",
+            },
+            {
                 "path": "/clear-all",
                 "endpoint": self.clear_all_data,
                 "methods": ["POST"],
@@ -809,6 +851,17 @@ class TencentDoc115Library(_PluginBase):
         if not self._enabled or not self._builder:
             return
         self._submit("自动媒体库生成", self._builder.build)
+
+    def _automatic_transfer_cleanup(self) -> None:
+        """定时清理已到期的115播放临时转存。"""
+        if not self._resolver:
+            return
+        result = self._resolver.cleanup_temporary_transfers()
+        if result.get("checked"):
+            logger.info(
+                "115播放临时转存清理完成："
+                f"{result['removed']} 成功 / {result['failed']} 失败"
+            )
 
     def get_service(self) -> List[Dict[str, Any]]:
         """按配置注册自动同步任务。"""
@@ -851,6 +904,29 @@ class TencentDoc115Library(_PluginBase):
                     "kwargs": {},
                 }
             )
+        transfer_count = (
+            self._store.playback_transfer_snapshot().get("total", 0)
+            if self._store
+            else 0
+        )
+        if self._config.get("playback_transfer_enabled") or transfer_count:
+            cron = str(
+                self._config.get("playback_transfer_cleanup_cron")
+                or "17 * * * *"
+            ).strip()
+            try:
+                trigger = CronTrigger.from_crontab(cron)
+                services.append(
+                    {
+                        "id": "TencentDoc115LibraryTransferCleanup",
+                        "name": "腾讯文档115播放临时转存清理",
+                        "trigger": trigger,
+                        "func": self._automatic_transfer_cleanup,
+                        "kwargs": {},
+                    }
+                )
+            except ValueError as error:
+                logger.error(f"115播放临时转存清理定时表达式错误：{error}")
         return services
 
     @staticmethod
@@ -1142,6 +1218,86 @@ class TencentDoc115Library(_PluginBase):
                         ],
                     },
                     {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "class": "mt-2 mb-3",
+                            "text": (
+                                "ISO 无法通过分享直链播放时，可开启播放前临时转存。"
+                                "首次播放会等待115把当前文件转存到个人网盘；仅转存"
+                                "正在播放的电影或单集，不会一次转存整个分享。"
+                            ),
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "playback_transfer_enabled",
+                                            "label": "播放前临时转存到115",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "playback_transfer_permanent_delete",
+                                            "label": "到期后彻底删除对应回收项",
+                                        },
+                                    }
+                                ],
+                            },
+                            self._text_field(
+                                "playback_transfer_path",
+                                "115临时目录",
+                                4,
+                                hint="默认 /temp；插件会在其中建立 TencentDoc115 专用子目录",
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._text_field(
+                                "playback_transfer_retention_hours",
+                                "转存保留时间（小时）",
+                                3,
+                                hint="默认24小时；再次播放不会延长时间",
+                            ),
+                            self._text_field(
+                                "playback_transfer_wait_seconds",
+                                "首次播放等待（秒）",
+                                3,
+                                hint="等待115服务端完成转存，默认30秒",
+                            ),
+                            self._text_field(
+                                "playback_transfer_cleanup_cron",
+                                "到期清理 Cron",
+                                3,
+                                hint="默认每小时第17分钟检查",
+                            ),
+                            self._text_field(
+                                "playback_transfer_recycle_password",
+                                "115六位安全密钥（可选）",
+                                3,
+                                True,
+                                "用于彻底删除本插件对应的回收项；不是登录密码",
+                            ),
+                        ],
+                    },
+                    {
                         "component": "VDivider",
                         "props": {"class": "my-4"},
                     },
@@ -1353,6 +1509,11 @@ class TencentDoc115Library(_PluginBase):
             if self._gateway
             else {"enabled": False, "state": "disabled", "port": 8097}
         )
+        playback_transfer = (
+            self._store.playback_transfer_snapshot()
+            if self._store
+            else {"total": 0, "ready": 0, "failed": 0, "total_size": 0}
+        )
         buttons = [
             ("发现工作表", "mdi-table-search", "discover", "primary"),
             ("继续同步", "mdi-sync", "sync", "primary"),
@@ -1371,6 +1532,12 @@ class TencentDoc115Library(_PluginBase):
                 "mdi-lan-connect",
                 "gateway/restart",
                 "info",
+            ),
+            (
+                "清理到期115转存",
+                "mdi-delete-clock",
+                "transfers/cleanup",
+                "warning",
             ),
             (
                 "清空并重新开始",
@@ -1514,6 +1681,14 @@ class TencentDoc115Library(_PluginBase):
         )
         if gateway.get("last_error"):
             gateway_text += f" · 错误：{gateway.get('last_error')}"
+        transfer_text = (
+            "115播放临时转存："
+            f"{int(playback_transfer.get('ready') or 0)} 项可用 · "
+            f"{int(playback_transfer.get('failed') or 0)} 项待清理重试 · "
+            f"占用 {format_gib(int(playback_transfer.get('total_size') or 0))}"
+        )
+        if playback_transfer.get("last_error"):
+            transfer_text += f" · 最近错误：{playback_transfer.get('last_error')}"
         error_items: List[Dict[str, Any]] = []
         for item in snapshot.get("recent_errors", [])[:10]:
             error_items.append(
@@ -1580,6 +1755,22 @@ class TencentDoc115Library(_PluginBase):
                             "text": (
                                 f"{gateway_text}。客户端需要连接此端口，不能继续连接 Emby 8096；"
                                 "直链播放时视频数据由客户端直接从115获取。"
+                            ),
+                        },
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": (
+                                "error"
+                                if int(playback_transfer.get("failed") or 0)
+                                else "info"
+                            ),
+                            "variant": "tonal",
+                            "class": "mt-2",
+                            "text": (
+                                f"{transfer_text}。开启播放前临时转存后，首次播放"
+                                "只转存当前文件；到期清理由独立定时任务完成。"
                             ),
                         },
                     },

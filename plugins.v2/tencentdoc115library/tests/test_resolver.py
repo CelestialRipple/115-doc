@@ -135,3 +135,99 @@ def test_iso_fresh_redirect_is_configurable() -> None:
     assert enabled._fresh_redirect_for("movie.ISO") is True
     assert enabled._fresh_redirect_for("movie.mkv") is False
     assert disabled._fresh_redirect_for("movie.iso") is False
+
+
+def test_playback_transfer_saves_one_file_and_reuses_private_copy() -> None:
+    class FakeStore:
+        transfer = None
+
+        @staticmethod
+        def get_resource(resource_id):
+            assert resource_id == "resource-1"
+            return {
+                "resource_id": resource_id,
+                "share_url": "https://115.com/s/share-code?password=abcd",
+                "status": "ready",
+                "resolved_file_id": "115001",
+                "resolved_file_name": "movie.iso",
+            }
+
+        @staticmethod
+        def get_resource_file(resource_id, file_id):
+            assert resource_id == "resource-1"
+            assert file_id == "115001"
+            return {
+                "file_id": file_id,
+                "file_name": "movie.iso",
+                "file_size": 1024,
+            }
+
+        def get_playback_transfer(self, resource_id, file_id):
+            return dict(self.transfer) if self.transfer else None
+
+        def upsert_playback_transfer(self, transfer):
+            self.transfer = dict(transfer)
+
+        @staticmethod
+        def update_resource_status(*args, **kwargs):
+            return None
+
+    class FakeClient:
+        received = False
+        receive_calls = 0
+        download_calls = 0
+
+        @staticmethod
+        def fs_dir_getid(path):
+            assert path.startswith("/temp/TencentDoc115/")
+            return {"state": True, "id": "9001"}
+
+        def fs_files(self, payload):
+            if not self.received:
+                return {"state": True, "data": []}
+            return {
+                "state": True,
+                "data": [
+                    {
+                        "fid": "8001",
+                        "pc": "pick-code",
+                        "n": "movie.iso",
+                        "s": 1024,
+                    }
+                ],
+            }
+
+        def share_receive(self, payload):
+            assert payload["file_id"] == "115001"
+            self.received = True
+            self.receive_calls += 1
+            return {"state": True}
+
+        def download_url(self, pick_code, **kwargs):
+            assert pick_code == "pick-code"
+            self.download_calls += 1
+            return f"https://115cdn.example/private.iso?c=0&n={self.download_calls}"
+
+    store = FakeStore()
+    client = FakeClient()
+    resolver = ShareResolver(
+        store=store,
+        config_provider=lambda: {
+            "playback_transfer_enabled": True,
+            "playback_transfer_path": "/temp",
+            "playback_transfer_retention_hours": 24,
+            "playback_transfer_wait_seconds": 5,
+            "request_interval": 0.1,
+            "request_retries": 0,
+        },
+    )
+    resolver._get_client = lambda: client
+
+    first = resolver.resolve("resource-1", "115001", "infuse")
+    second = resolver.resolve("resource-1", "115001", "infuse")
+
+    assert "c=0" in first
+    assert first != second
+    assert client.receive_calls == 1
+    assert client.download_calls == 2
+    assert store.transfer["pick_code"] == "pick-code"

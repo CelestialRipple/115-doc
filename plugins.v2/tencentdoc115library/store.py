@@ -7,7 +7,7 @@ from threading import RLock
 from typing import Any, Dict, Generator, List, Optional, Tuple
 from uuid import uuid4
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def utc_now() -> str:
@@ -169,6 +169,27 @@ class CatalogStore:
 
                 CREATE INDEX IF NOT EXISTS idx_direct_download_state
                     ON direct_download_task(state, organized, updated_at);
+
+                CREATE TABLE IF NOT EXISTS playback_transfer (
+                    resource_id TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    directory_id TEXT NOT NULL,
+                    owned_file_id TEXT NOT NULL,
+                    pick_code TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'ready',
+                    transferred_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(resource_id, file_id),
+                    FOREIGN KEY(resource_id) REFERENCES resource(resource_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_playback_transfer_expiry
+                    ON playback_transfer(state, expires_at);
                 """)
             download_columns = {
                 row["name"]
@@ -397,6 +418,7 @@ class CatalogStore:
     def clear_all(self) -> None:
         """清空全部工作表、资源、下载任务和同步历史记录"""
         with self._lock, self.connection() as connection:
+            connection.execute("DELETE FROM playback_transfer")
             connection.execute("DELETE FROM direct_download_task")
             connection.execute("DELETE FROM resource_file")
             connection.execute("DELETE FROM resource")
@@ -404,6 +426,121 @@ class CatalogStore:
             connection.execute("DELETE FROM sync_run")
         with self._lock, self.connection() as connection:
             connection.execute("VACUUM")
+
+    def get_playback_transfer(
+        self,
+        resource_id: str,
+        file_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """读取一个播放文件的临时转存记录。"""
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM playback_transfer "
+                "WHERE resource_id = ? AND file_id = ?",
+                (resource_id, str(file_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_playback_transfer(self, transfer: Dict[str, Any]) -> None:
+        """保存或更新播放前临时转存记录。"""
+        now = utc_now()
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO playback_transfer (
+                    resource_id, file_id, file_name, file_size,
+                    directory_id, owned_file_id, pick_code, state,
+                    transferred_at, expires_at, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(resource_id, file_id) DO UPDATE SET
+                    file_name = excluded.file_name,
+                    file_size = excluded.file_size,
+                    directory_id = excluded.directory_id,
+                    owned_file_id = excluded.owned_file_id,
+                    pick_code = excluded.pick_code,
+                    state = excluded.state,
+                    transferred_at = excluded.transferred_at,
+                    expires_at = excluded.expires_at,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    transfer["resource_id"],
+                    str(transfer["file_id"]),
+                    str(transfer.get("file_name") or ""),
+                    int(transfer.get("file_size") or 0),
+                    str(transfer.get("directory_id") or ""),
+                    str(transfer.get("owned_file_id") or ""),
+                    str(transfer.get("pick_code") or ""),
+                    str(transfer.get("state") or "ready"),
+                    str(transfer.get("transferred_at") or now),
+                    str(transfer["expires_at"]),
+                    transfer.get("last_error"),
+                    now,
+                ),
+            )
+
+    def update_playback_transfer_error(
+        self,
+        resource_id: str,
+        file_id: str,
+        state: str,
+        error: str,
+    ) -> None:
+        """记录临时转存清理失败，供下次定时任务重试。"""
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                "UPDATE playback_transfer SET state = ?, last_error = ?, "
+                "updated_at = ? WHERE resource_id = ? AND file_id = ?",
+                (state, error, utc_now(), resource_id, str(file_id)),
+            )
+
+    def delete_playback_transfer(self, resource_id: str, file_id: str) -> None:
+        """删除一个已完成远端清理的临时转存记录。"""
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                "DELETE FROM playback_transfer "
+                "WHERE resource_id = ? AND file_id = ?",
+                (resource_id, str(file_id)),
+            )
+
+    def list_playback_transfers(
+        self,
+        expired_before: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """列出全部或已经到期的播放临时转存记录。"""
+        query = "SELECT * FROM playback_transfer"
+        parameters: Tuple[Any, ...] = ()
+        if expired_before:
+            query += " WHERE expires_at <= ? OR state <> 'ready'"
+            parameters = (expired_before,)
+        query += " ORDER BY expires_at"
+        with self.connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def playback_transfer_snapshot(self) -> Dict[str, Any]:
+        """返回临时转存数量、空间和最近清理错误。"""
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total, "
+                "COALESCE(SUM(file_size), 0) AS total_size, "
+                "SUM(CASE WHEN state = 'ready' THEN 1 ELSE 0 END) AS ready, "
+                "SUM(CASE WHEN state <> 'ready' THEN 1 ELSE 0 END) AS failed "
+                "FROM playback_transfer"
+            ).fetchone()
+            error = connection.execute(
+                "SELECT last_error FROM playback_transfer "
+                "WHERE last_error IS NOT NULL AND last_error <> '' "
+                "ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "ready": int(row["ready"] or 0),
+            "failed": int(row["failed"] or 0),
+            "total_size": int(row["total_size"] or 0),
+            "last_error": str(error["last_error"] or "") if error else "",
+        }
 
     def list_sheets(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
         """
