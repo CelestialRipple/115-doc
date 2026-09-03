@@ -189,79 +189,49 @@ def test_playback_info_preserves_auth_and_play_session_in_stream_url():
     assert query["PlaySessionId"] == ["session-1"]
 
 
-def test_playback_info_enriches_iso_source_and_uses_iso_stream_route():
-    with TemporaryDirectory() as temporary_directory:
-        strm_path = Path(temporary_directory) / "光盘.strm"
-        strm_path.write_text(
-            "http://moviepilot:3000/api/v1/plugin/"
-            "TencentDoc115Library/play/resource-iso"
-            "?token=secret&file_id=file-iso",
-            encoding="utf-8",
-        )
+def test_playback_info_preserves_iso_source_and_uses_normal_stream_route():
+    config = {"emby_strm_paths": "/media/tencentdoc115"}
+    gateway = DirectPlayGateway(lambda: config, object())
+    payload = {
+        "MediaSources": [
+            {
+                "Id": "source-iso",
+                "Path": "/media/tencentdoc115/电影/光盘.strm",
+                "Protocol": "File",
+                "IsRemote": False,
+                "Container": "iso",
+                "VideoType": "Iso",
+                "Size": 42_000_000_000,
+                "MediaStreams": [],
+                "SupportsDirectPlay": False,
+                "SupportsDirectStream": False,
+                "SupportsTranscoding": True,
+                "TranscodingUrl": "/Videos/1/master.m3u8",
+            }
+        ]
+    }
 
-        class FakeStore:
-            @staticmethod
-            def get_resource(resource_id):
-                assert resource_id == "resource-iso"
-                return {}
+    modified = gateway._modify_playback_info(
+        payload,
+        config,
+        "/media/tencentdoc115/电影/光盘.strm",
+        item_id="item-iso",
+    )
 
-            @staticmethod
-            def get_resource_file(resource_id, file_id):
-                assert resource_id == "resource-iso"
-                assert file_id == "file-iso"
-                return {
-                    "file_name": "BDMV/电影原盘.ISO",
-                    "file_size": 42_000_000_000,
-                }
-
-        class FakeResolver:
-            store = FakeStore()
-
-        config = {
-            "emby_strm_paths": temporary_directory,
-            "emby_path_mappings": "",
-            "playback_token": "secret",
-        }
-        gateway = DirectPlayGateway(lambda: config, FakeResolver())
-        payload = {
-            "MediaSources": [
-                {
-                    "Id": "source-iso",
-                    "Path": "http://moviepilot/private-play-url/movie.iso",
-                    "Protocol": "Http",
-                    "IsRemote": True,
-                    "Container": "strm",
-                    "Size": 176,
-                    "MediaStreams": [],
-                    "SupportsDirectPlay": False,
-                    "SupportsDirectStream": False,
-                    "SupportsTranscoding": True,
-                }
-            ]
-        }
-
-        modified = gateway._modify_playback_info(
-            payload,
-            config,
-            str(strm_path),
-            item_id="item-iso",
-        )
-
-        source = modified["MediaSources"][0]
-        assert source["Container"] == "iso"
-        assert source["VideoType"] == "Iso"
-        assert source["IsoType"] == "BluRay"
-        assert source["Size"] == 42_000_000_000
-        assert source["SupportsDirectPlay"] is True
-        assert source["SupportsDirectStream"] is True
-        assert source["SupportsTranscoding"] is False
-        assert source["Path"] == "http://moviepilot/private-play-url/movie.iso"
-        assert source["Protocol"] == "Http"
-        assert source["IsRemote"] is True
-        assert source["MediaStreams"] == []
-        assert source["DirectStreamUrl"] == (
-            "/videos/item-iso/stream.iso?Static=true&MediaSourceId=source-iso"
-        )
+    source = modified["MediaSources"][0]
+    assert source["Path"] == "/media/tencentdoc115/电影/光盘.strm"
+    assert source["Protocol"] == "File"
+    assert source["IsRemote"] is False
+    assert source["Container"] == "iso"
+    assert source["VideoType"] == "Iso"
+    assert source["Size"] == 42_000_000_000
+    assert source["SupportsDirectPlay"] is True
+    assert source["SupportsDirectStream"] is True
+    assert source["SupportsTranscoding"] is False
+    assert "TranscodingUrl" not in source
+    assert source["DirectStreamUrl"] == (
+        "/videos/item-iso/stream?Static=true&MediaSourceId=source-iso"
+    )
 
 
 def test_gateway_redirects_managed_strm_and_proxies_other_requests():
@@ -451,7 +421,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
     asyncio.run(scenario())
 
 
-def test_iso_stream_enriches_playback_info_without_probing_emby():
+def test_iso_stream_preserves_playback_info_and_redirects_directly():
     async def scenario():
         with TemporaryDirectory() as temporary_directory:
             strm_path = Path(temporary_directory) / "测试ISO.strm"
@@ -461,30 +431,11 @@ def test_iso_stream_enriches_playback_info_without_probing_emby():
                 "?token=secret&file_id=file-iso",
                 encoding="utf-8",
             )
-            playback_requests = []
 
-            async def items_handler(request):
-                assert request.query.get("Ids") in {"1", "source-iso"}
-                return web.json_response(
-                    {
-                        "Items": [
-                            {
-                                "Path": str(strm_path),
-                                "MediaSources": [
-                                    {
-                                        "Id": "mediasource_source-iso",
-                                        "Path": "http://moviepilot/iso",
-                                        "Container": "strm",
-                                        "MediaStreams": [],
-                                    }
-                                ],
-                            }
-                        ]
-                    }
-                )
+            async def items_handler(_request):
+                return web.json_response({"Items": [{"Path": str(strm_path)}]})
 
-            async def playback_info_handler(request):
-                playback_requests.append(dict(request.query))
+            async def playback_info_handler(_request):
                 return web.json_response(
                     {
                         "MediaSources": [
@@ -505,38 +456,18 @@ def test_iso_stream_enriches_playback_info_without_probing_emby():
 
             emby_app = web.Application()
             emby_app.router.add_get("/emby/Items", items_handler)
-            emby_app.router.add_post(
-                "/emby/Items/1/PlaybackInfo",
-                playback_info_handler,
-            )
+            emby_app.router.add_post("/emby/Items/1/PlaybackInfo", playback_info_handler)
             emby_runner = web.AppRunner(emby_app)
             await emby_runner.setup()
             emby_port = _unused_port()
             await web.TCPSite(emby_runner, "127.0.0.1", emby_port).start()
 
-            class FakeStore:
-                @staticmethod
-                def get_resource(resource_id):
-                    assert resource_id == "resource-iso"
-                    return {}
-
-                @staticmethod
-                def get_resource_file(resource_id, file_id):
-                    assert resource_id == "resource-iso"
-                    assert file_id == "file-iso"
-                    return {
-                        "file_name": "测试ISO.iso",
-                        "file_size": 8_000_000_000,
-                    }
-
             class FakeResolver:
-                store = FakeStore()
-
                 @staticmethod
                 def resolve(resource_id, file_id=None, user_agent=""):
                     assert resource_id == "resource-iso"
                     assert file_id == "file-iso"
-                    assert user_agent == "Infuse-ISO-Redirect/1.0"
+                    assert user_agent == "infuse-iso-test"
                     return "https://115cdn.example/test.iso?temporary=1"
 
             gateway_port = _unused_port()
@@ -560,19 +491,16 @@ def test_iso_stream_enriches_playback_info_without_probing_emby():
                     ) as response:
                         assert response.status == 200
                         source = (await response.json())["MediaSources"][0]
-                        assert source["Container"] == "iso"
-                        assert source["VideoType"] == "Iso"
-                        assert source["IsoType"] == "BluRay"
-                        assert source["Size"] == 8_000_000_000
+                        assert source["Path"] == "http://moviepilot/play/movie.iso"
                         assert source["Protocol"] == "Http"
                         assert source["IsRemote"] is True
-                        assert source["Path"].endswith("/movie.iso")
+                        assert source["Container"] == "strm"
+                        assert source["SupportsDirectPlay"] is True
                         assert source["SupportsDirectStream"] is True
                         assert source["SupportsTranscoding"] is False
-                        assert source["MediaStreams"] == []
-                        assert "/stream.iso?" in source["DirectStreamUrl"]
-                    await asyncio.sleep(0)
-                    assert len(playback_requests) == 1
+                        assert source["DirectStreamUrl"].startswith(
+                            "/videos/1/stream?"
+                        )
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Videos/1/original.iso",
                         params={
@@ -583,21 +511,9 @@ def test_iso_stream_enriches_playback_info_without_probing_emby():
                         allow_redirects=False,
                     ) as response:
                         assert response.status == 307
-                        bridge_url = response.headers["Location"]
-                        assert bridge_url.startswith(
-                            "/__tencentdoc115/redirect/resource-iso/media.iso?"
-                        )
-                    async with client.get(
-                        f"http://127.0.0.1:{gateway_port}{bridge_url}",
-                        headers={"User-Agent": "Infuse-ISO-Redirect/1.0"},
-                        allow_redirects=False,
-                    ) as response:
-                        assert response.status == 302
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/test.iso"
                         )
-                    await asyncio.sleep(0)
-                    assert len(playback_requests) == 1
             finally:
                 await gateway._cleanup()
                 await emby_runner.cleanup()

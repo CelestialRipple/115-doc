@@ -1,6 +1,5 @@
 import hashlib
 import re
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock, RLock
 from time import monotonic, sleep
@@ -456,13 +455,15 @@ class ShareResolver:
         self,
         share_url: str,
         file_id: str,
-        user_agent: str = "",
+        user_agent: Optional[str] = "",
     ) -> str:
         share_code, receive_code = self.parse_share_url(share_url)
         client = self._get_client()
         try:
             request_kwargs: Dict[str, Any] = {"app": "android"}
-            if user_agent:
+            if user_agent is None:
+                request_kwargs["headers"] = {"User-Agent": ""}
+            elif user_agent:
                 request_kwargs["headers"] = {"User-Agent": user_agent}
             result = self._call_with_retry(
                 lambda: client.share_download_url(
@@ -578,336 +579,24 @@ class ShareResolver:
         self,
         share_url: str,
         file_id: str,
-        user_agent: str = "",
+        user_agent: Optional[str] = "",
         force_refresh: bool = False,
     ) -> str:
         """使用账户 Cookie 为一个已知分享文件生成临时下载地址。"""
         if not force_refresh:
-            cached = self._cached_url(share_url, file_id, user_agent)
+            cached = self._cached_url(share_url, file_id, user_agent or "")
             if cached:
                 return cached
         url = self._download_url(share_url, file_id, user_agent)
         if not force_refresh:
-            self._store_url(share_url, file_id, user_agent, url)
+            self._store_url(share_url, file_id, user_agent or "", url)
         return url
-
-    def _fresh_redirect_for(self, file_name: str) -> bool:
-        """ISO 随机读取时每次回源换签名，避免复用次数有限的分享直链。"""
-        enabled = self.config_provider().get("iso_fresh_redirect", True)
-        return bool(enabled) and Path(str(file_name or "")).suffix.lower() == ".iso"
-
-    def _temporary_transfer_enabled(self) -> bool:
-        """是否在播放前把分享文件临时转存到用户自己的115。"""
-        return bool(self.config_provider().get("playback_transfer_enabled", False))
-
-    def _temporary_transfer_path(self, resource_id: str, file_id: str) -> str:
-        """生成插件独占的临时转存目录，便于精确清理。"""
-        root = str(
-            self.config_provider().get("playback_transfer_path")
-            or "/temp"
-        ).strip()
-        root = "/" + root.strip("/") if root.strip("/") else "/temp"
-        safe_resource = re.sub(r"[^0-9A-Za-z_-]+", "_", resource_id)[:64]
-        safe_file = re.sub(r"[^0-9A-Za-z_-]+", "_", str(file_id))[:64]
-        return f"{root}/TencentDoc115/{safe_resource}-{safe_file}"
-
-    def _temporary_transfer_expiry(self) -> str:
-        """计算新转存记录的到期时间。"""
-        raw = self.config_provider().get("playback_transfer_retention_hours")
-        try:
-            hours = float(raw if raw not in (None, "") else 24)
-        except (TypeError, ValueError):
-            hours = 24
-        hours = min(max(hours, 1), 24 * 30)
-        return (
-            datetime.now(timezone.utc) + timedelta(hours=hours)
-        ).isoformat(timespec="seconds")
-
-    @staticmethod
-    def _private_file(item: Dict[str, Any]) -> Dict[str, Any]:
-        """归一化个人网盘文件列表中的 ID、PickCode、名称和大小。"""
-        normalized: Dict[str, Any] = {}
-        try:
-            from p115client.tool.attr import normalize_attr
-
-            normalized = dict(normalize_attr(dict(item)))
-        except Exception:
-            normalized = dict(item)
-        size_value = (
-            normalized.get("size")
-            or normalized.get("file_size")
-            or item.get("s")
-            or 0
-        )
-        try:
-            file_size = int(size_value)
-        except (TypeError, ValueError):
-            file_size = 0
-        return {
-            "owned_file_id": str(
-                normalized.get("id")
-                or normalized.get("file_id")
-                or item.get("fid")
-                or ""
-            ),
-            "pick_code": str(
-                normalized.get("pickcode")
-                or normalized.get("pick_code")
-                or item.get("pc")
-                or item.get("pickcode")
-                or ""
-            ),
-            "file_name": str(
-                normalized.get("name")
-                or normalized.get("file_name")
-                or item.get("n")
-                or ""
-            ),
-            "file_size": file_size,
-        }
-
-    def _ensure_private_directory(self, client: Any, path: str) -> str:
-        """定位或创建个人网盘临时目录。"""
-        try:
-            # 目录不存在是首次播放的正常分支，不走指数退避。
-            response = client.fs_dir_getid(path)
-            directory_id = str(
-                (response or {}).get("id")
-                or ((response or {}).get("data") or {}).get("id")
-                or ""
-            )
-            if directory_id and directory_id != "0":
-                return directory_id
-        except Exception:
-            pass
-        response = self._call_with_retry(
-            lambda: client.fs_makedirs_app(path, pid=0, app="android")
-        )
-        directory_id = str(
-            (response or {}).get("cid")
-            or ((response or {}).get("data") or {}).get("cid")
-            or ""
-        )
-        if not directory_id:
-            raise ShareResolutionError(
-                f"115 未返回临时目录 ID：{path}",
-                status_code=502,
-                retryable=True,
-            )
-        return directory_id
-
-    def _find_private_file(
-        self,
-        client: Any,
-        directory_id: str,
-        file_name: str,
-        file_size: int,
-    ) -> Optional[Dict[str, Any]]:
-        """在插件独占目录中定位刚刚转存的文件。"""
-        response = self._call_with_retry(
-            lambda: client.fs_files(
-                {
-                    "cid": int(directory_id),
-                    "limit": 1150,
-                    "offset": 0,
-                    "show_dir": 0,
-                    "cur": 1,
-                }
-            )
-        )
-        items = (response or {}).get("data") or []
-        candidates = [
-            self._private_file(item)
-            for item in items
-            if isinstance(item, dict)
-        ]
-        candidates = [
-            item
-            for item in candidates
-            if item["owned_file_id"] and item["pick_code"]
-        ]
-        exact = [item for item in candidates if item["file_name"] == file_name]
-        if file_size:
-            exact_size = [item for item in exact if item["file_size"] == file_size]
-            if exact_size:
-                return exact_size[0]
-        if exact:
-            return exact[0]
-        return candidates[0] if len(candidates) == 1 else None
-
-    def _private_download_url(self, pick_code: str, user_agent: str) -> str:
-        """为个人网盘文件生成不受分享直链次数限制的临时地址。"""
-        client = self._get_client()
-        agent = user_agent or "Mozilla/5.0 MoviePilot TencentDoc115Library"
-        result = self._call_with_retry(
-            lambda: client.download_url(
-                pick_code,
-                user_agent=agent,
-                app="android",
-            )
-        )
-        url = str(result or "").strip()
-        if not url:
-            raise ShareResolutionError(
-                "115 个人网盘下载接口未返回可播放地址",
-                status_code=502,
-                retryable=True,
-            )
-        return url
-
-    def _remove_temporary_transfer(self, transfer: Dict[str, Any]) -> None:
-        """删除插件创建的115临时目录，并可精确彻底删除对应回收项。"""
-        resource_id = str(transfer["resource_id"])
-        file_id = str(transfer["file_id"])
-        directory_id = str(transfer.get("directory_id") or "")
-        if not directory_id:
-            self.store.delete_playback_transfer(resource_id, file_id)
-            return
-        client = self._get_client()
-        try:
-            if str(transfer.get("state") or "ready") != "recycled":
-                self._call_with_retry(lambda: client.fs_delete([directory_id]))
-                self.store.update_playback_transfer_error(
-                    resource_id, file_id, "recycled", ""
-                )
-            if bool(
-                self.config_provider().get(
-                    "playback_transfer_permanent_delete", True
-                )
-            ):
-                payload: Dict[str, Any] = {"tid": directory_id}
-                recycle_password = str(
-                    self.config_provider().get("playback_transfer_recycle_password")
-                    or ""
-                ).strip()
-                if recycle_password:
-                    payload["password"] = recycle_password
-                self._call_with_retry(lambda: client.recyclebin_clean(payload))
-            self.store.delete_playback_transfer(resource_id, file_id)
-        except Exception as error:
-            self.store.update_playback_transfer_error(
-                resource_id,
-                file_id,
-                "cleanup_error",
-                str(error),
-            )
-            raise
-
-    def cleanup_temporary_transfers(self, include_all: bool = False) -> Dict[str, int]:
-        """清理到期或全部播放临时转存；单项失败不会阻断其它项。"""
-        records = self.store.list_playback_transfers(
-            None if include_all else utc_now()
-        )
-        removed = 0
-        failed = 0
-        for transfer in records:
-            try:
-                self._remove_temporary_transfer(transfer)
-                removed += 1
-            except Exception as error:
-                failed += 1
-                logger.warning(
-                    "115 播放临时转存清理失败："
-                    f"{transfer.get('file_name') or transfer.get('file_id')} - {error}"
-                )
-        return {"checked": len(records), "removed": removed, "failed": failed}
-
-    def _resolve_via_temporary_transfer(
-        self,
-        resource_id: str,
-        share_url: str,
-        file_id: str,
-        file_name: str,
-        file_size: int,
-        user_agent: str,
-    ) -> str:
-        """把单个分享文件转存到个人网盘后生成个人直链。"""
-        transfer = self.store.get_playback_transfer(resource_id, file_id)
-        if transfer and str(transfer.get("expires_at") or "") > utc_now():
-            try:
-                return self._private_download_url(
-                    str(transfer.get("pick_code") or ""), user_agent
-                )
-            except Exception as error:
-                logger.warning(
-                    f"115 临时转存记录已失效，准备重新转存：{file_name} - {error}"
-                )
-        if transfer:
-            try:
-                self._remove_temporary_transfer(transfer)
-            except Exception as error:
-                raise ShareResolutionError(
-                    f"旧的115临时转存清理失败：{error}",
-                    status_code=502,
-                    retryable=True,
-                ) from error
-
-        client = self._get_client()
-        target_path = self._temporary_transfer_path(resource_id, file_id)
-        directory_id = self._ensure_private_directory(client, target_path)
-        owned_file = self._find_private_file(
-            client, directory_id, file_name, file_size
-        )
-        if not owned_file:
-            share_code, receive_code = self.parse_share_url(share_url)
-            self._call_with_retry(
-                lambda: client.share_receive(
-                    {
-                        "share_code": share_code,
-                        "receive_code": receive_code,
-                        "file_id": str(file_id),
-                        "cid": int(directory_id),
-                        "is_check": 0,
-                    }
-                )
-            )
-            raw_wait = self.config_provider().get("playback_transfer_wait_seconds")
-            try:
-                wait_seconds = int(raw_wait if raw_wait not in (None, "") else 30)
-            except (TypeError, ValueError):
-                wait_seconds = 30
-            wait_seconds = min(max(wait_seconds, 5), 90)
-            deadline = monotonic() + wait_seconds
-            while monotonic() < deadline:
-                owned_file = self._find_private_file(
-                    client, directory_id, file_name, file_size
-                )
-                if owned_file:
-                    break
-                sleep(1)
-        if not owned_file:
-            raise ShareResolutionError(
-                f"115 已接受转存，但 {wait_seconds} 秒内未发现目标文件",
-                status_code=504,
-                retryable=True,
-            )
-
-        now = utc_now()
-        self.store.upsert_playback_transfer(
-            {
-                "resource_id": resource_id,
-                "file_id": file_id,
-                "file_name": owned_file.get("file_name") or file_name,
-                "file_size": owned_file.get("file_size") or file_size,
-                "directory_id": directory_id,
-                "owned_file_id": owned_file["owned_file_id"],
-                "pick_code": owned_file["pick_code"],
-                "state": "ready",
-                "transferred_at": now,
-                "expires_at": self._temporary_transfer_expiry(),
-                "last_error": None,
-            }
-        )
-        logger.info(
-            f"115 播放前临时转存完成：{file_name} -> {target_path}"
-        )
-        return self._private_download_url(owned_file["pick_code"], user_agent)
 
     def resolve(
         self,
         resource_id: str,
         file_id: Optional[str] = None,
-        user_agent: str = "",
+        user_agent: Optional[str] = "",
     ) -> str:
         """
         解析资源并返回临时播放地址
@@ -938,17 +627,14 @@ class ShareResolver:
             )
             if resource_file:
                 known_file_name = str(resource_file.get("file_name") or "").strip()
-        force_refresh = self._fresh_redirect_for(known_file_name)
-        transfer_enabled = self._temporary_transfer_enabled()
         if known_file_id:
-            if not force_refresh and not transfer_enabled:
-                cached = self._cached_url(
-                    resource["share_url"],
-                    known_file_id,
-                    user_agent,
-                )
-                if cached:
-                    return cached
+            cached = self._cached_url(
+                resource["share_url"],
+                known_file_id,
+                user_agent or "",
+            )
+            if cached:
+                return cached
         with self._resource_locks_guard:
             lock = self._resource_locks.setdefault(resource_id, Lock())
         with lock:
@@ -995,18 +681,9 @@ class ShareResolver:
                             resolved_file_name=selected["file_name"],
                             resolved_at=utc_now(),
                         )
-                if transfer_enabled:
-                    return self._resolve_via_temporary_transfer(
-                        resource_id=resource_id,
-                        share_url=resource["share_url"],
-                        file_id=target_file_id,
-                        file_name=target_file_name,
-                        file_size=target_file_size,
-                        user_agent=user_agent,
-                    )
                 return self.resolve_file_url(
                     resource["share_url"], target_file_id, user_agent,
-                    force_refresh=self._fresh_redirect_for(target_file_name),
+                    force_refresh=False,
                 )
             except ShareResolutionError as error:
                 status = "invalid_share" if not error.retryable else "ready"

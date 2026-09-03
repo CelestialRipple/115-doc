@@ -102,41 +102,6 @@ def test_group_change_requeues_existing_resource(tmp_path: Path) -> None:
     assert resource["strm_path"] is None
 
 
-def test_playback_transfer_records_are_persistent_and_counted(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    checkpoint = store.begin_sheet_scan("sheet-1")
-    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
-    store.upsert_playback_transfer(
-        {
-            "resource_id": "resource-1",
-            "file_id": "file-1",
-            "file_name": "movie.iso",
-            "file_size": 2048,
-            "directory_id": "dir-1",
-            "owned_file_id": "owned-1",
-            "pick_code": "pick-1",
-            "state": "ready",
-            "transferred_at": "2026-09-03T00:00:00+00:00",
-            "expires_at": "2026-09-04T00:00:00+00:00",
-        }
-    )
-
-    record = store.get_playback_transfer("resource-1", "file-1")
-    snapshot = store.playback_transfer_snapshot()
-
-    assert record["pick_code"] == "pick-1"
-    assert snapshot == {
-        "total": 1,
-        "ready": 1,
-        "failed": 0,
-        "total_size": 2048,
-        "last_error": "",
-    }
-    assert len(
-        store.list_playback_transfers("2026-09-05T00:00:00+00:00")
-    ) == 1
-
-
 def test_media_mode_change_requires_fresh_sheet_sync(tmp_path: Path) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")
