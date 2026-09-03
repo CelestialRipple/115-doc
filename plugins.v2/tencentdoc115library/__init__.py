@@ -58,6 +58,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "pages_per_run": 5,
     "max_columns": 10,
     "build_batch": 20,
+    "scrape_workers": 1,
+    "separate_source_folders": False,
     "output_root": "/media/tencentdoc115",
     "output_size_limit_gb": 0,
     "public_base_url": "http://127.0.0.1:3000",
@@ -93,7 +95,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.9.4"
+    plugin_version = "0.9.6"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -1137,6 +1139,12 @@ class TencentDoc115Library(_PluginBase):
                             self._text_field("page_rows", "每页行数（最高1000）", 3),
                             self._text_field("pages_per_run", "每次最多页数", 3),
                             self._text_field("build_batch", "每次最多生成资源", 3),
+                            self._text_field(
+                                "scrape_workers",
+                                "并行刮削线程数",
+                                3,
+                                hint="默认1；建议2-4，过高可能触发TMDB限流或增加内存占用",
+                            ),
                             self._text_field("share_max_files", "单分享最多视频数", 3),
                             self._text_field("share_page_size", "115每页文件数", 3),
                             self._text_field("share_max_depth", "115最大目录深度", 3),
@@ -1149,6 +1157,21 @@ class TencentDoc115Library(_PluginBase):
                             ),
                             self._text_field("search_page_size", "本地检索每页条数", 3),
                             self._text_field("download_retries", "直链下载重试次数", 3),
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "separate_source_folders",
+                                            "label": "按工作表分开文件夹",
+                                            "hint": "开启后同一媒体在不同工作表使用独立子目录；元数据仍可复用",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {

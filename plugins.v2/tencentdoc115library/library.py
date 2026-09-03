@@ -1,5 +1,7 @@
 import os
 import re
+import shutil
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from inspect import signature
 from pathlib import Path
 from threading import Event, Lock
@@ -145,6 +147,8 @@ class LibraryBuilder:
         self.config_provider = config_provider
         self.stop_event = stop_event
         self._run_lock = Lock()
+        self._metadata_lock = Lock()
+        self._metadata_cache: Dict[Tuple[str, str], Path] = {}
 
     @staticmethod
     def _media_type(
@@ -229,11 +233,103 @@ class LibraryBuilder:
         root = Path(output_root).expanduser().resolve()
         group = safe_path_segment(str(resource.get("group_name") or "未分组"))
         media_directory = self._media_directory_name(resource, mediainfo)
-        target = (root / group / media_directory).resolve()
+        target_parent = root / group
+        if config.get("separate_source_folders"):
+            sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
+            source_name = safe_path_segment(
+                str(sheet.get("title") or sheet.get("source_title") or "工作表")
+            )
+            target_parent = target_parent / source_name
+        target = (target_parent / media_directory).resolve()
         if root != target and root not in target.parents:
             raise LibraryBuildError("生成路径超出 STRM 输出目录")
         target.mkdir(parents=True, exist_ok=True)
         return target
+
+    @staticmethod
+    def _metadata_key(resource: Dict[str, Any], mediainfo: Any) -> Tuple[str, str]:
+        """生成跨工作表复用元数据的稳定媒体键。"""
+        media_type = str(
+            getattr(mediainfo, "type", None)
+            or resource.get("media_type")
+            or ""
+        )
+        identity = str(
+            getattr(mediainfo, "tmdb_id", None)
+            or getattr(mediainfo, "media_id", None)
+            or ""
+        ).strip()
+        if not identity:
+            title = str(getattr(mediainfo, "title", None) or resource.get("title") or "")
+            year = str(getattr(mediainfo, "year", None) or resource.get("year") or "")
+            identity = f"{title.strip().casefold()}::{year.strip()}"
+        return media_type, identity
+
+    @staticmethod
+    def _metadata_directory_from_record(record: Dict[str, Any]) -> Optional[Path]:
+        raw_path = str(record.get("strm_path") or "").strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path)
+        # 电影记录保存的是单个 STRM 文件，电视剧记录保存的是剧集目录。
+        if path.suffix.lower() == ".strm":
+            path = path.parent
+        return path if path.exists() and path.is_dir() else None
+
+    def _metadata_source(
+        self,
+        resource: Dict[str, Any],
+        mediainfo: Any,
+        target_directory: Path,
+    ) -> Optional[Path]:
+        key = self._metadata_key(resource, mediainfo)
+        with self._metadata_lock:
+            cached = self._metadata_cache.get(key)
+        if cached and cached.exists() and cached.resolve() != target_directory.resolve():
+            return cached
+        record = self.store.find_metadata_source(
+            media_id=str(getattr(mediainfo, "media_id", None) or ""),
+            tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
+            media_type=str(resource.get("media_type") or ""),
+            title=str(getattr(mediainfo, "title", None) or resource.get("title") or ""),
+            year=str(getattr(mediainfo, "year", None) or resource.get("year") or ""),
+            exclude_resource_id=str(resource.get("resource_id") or ""),
+        )
+        source = self._metadata_directory_from_record(record or {})
+        if source and source.resolve() != target_directory.resolve():
+            with self._metadata_lock:
+                self._metadata_cache[key] = source
+            return source
+        return None
+
+    @staticmethod
+    def _copy_metadata(source: Path, target: Path) -> bool:
+        """复制或硬链接 NFO、图片等元数据，避免重复调用刮削服务。"""
+        copied = False
+        metadata_suffixes = GENERATED_METADATA_SUFFIXES - {".strm", ".tmp"}
+        for path in source.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in metadata_suffixes:
+                continue
+            relative = path.relative_to(source)
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                continue
+            try:
+                os.link(path, destination)
+            except OSError:
+                shutil.copy2(path, destination)
+            copied = True
+        return copied
+
+    def _remember_metadata(
+        self,
+        resource: Dict[str, Any],
+        mediainfo: Any,
+        directory: Path,
+    ) -> None:
+        with self._metadata_lock:
+            self._metadata_cache[self._metadata_key(resource, mediainfo)] = directory
 
     def storage_snapshot(self) -> Dict[str, Any]:
         """返回插件输出目录的当前占用和配置上限。"""
@@ -536,8 +632,68 @@ class LibraryBuilder:
         space_limit_reached = False
         usage_bytes = 0
         limit_bytes = 0
+        scrape_workers = 1
+        scrape_executor: Optional[ThreadPoolExecutor] = None
+        pending_scrapes: Dict[
+            Future,
+            Tuple[Dict[str, Any], Path, str, Any],
+        ] = {}
+
+        def finish_scrapes(done: Any) -> None:
+            """收集并发刮削结果，逐条写回可恢复状态。"""
+            nonlocal success_count, failed_count
+            for future in done:
+                resource, directory, output_path, mediainfo = pending_scrapes.pop(
+                    future
+                )
+                try:
+                    future.result()
+                except Exception as error:
+                    failed_count += 1
+                    self.store.update_resource_status(
+                        resource["resource_id"],
+                        "metadata_error",
+                        str(error),
+                        strm_status="ready",
+                        scrape_status="failed",
+                        strm_path=output_path,
+                    )
+                    logger.warning(
+                        f"并行刮削失败：{resource['title']} - {str(error)}"
+                    )
+                    continue
+                self.store.update_resource_status(
+                    resource["resource_id"],
+                    "ready",
+                    strm_status="ready",
+                    scrape_status="ready",
+                    media_source=str(
+                        getattr(mediainfo, "media_source", None)
+                        or getattr(mediainfo, "source", None)
+                        or ""
+                    ),
+                    media_id=str(getattr(mediainfo, "media_id", None) or ""),
+                    tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
+                    strm_path=output_path,
+                )
+                self._remember_metadata(resource, mediainfo, directory)
+                success_count += 1
+                logger.info(f"STRM 资源生成完成：{resource['title']}")
         try:
             config = self.config_provider()
+            scrape_enabled = bool(config.get("scrape_metadata", True))
+            try:
+                scrape_workers = min(
+                    max(int(config.get("scrape_workers") or 1), 1),
+                    8,
+                )
+            except (TypeError, ValueError):
+                scrape_workers = 1
+            if scrape_enabled and scrape_workers > 1:
+                scrape_executor = ThreadPoolExecutor(
+                    max_workers=scrape_workers,
+                    thread_name_prefix="TencentDoc115Scrape",
+                )
             limit_bytes = configured_limit_bytes(config)
             usage_bytes = (
                 max(int(known_usage_bytes), 0)
@@ -561,6 +717,12 @@ class LibraryBuilder:
                 retry_failed=retry_failed,
             )
             for resource in resources:
+                if scrape_executor and len(pending_scrapes) >= scrape_workers:
+                    done, _ = wait(
+                        pending_scrapes,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    finish_scrapes(done)
                 if self.stop_event.is_set():
                     break
                 if limit_bytes and usage_bytes >= limit_bytes:
@@ -612,7 +774,8 @@ class LibraryBuilder:
                             directory=directory,
                             source_files=source_files,
                         )
-                    scrape_enabled = bool(config.get("scrape_metadata", True))
+                    deferred_scrape = False
+                    metadata_reused = False
                     if scrape_enabled:
                         current_stage = "scraping"
                         self.store.update_resource_status(
@@ -622,23 +785,94 @@ class LibraryBuilder:
                             scrape_status="scraping",
                             strm_path=output_path,
                         )
-                        self._scrape(directory, meta, mediainfo)
-                    self.store.update_resource_status(
-                        resource["resource_id"],
-                        "ready",
-                        strm_status="ready",
-                        scrape_status="ready" if scrape_enabled else "skipped",
-                        media_source=str(
-                            getattr(mediainfo, "media_source", None)
-                            or getattr(mediainfo, "source", None)
-                            or ""
-                        ),
-                        media_id=str(mediainfo.media_id or ""),
-                        tmdb_id=str(mediainfo.tmdb_id or ""),
-                        strm_path=output_path,
-                    )
-                    success_count += 1
-                    logger.info(f"STRM 资源生成完成：{resource['title']}")
+                        metadata_source = self._metadata_source(
+                            resource,
+                            mediainfo,
+                            directory,
+                        )
+                        if metadata_source and self._copy_metadata(
+                            metadata_source,
+                            directory,
+                        ):
+                            self.store.update_resource_status(
+                                resource["resource_id"],
+                                "ready",
+                                strm_status="ready",
+                                scrape_status="ready",
+                                media_source=str(
+                                    getattr(mediainfo, "media_source", None)
+                                    or getattr(mediainfo, "source", None)
+                                    or ""
+                                ),
+                                media_id=str(
+                                    getattr(mediainfo, "media_id", None) or ""
+                                ),
+                                tmdb_id=str(
+                                    getattr(mediainfo, "tmdb_id", None) or ""
+                                ),
+                                strm_path=output_path,
+                            )
+                            self._remember_metadata(resource, mediainfo, directory)
+                            success_count += 1
+                            metadata_reused = True
+                            logger.info(
+                                f"复用已有元数据完成：{resource['title']}"
+                            )
+                        elif scrape_executor:
+                            future = scrape_executor.submit(
+                                self._scrape,
+                                directory,
+                                meta,
+                                mediainfo,
+                            )
+                            pending_scrapes[future] = (
+                                resource,
+                                directory,
+                                output_path,
+                                mediainfo,
+                            )
+                            deferred_scrape = True
+                        else:
+                            self._scrape(directory, meta, mediainfo)
+                    if not deferred_scrape and not scrape_enabled:
+                        self.store.update_resource_status(
+                            resource["resource_id"],
+                            "ready",
+                            strm_status="ready",
+                            scrape_status="skipped",
+                            media_source=str(
+                                getattr(mediainfo, "media_source", None)
+                                or getattr(mediainfo, "source", None)
+                                or ""
+                            ),
+                            media_id=str(getattr(mediainfo, "media_id", None) or ""),
+                            tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
+                            strm_path=output_path,
+                        )
+                        success_count += 1
+                        logger.info(f"STRM 资源生成完成：{resource['title']}")
+                    elif (
+                        not deferred_scrape
+                        and scrape_enabled
+                        and not metadata_reused
+                    ):
+                        self.store.update_resource_status(
+                            resource["resource_id"],
+                            "ready",
+                            strm_status="ready",
+                            scrape_status="ready",
+                            media_source=str(
+                                getattr(mediainfo, "media_source", None)
+                                or getattr(mediainfo, "source", None)
+                                or ""
+                            ),
+                            media_id=str(getattr(mediainfo, "media_id", None) or ""),
+                            tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
+                            strm_path=output_path,
+                        )
+                        self._remember_metadata(resource, mediainfo, directory)
+                        success_count += 1
+                        logger.info(f"STRM 资源生成完成：{resource['title']}")
                 except ShareResolutionError as error:
                     share_status = "share_error" if error.retryable else "invalid_share"
                     self.store.update_resource_status(
@@ -709,6 +943,14 @@ class LibraryBuilder:
                 if limit_bytes and usage_bytes >= limit_bytes:
                     space_limit_reached = True
                     break
+            while pending_scrapes:
+                done, _ = wait(pending_scrapes, return_when=FIRST_COMPLETED)
+                finish_scrapes(done)
+            if scrape_executor:
+                # 所有任务已收集，关闭线程池避免线程泄漏。
+                scrape_executor.shutdown(wait=True)
+                scrape_executor = None
+            usage_bytes = max(usage_bytes, int(self.storage_snapshot()["usage_bytes"]))
             if self.stop_event.is_set():
                 status = "interrupted"
                 message = "媒体库生成已停止，剩余资源保留为 pending"
@@ -728,4 +970,6 @@ class LibraryBuilder:
                 "limit_bytes": limit_bytes,
             }
         finally:
+            if scrape_executor:
+                scrape_executor.shutdown(wait=True)
             self._run_lock.release()

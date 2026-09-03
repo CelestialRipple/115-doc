@@ -918,6 +918,55 @@ class CatalogStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def find_metadata_source(
+        self,
+        media_id: str = "",
+        tmdb_id: str = "",
+        media_type: str = "",
+        title: str = "",
+        year: str = "",
+        exclude_resource_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """查找已刮削的同一媒体，供不同分享复用元数据目录。"""
+        identity_conditions: List[str] = []
+        parameters: List[Any] = []
+        if str(tmdb_id or "").strip():
+            identity_conditions.append("tmdb_id = ?")
+            parameters.append(str(tmdb_id).strip())
+        if str(media_id or "").strip():
+            identity_conditions.append("media_id = ?")
+            parameters.append(str(media_id).strip())
+        if not identity_conditions and str(title or "").strip():
+            title_condition = ["title = ?"]
+            title_parameters: List[Any] = [str(title).strip()]
+            if str(year or "").strip():
+                title_condition.append("year = ?")
+                title_parameters.append(str(year).strip())
+            identity_conditions.append("(" + " AND ".join(title_condition) + ")")
+            parameters.extend(title_parameters)
+        if not identity_conditions:
+            return None
+        conditions = [
+            "status = 'ready'",
+            "scrape_status = 'ready'",
+            "strm_path IS NOT NULL",
+            "(" + " OR ".join(identity_conditions) + ")",
+        ]
+        if str(media_type or "").strip():
+            conditions.append("media_type = ?")
+            parameters.append(str(media_type).strip())
+        if exclude_resource_id:
+            conditions.append("resource_id <> ?")
+            parameters.append(str(exclude_resource_id))
+        query = (
+            "SELECT resource_id, media_id, tmdb_id, media_type, strm_path "
+            "FROM resource WHERE " + " AND ".join(conditions) + " "
+            "ORDER BY updated_at ASC LIMIT 1"
+        )
+        with self.connection() as connection:
+            row = connection.execute(query, parameters).fetchone()
+        return dict(row) if row else None
+
     def update_resource_status(
         self,
         resource_id: str,

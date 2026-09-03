@@ -153,6 +153,30 @@ def test_local_search_defaults_to_ready_resources(tmp_path: Path) -> None:
     assert [item["resource_id"] for item in results] == ["resource-1"]
 
 
+def test_find_metadata_source_matches_media_identity(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+    store.update_resource_status(
+        "resource-1",
+        "ready",
+        strm_path="/media/电影合集/测试电影/测试电影.strm",
+        media_id="movie-1",
+        tmdb_id="123",
+        scrape_status="ready",
+    )
+
+    source = store.find_metadata_source(
+        media_id="movie-1",
+        tmdb_id="123",
+        media_type="电影",
+        exclude_resource_id="other-resource",
+    )
+
+    assert source["resource_id"] == "resource-1"
+    assert source["strm_path"].endswith("测试电影.strm")
+
+
 def test_known_v2_signature_errors_can_be_requeued_automatically(
     tmp_path: Path,
 ) -> None:
