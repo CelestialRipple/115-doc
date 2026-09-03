@@ -48,6 +48,10 @@ PLAYBACK_INFO_PATTERN = re.compile(
     r"/(?:emby/)?Items/([^/]+)/PlaybackInfo$",
     re.IGNORECASE,
 )
+ISO_UA_BRIDGE_PATTERN = re.compile(
+    r"^/__tencentdoc115/redirect/(?P<resource_id>[^/]+)/media\.iso$",
+    re.IGNORECASE,
+)
 PLAYBACK_PATH_CACHE_TTL_SECONDS = 10 * 60
 PLAYBACK_PATH_CACHE_MAX_SIZE = 2048
 MEDIA_PROBE_COOLDOWN_SECONDS = 10 * 60
@@ -750,6 +754,36 @@ class DirectPlayGateway:
             return None
         try:
             resource_id, file_id = self._strm_target(emby_path, config)
+            container, _, _ = self._strm_media_details(emby_path, config)
+            if container == "iso":
+                # 115 的个人网盘直链带 f=1，会严格绑定生成直链时的
+                # User-Agent。Infuse 的媒体请求在第一次重定向后可能从
+                # Infuse-Library 切换为 Infuse/AppleCoreMedia，因此先回到
+                # 网关的 UA 桥接入口，再用第二跳的真实 UA 获取115直链。
+                bridge_query = urlencode(
+                    {
+                        "token": str(config.get("playback_token") or ""),
+                        "file_id": file_id,
+                    }
+                )
+                bridge_url = (
+                    f"/__tencentdoc115/redirect/"
+                    f"{quote(resource_id, safe='')}/media.iso?{bridge_query}"
+                )
+                logger.info(
+                    f"直链网关已为 ISO 媒体项 {item_id} 返回 UA 桥接入口："
+                    f"{request.method} {request.path}，"
+                    f"UA={request.headers.get('user-agent', '')[:160]}"
+                )
+                return web.Response(
+                    status=307,
+                    headers={
+                        "Location": bridge_url,
+                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                        "Pragma": "no-cache",
+                        "Expires": "0",
+                    },
+                )
             direct_url = await asyncio.to_thread(
                 self.resolver.resolve,
                 resource_id,
@@ -759,7 +793,8 @@ class DirectPlayGateway:
             self._schedule_media_probe(request, item_id, emby_path, config)
             logger.info(
                 f"直链网关已为 Emby 媒体项 {item_id} "
-                f"返回115直链：{request.method} {request.path}"
+                f"返回115直链：{request.method} {request.path}，"
+                f"UA={request.headers.get('user-agent', '')[:160]}"
             )
             # 与 go-emby2openlist 一致使用 307，完整保留 GET、HEAD 和 Range 语义。
             return web.Response(
@@ -778,6 +813,54 @@ class DirectPlayGateway:
             )
         except Exception as error:
             logger.error(f"直链网关解析 Emby 媒体项 {item_id} 失败：{error}")
+            return web.json_response(
+                {"success": False, "message": str(error)},
+                status=502,
+            )
+
+    async def _iso_ua_bridge_response(
+        self,
+        request: web.Request,
+        resource_id: str,
+        config: Dict[str, Any],
+    ) -> web.Response:
+        """使用重定向后播放器的真实 UA 签发 ISO 个人网盘直链。"""
+        expected_token = str(config.get("playback_token") or "")
+        actual_token = str(request.query.get("token") or "")
+        if not expected_token or not compare_digest(actual_token, expected_token):
+            return web.json_response(
+                {"success": False, "message": "ISO UA 桥接密钥无效"},
+                status=403,
+            )
+        file_id = str(request.query.get("file_id") or "").strip()
+        user_agent = request.headers.get("user-agent", "")
+        try:
+            direct_url = await asyncio.to_thread(
+                self.resolver.resolve,
+                resource_id,
+                file_id or None,
+                user_agent,
+            )
+            logger.info(
+                f"ISO UA 桥接已返回115直链：资源={resource_id[:12]}，"
+                f"UA={user_agent[:160]}"
+            )
+            return web.Response(
+                status=302,
+                headers={
+                    "Location": direct_url,
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
+        except ShareResolutionError as error:
+            return web.json_response(
+                {"success": False, "message": str(error)},
+                status=error.status_code,
+            )
+        except Exception as error:
+            logger.error(f"ISO UA 桥接获取115直链失败：{error}")
             return web.json_response(
                 {"success": False, "message": str(error)},
                 status=502,
@@ -907,6 +990,13 @@ class DirectPlayGateway:
 
     async def _proxy(self, request: web.Request) -> web.StreamResponse:
         config = self.config_provider()
+        bridge_match = ISO_UA_BRIDGE_PATTERN.match(request.path)
+        if bridge_match and request.method in {"GET", "HEAD"}:
+            return await self._iso_ua_bridge_response(
+                request,
+                bridge_match.group("resource_id"),
+                config,
+            )
         target_url = self._emby_url(config, request.path_qs)
         if request.headers.get("upgrade", "").lower() == "websocket":
             return await self._proxy_websocket(request, target_url)

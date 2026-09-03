@@ -536,6 +536,7 @@ def test_iso_stream_enriches_playback_info_without_probing_emby():
                 def resolve(resource_id, file_id=None, user_agent=""):
                     assert resource_id == "resource-iso"
                     assert file_id == "file-iso"
+                    assert user_agent == "Infuse-ISO-Redirect/1.0"
                     return "https://115cdn.example/test.iso?temporary=1"
 
             gateway_port = _unused_port()
@@ -582,6 +583,16 @@ def test_iso_stream_enriches_playback_info_without_probing_emby():
                         allow_redirects=False,
                     ) as response:
                         assert response.status == 307
+                        bridge_url = response.headers["Location"]
+                        assert bridge_url.startswith(
+                            "/__tencentdoc115/redirect/resource-iso/media.iso?"
+                        )
+                    async with client.get(
+                        f"http://127.0.0.1:{gateway_port}{bridge_url}",
+                        headers={"User-Agent": "Infuse-ISO-Redirect/1.0"},
+                        allow_redirects=False,
+                    ) as response:
+                        assert response.status == 302
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/test.iso"
                         )

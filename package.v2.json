@@ -3,11 +3,12 @@
         "name": "腾讯文档115媒体库",
         "description": "同步多个腾讯文档中的115分享资源，支持断点、MoviePilot刮削、原生检索下载和内置Emby直链网关",
         "labels": "媒体库,115网盘,STRM,直链下载,Emby",
-        "version": "0.9.1",
+        "version": "0.9.2",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.9.2": "修复115个人网盘直链绑定 User-Agent 导致 Infuse ISO 秒退：ISO 播放增加本地双跳 UA 桥接，按重定向后播放器的真实 UA 重新签发直链，全程仍由客户端直连115且不经过 NAS 中转媒体数据",
             "v0.9.1": "修复 Infuse 播放已转存 ISO 仍秒退：将 PlaybackInfo 中被 Emby 误判为 STRM 的媒体源还原为 ISO/BluRay、补充真实文件大小与 .iso 直流入口，并跳过必然失败的 ISO ffprobe",
             "v0.9.0": "新增播放前按文件临时转存：可把即将播放的电影或单集转存到115 /temp 后返回个人网盘直链，复用转存结果并按保留时长精确删除专用目录和回收项",
             "v0.8.7": "新增ISO动态续签实验模式：每次ISO播放请求重新获取115分享直链，并为307添加禁止缓存响应头，尝试规避分享直链约10次随机读取限制",
