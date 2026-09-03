@@ -149,6 +149,7 @@ class LibraryBuilder:
         self._run_lock = Lock()
         self._metadata_lock = Lock()
         self._metadata_cache: Dict[Tuple[str, str], Path] = {}
+        self._metadata_inflight: Dict[Tuple[str, str], Event] = {}
 
     @staticmethod
     def _media_type(
@@ -330,6 +331,50 @@ class LibraryBuilder:
     ) -> None:
         with self._metadata_lock:
             self._metadata_cache[self._metadata_key(resource, mediainfo)] = directory
+
+    def _scrape_with_reuse(
+        self,
+        resource: Dict[str, Any],
+        directory: Path,
+        meta: Any,
+        mediainfo: Any,
+    ) -> bool:
+        """刮削前复用已完成结果，并协调并行任务避免同片重复刮削。"""
+        key = self._metadata_key(resource, mediainfo)
+        metadata_suffixes = GENERATED_METADATA_SUFFIXES - {".strm", ".tmp"}
+        if directory.exists() and any(
+            path.is_file() and path.suffix.lower() in metadata_suffixes
+            for path in directory.rglob("*")
+        ):
+            self._remember_metadata(resource, mediainfo, directory)
+            return True
+        while True:
+            source = self._metadata_source(resource, mediainfo, directory)
+            if source and self._copy_metadata(source, directory):
+                self._remember_metadata(resource, mediainfo, directory)
+                return True
+            with self._metadata_lock:
+                event = self._metadata_inflight.get(key)
+                if event is None:
+                    event = Event()
+                    self._metadata_inflight[key] = event
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                break
+            # 同一个媒体已有任务正在刮削，等待它写完后再建立本目录的
+            # 硬链接/副本；若对方失败，下一轮会成为新的执行者重试。
+            event.wait()
+        try:
+            self._scrape(directory, meta, mediainfo)
+            self._remember_metadata(resource, mediainfo, directory)
+            return False
+        finally:
+            with self._metadata_lock:
+                if self._metadata_inflight.get(key) is event:
+                    self._metadata_inflight.pop(key, None)
+            event.set()
 
     def storage_snapshot(self) -> Dict[str, Any]:
         """返回插件输出目录的当前占用和配置上限。"""
@@ -785,42 +830,10 @@ class LibraryBuilder:
                             scrape_status="scraping",
                             strm_path=output_path,
                         )
-                        metadata_source = self._metadata_source(
-                            resource,
-                            mediainfo,
-                            directory,
-                        )
-                        if metadata_source and self._copy_metadata(
-                            metadata_source,
-                            directory,
-                        ):
-                            self.store.update_resource_status(
-                                resource["resource_id"],
-                                "ready",
-                                strm_status="ready",
-                                scrape_status="ready",
-                                media_source=str(
-                                    getattr(mediainfo, "media_source", None)
-                                    or getattr(mediainfo, "source", None)
-                                    or ""
-                                ),
-                                media_id=str(
-                                    getattr(mediainfo, "media_id", None) or ""
-                                ),
-                                tmdb_id=str(
-                                    getattr(mediainfo, "tmdb_id", None) or ""
-                                ),
-                                strm_path=output_path,
-                            )
-                            self._remember_metadata(resource, mediainfo, directory)
-                            success_count += 1
-                            metadata_reused = True
-                            logger.info(
-                                f"复用已有元数据完成：{resource['title']}"
-                            )
-                        elif scrape_executor:
+                        if scrape_executor:
                             future = scrape_executor.submit(
-                                self._scrape,
+                                self._scrape_with_reuse,
+                                resource,
                                 directory,
                                 meta,
                                 mediainfo,
@@ -833,7 +846,16 @@ class LibraryBuilder:
                             )
                             deferred_scrape = True
                         else:
-                            self._scrape(directory, meta, mediainfo)
+                            metadata_reused = self._scrape_with_reuse(
+                                resource,
+                                directory,
+                                meta,
+                                mediainfo,
+                            )
+                            if metadata_reused:
+                                logger.info(
+                                    f"复用已有元数据完成：{resource['title']}"
+                                )
                     if not deferred_scrape and not scrape_enabled:
                         self.store.update_resource_status(
                             resource["resource_id"],
@@ -851,11 +873,7 @@ class LibraryBuilder:
                         )
                         success_count += 1
                         logger.info(f"STRM 资源生成完成：{resource['title']}")
-                    elif (
-                        not deferred_scrape
-                        and scrape_enabled
-                        and not metadata_reused
-                    ):
+                    elif not deferred_scrape and scrape_enabled:
                         self.store.update_resource_status(
                             resource["resource_id"],
                             "ready",
