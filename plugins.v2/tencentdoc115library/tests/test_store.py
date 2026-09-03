@@ -177,6 +177,44 @@ def test_find_metadata_source_matches_media_identity(tmp_path: Path) -> None:
     assert source["strm_path"].endswith("测试电影.strm")
 
 
+def test_migration_paths_can_be_listed_and_updated_atomically(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+    store.update_resource_status(
+        "resource-1",
+        "ready",
+        strm_path="/media/电影合集/测试电影/测试电影.strm",
+    )
+    store.replace_resource_files(
+        "resource-1",
+        [
+            {
+                "file_id": "file-1",
+                "file_name": "测试电影.mkv",
+                "file_path": "/测试电影.mkv",
+                "strm_path": "/media/电影合集/测试电影/测试电影.strm",
+            }
+        ],
+    )
+
+    resources = store.list_migration_resources()
+    assert [item["resource_id"] for item in resources] == ["resource-1"]
+    store.update_resource_paths(
+        "resource-1",
+        "/media/电影合集/电影大全/测试电影/测试电影.strm",
+        {
+            "file-1": "/media/电影合集/电影大全/测试电影/测试电影.strm",
+        },
+    )
+    assert store.get_resource("resource-1")["strm_path"].endswith(
+        "电影大全/测试电影/测试电影.strm"
+    )
+    assert store.get_resource_file("resource-1", "file-1")["strm_path"].endswith(
+        "电影大全/测试电影/测试电影.strm"
+    )
+
+
 def test_known_v2_signature_errors_can_be_requeued_automatically(
     tmp_path: Path,
 ) -> None:

@@ -1076,6 +1076,37 @@ class CatalogStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_migration_resources(self) -> List[Dict[str, Any]]:
+        """列出已有 STRM 路径的资源，供输出目录迁移使用。"""
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM resource "
+                "WHERE status <> 'removed' AND strm_path IS NOT NULL "
+                "ORDER BY updated_at, sheet_id, row_number"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_resource_paths(
+        self,
+        resource_id: str,
+        strm_path: str,
+        file_paths: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """原子更新资源及其剧集文件的本地路径。"""
+        now = utc_now()
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                "UPDATE resource SET strm_path = ?, updated_at = ? "
+                "WHERE resource_id = ?",
+                (str(strm_path), now, resource_id),
+            )
+            for file_id, path in (file_paths or {}).items():
+                connection.execute(
+                    "UPDATE resource_file SET strm_path = ?, updated_at = ? "
+                    "WHERE resource_id = ? AND file_id = ?",
+                    (str(path), now, resource_id, str(file_id)),
+                )
+
     def retry_resources(self, resource_ids: List[str]) -> int:
         """
         把指定失败资源重新加入生成队列

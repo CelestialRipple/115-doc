@@ -1,4 +1,5 @@
 import os
+import filecmp
 import re
 import shutil
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -133,6 +134,7 @@ class LibraryBuilder:
         resolver: ShareResolver,
         config_provider: Callable[[], Dict[str, Any]],
         stop_event: Event,
+        pause_event: Optional[Event] = None,
     ):
         """
         初始化媒体库生成器
@@ -146,6 +148,7 @@ class LibraryBuilder:
         self.resolver = resolver
         self.config_provider = config_provider
         self.stop_event = stop_event
+        self.pause_event = pause_event or Event()
         self._run_lock = Lock()
         self._metadata_lock = Lock()
         self._metadata_cache: Dict[Tuple[str, str], Path] = {}
@@ -452,6 +455,288 @@ class LibraryBuilder:
             "deleted_files": deleted_files,
             "retained_files": retained_files,
             "freed_bytes": freed_bytes,
+        }
+
+    @staticmethod
+    def _merge_move_directory(source: Path, target: Path) -> None:
+        """移动媒体目录；目标已存在时安全合并，避免覆盖冲突文件。"""
+        if source == target:
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            shutil.move(str(source), str(target))
+            return
+        if not target.is_dir() or target.is_symlink():
+            raise LibraryBuildError(f"迁移目标不是目录：{target}")
+        for child in source.iterdir():
+            if child.is_symlink():
+                raise LibraryBuildError(f"源目录包含符号链接，已停止迁移：{child}")
+            destination = target / child.name
+            if child.is_dir():
+                if destination.exists():
+                    LibraryBuilder._merge_move_directory(child, destination)
+                else:
+                    shutil.move(str(child), str(destination))
+                continue
+            if destination.exists():
+                if destination.is_symlink() or not destination.is_file():
+                    raise LibraryBuildError(f"迁移目标存在冲突：{destination}")
+                try:
+                    identical = os.path.samefile(child, destination)
+                except OSError:
+                    identical = filecmp.cmp(child, destination, shallow=False)
+                if not identical:
+                    raise LibraryBuildError(f"迁移目标存在同名不同文件：{destination}")
+                child.unlink()
+            else:
+                shutil.move(str(child), str(destination))
+        try:
+            source.rmdir()
+        except OSError as error:
+            raise LibraryBuildError(f"源目录未能完全迁移：{source}") from error
+
+    @staticmethod
+    def _move_generated_file(source: Path, target: Path) -> None:
+        """安全移动单个生成文件；相同目标存在时只删除重复源文件。"""
+        if source == target:
+            return
+        if source.is_symlink():
+            raise LibraryBuildError(f"源文件是符号链接，已停止迁移：{source}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if target.is_symlink() or not target.is_file():
+                raise LibraryBuildError(f"迁移目标存在冲突：{target}")
+            try:
+                identical = os.path.samefile(source, target)
+            except OSError:
+                identical = filecmp.cmp(source, target, shallow=False)
+            if not identical:
+                raise LibraryBuildError(f"迁移目标存在同名不同文件：{target}")
+            source.unlink()
+            return
+        shutil.move(str(source), str(target))
+
+    def migrate_existing_output(self) -> Dict[str, Any]:
+        """按当前工作表分目录设置搬迁已有 STRM 和元数据，不重新刮削。"""
+        config = self.config_provider()
+        if not config.get("separate_source_folders"):
+            return {
+                "status": "configuration_error",
+                "message": "请先开启“按工作表分开文件夹”并保存配置",
+                "moved": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+        raw_root = str(config.get("output_root") or "").strip()
+        if not raw_root:
+            return {
+                "status": "configuration_error",
+                "message": "未配置 STRM 输出目录",
+                "moved": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+        configured_root = Path(raw_root).expanduser()
+        if configured_root.is_symlink():
+            return {
+                "status": "configuration_error",
+                "message": "输出目录是符号链接，为避免误搬迁已拒绝执行",
+                "moved": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+        root = configured_root.resolve()
+        if root in {Path("/"), Path("/config"), Path("/data"), Path("/media"), Path("/mnt")} or len(root.parts) < 3:
+            return {
+                "status": "configuration_error",
+                "message": f"输出目录范围过大，已拒绝迁移：{root}",
+                "moved": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+        if not root.exists():
+            return {
+                "status": "completed",
+                "message": "输出目录不存在，没有需要迁移的内容",
+                "moved": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+        if not root.is_dir():
+            return {
+                "status": "configuration_error",
+                "message": f"输出路径不是目录：{root}",
+                "moved": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+
+        migration_items: List[Dict[str, Any]] = []
+        source_targets: Dict[Path, set[Path]] = {}
+        for resource in self.store.list_migration_resources():
+            raw_strm_path = str(resource.get("strm_path") or "").strip()
+            if not raw_strm_path:
+                continue
+            recorded_path = Path(raw_strm_path).expanduser()
+            source_directory = (
+                recorded_path.parent
+                if recorded_path.suffix.lower() == ".strm"
+                else recorded_path
+            ).resolve()
+            sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
+            source_name = safe_path_segment(
+                str(sheet.get("title") or sheet.get("source_title") or "工作表")
+            )
+            group_name = safe_path_segment(str(resource.get("group_name") or "未分组"))
+            media_name = safe_path_segment(source_directory.name)
+            target_directory = (root / group_name / source_name / media_name).resolve()
+            migration_items.append(
+                {
+                    "resource": resource,
+                    "recorded_path": recorded_path,
+                    "source_directory": source_directory,
+                    "target_directory": target_directory,
+                }
+            )
+            source_targets.setdefault(source_directory, set()).add(target_directory)
+
+        moved = 0
+        updated = 0
+        skipped = 0
+        failed = 0
+        moved_directories: set[Tuple[Path, Path]] = set()
+        for item in migration_items:
+            resource = item["resource"]
+            if self.stop_event.is_set():
+                return {
+                    "status": "interrupted",
+                    "message": "迁移已停止，已完成的路径更新会保留",
+                    "moved": moved,
+                    "updated": updated,
+                    "skipped": skipped,
+                    "failed": failed,
+                }
+            if self.pause_event.is_set():
+                return {
+                    "status": "paused",
+                    "message": "迁移已暂停，点击恢复可继续",
+                    "moved": moved,
+                    "updated": updated,
+                    "skipped": skipped,
+                    "failed": failed,
+                }
+            recorded_path = item["recorded_path"]
+            source_directory = item["source_directory"]
+            target_directory = item["target_directory"]
+            if source_directory != root and root not in source_directory.parents:
+                failed += 1
+                logger.warning(
+                    f"跳过输出目录外路径迁移：{resource.get('title')} - {source_directory}"
+                )
+                continue
+            if target_directory != root and root not in target_directory.parents:
+                failed += 1
+                continue
+            if source_directory != target_directory and source_directory in target_directory.parents:
+                failed += 1
+                logger.warning(
+                    f"迁移目标位于源目录内，已跳过：{resource.get('title')}"
+                )
+                continue
+            directory_key = (source_directory, target_directory)
+            try:
+                resource_files = self.store.list_resource_files(
+                    str(resource.get("resource_id") or "")
+                )
+                try:
+                    relative_strm = recorded_path.resolve().relative_to(source_directory)
+                except ValueError as error:
+                    raise LibraryBuildError(
+                        f"STRM 路径不在媒体目录内：{recorded_path}"
+                    ) from error
+                relative_file_paths: Dict[str, Path] = {}
+                for file_item in resource_files:
+                    raw_file_path = str(file_item.get("strm_path") or "").strip()
+                    if not raw_file_path:
+                        continue
+                    file_path = Path(raw_file_path).expanduser()
+                    try:
+                        relative_file_paths[str(file_item.get("file_id") or "")] = (
+                            file_path.resolve().relative_to(source_directory)
+                        )
+                    except ValueError:
+                        continue
+
+                if source_directory == target_directory:
+                    skipped += 1
+                elif len(source_targets.get(source_directory, set())) == 1:
+                    if directory_key not in moved_directories:
+                        if source_directory.exists():
+                            self._merge_move_directory(source_directory, target_directory)
+                            moved += 1
+                        elif not target_directory.exists():
+                            raise LibraryBuildError(
+                                f"源目录不存在：{source_directory}"
+                            )
+                        moved_directories.add(directory_key)
+                    elif not target_directory.exists():
+                        raise LibraryBuildError(f"迁移目标不存在：{target_directory}")
+                else:
+                    # 旧布局中多个工作表可能共用同一媒体目录。此时不能把
+                    # 整个目录交给第一条记录：各自移动 STRM，并为每个目标
+                    # 建立元数据硬链接/副本。
+                    target_directory.mkdir(parents=True, exist_ok=True)
+                    if source_directory.exists():
+                        self._copy_metadata(source_directory, target_directory)
+                    candidate_paths = set(relative_file_paths.values())
+                    if recorded_path.suffix.lower() == ".strm":
+                        candidate_paths.add(relative_strm)
+                    for relative_path in candidate_paths:
+                        source_file = source_directory / relative_path
+                        target_file = target_directory / relative_path
+                        if source_file.exists():
+                            self._move_generated_file(source_file, target_file)
+                        elif not target_file.exists():
+                            raise LibraryBuildError(f"STRM 文件不存在：{source_file}")
+                    moved += 1
+
+                new_strm_path = (
+                    target_directory / relative_strm
+                    if recorded_path.suffix.lower() == ".strm"
+                    else target_directory
+                )
+                file_paths = {
+                    file_id: str(target_directory / relative_path)
+                    for file_id, relative_path in relative_file_paths.items()
+                }
+                self.store.update_resource_paths(
+                    str(resource.get("resource_id") or ""),
+                    str(new_strm_path),
+                    file_paths,
+                )
+                updated += 1
+            except Exception as error:
+                failed += 1
+                logger.warning(
+                    f"迁移资源失败：{resource.get('title')} - {str(error)}"
+                )
+        status = "completed" if not failed else "completed_with_errors"
+        return {
+            "status": status,
+            "message": (
+                f"迁移完成：{moved} 个目录、更新 {updated} 条路径，"
+                f"跳过 {skipped} 条，失败 {failed} 条"
+            ),
+            "moved": moved,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
         }
 
     def _play_url(
@@ -768,7 +1053,7 @@ class LibraryBuilder:
                         return_when=FIRST_COMPLETED,
                     )
                     finish_scrapes(done)
-                if self.stop_event.is_set():
+                if self.stop_event.is_set() or self.pause_event.is_set():
                     break
                 if limit_bytes and usage_bytes >= limit_bytes:
                     space_limit_reached = True
@@ -972,6 +1257,9 @@ class LibraryBuilder:
             if self.stop_event.is_set():
                 status = "interrupted"
                 message = "媒体库生成已停止，剩余资源保留为 pending"
+            elif self.pause_event.is_set():
+                status = "paused"
+                message = "媒体库生成已暂停，剩余资源保留为 pending"
             elif space_limit_reached:
                 status = "space_limit"
                 message = "已达到输出空间上限，剩余资源保留为 pending"

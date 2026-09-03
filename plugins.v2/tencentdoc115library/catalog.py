@@ -313,6 +313,7 @@ class CatalogSynchronizer:
         config_provider: Callable[[], Dict[str, Any]],
         config_updater: Callable[[Dict[str, Any]], None],
         stop_event: Event,
+        pause_event: Optional[Event] = None,
     ):
         """
         初始化目录同步器
@@ -328,6 +329,7 @@ class CatalogSynchronizer:
         self.config_provider = config_provider
         self.config_updater = config_updater
         self.stop_event = stop_event
+        self.pause_event = pause_event or Event()
         self._run_lock = Lock()
 
     @staticmethod
@@ -472,7 +474,7 @@ class CatalogSynchronizer:
                     sheet.get("used_column_count") or sheet.get("column_count") or 6
                 )
                 column_count = min(max(column_count, 1), max_columns)
-                while not self.stop_event.is_set():
+                while not self.stop_event.is_set() and not self.pause_event.is_set():
                     if processed_pages >= page_limit:
                         self.store.pause_sheet_scan(current_sheet_id)
                         self.store.finish_sync_run(run_id, "paused")
@@ -542,12 +544,22 @@ class CatalogSynchronizer:
                         self.store.complete_sheet_scan(current_sheet_id, scan_id)
                         break
                     current_row = next_row
-                if self.stop_event.is_set():
-                    self.store.pause_sheet_scan(current_sheet_id, "插件正在停止")
-                    self.store.finish_sync_run(run_id, "interrupted", "插件正在停止")
+                if self.stop_event.is_set() or self.pause_event.is_set():
+                    paused = self.pause_event.is_set() and not self.stop_event.is_set()
+                    reason = "用户暂停任务" if paused else "插件正在停止"
+                    self.store.pause_sheet_scan(current_sheet_id, reason)
+                    self.store.finish_sync_run(
+                        run_id,
+                        "paused" if paused else "interrupted",
+                        reason,
+                    )
                     return {
-                        "status": "interrupted",
-                        "message": "插件停止，检查点已经保存",
+                        "status": "paused" if paused else "interrupted",
+                        "message": (
+                            "任务已暂停，检查点已经保存"
+                            if paused
+                            else "插件停止，检查点已经保存"
+                        ),
                         "processed_pages": processed_pages,
                         "processed_rows": processed_rows,
                     }

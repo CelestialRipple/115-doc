@@ -3,11 +3,12 @@
         "name": "腾讯文档115媒体库",
         "description": "同步多个腾讯文档中的115分享资源，支持断点、MoviePilot刮削、原生检索下载和内置Emby直链网关",
         "labels": "媒体库,115网盘,STRM,直链下载,Emby",
-        "version": "0.9.7",
+        "version": "0.9.8",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.9.8": "新增现有目录迁移按钮，无需重新刮削即可按工作表拆分目录并更新 SQLite 路径；后台同步、生成、重试和迁移支持明确的暂停、恢复与停止状态",
             "v0.9.7": "协调并行刮削中的同片任务：同一电影或剧集同时出现在多个工作表时只执行一次元数据刮削，后续目录复用结果",
             "v0.9.6": "优化大批量媒体库构建：支持1-8个并行刮削线程，并按 TMDB/媒体 ID 复用跨工作表元数据；可选按工作表分开输出子目录",
             "v0.9.5": "新增可配置并行刮削线程数和按工作表分开文件夹；相同 TMDB/媒体 ID 的资源复用已生成元数据，仍保留各自115直链和STRM",

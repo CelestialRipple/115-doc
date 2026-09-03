@@ -51,6 +51,9 @@ def main() -> None:
         api_paths = {api["path"] for api in plugin.get_api()}
         assert "/sync-all" in api_paths
         assert "/tasks/stop" in api_paths
+        assert "/tasks/pause" in api_paths
+        assert "/tasks/resume" in api_paths
+        assert "/migrate-output" in api_paths
         assert "/resources/retry-all" in api_paths
         assert "/gateway/restart" in api_paths
         assert "/clear-all" in api_paths
@@ -59,6 +62,7 @@ def main() -> None:
         assert "重试全部失败并生成" in page_text
         assert "内置直链网关" in page_text
         assert "清空并重新开始" in page_text
+        assert "迁移现有目录" in page_text
 
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()

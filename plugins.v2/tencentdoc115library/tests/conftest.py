@@ -1,4 +1,5 @@
 import sys
+from enum import Enum
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -17,6 +18,21 @@ def _install_app_stubs() -> None:
     logging = ModuleType("app.sdk.logging")
     network = ModuleType("app.sdk.network")
     plugins = ModuleType("app.sdk.plugins")
+    media_sdk = ModuleType("app.sdk.media")
+    chain = ModuleType("app.chain")
+    chain_media = ModuleType("app.chain.media")
+    schemas = ModuleType("app.schemas")
+    schemas_file = ModuleType("app.schemas.file")
+    schemas_types = ModuleType("app.schemas.types")
+
+    class DummyMediaType(Enum):
+        MOVIE = "电影"
+        TV = "电视剧"
+
+    class DummyFileItem:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
     config.settings = SimpleNamespace(PROXY=None)
     logging.logger = SimpleNamespace(
         info=lambda *args, **kwargs: None,
@@ -25,6 +41,13 @@ def _install_app_stubs() -> None:
     )
     network.RequestUtils = DummyRequestUtils
     plugins.PluginManager = object
+    media_sdk.MetaInfo = lambda *args, **kwargs: SimpleNamespace(
+        begin_season=None,
+        begin_episode=None,
+    )
+    chain_media.MediaChain = object
+    schemas_file.FileItem = DummyFileItem
+    schemas_types.MediaType = DummyMediaType
     sys.modules.update(
         {
             "app": app,
@@ -33,6 +56,12 @@ def _install_app_stubs() -> None:
             "app.sdk.logging": logging,
             "app.sdk.network": network,
             "app.sdk.plugins": plugins,
+            "app.sdk.media": media_sdk,
+            "app.chain": chain,
+            "app.chain.media": chain_media,
+            "app.schemas": schemas,
+            "app.schemas.file": schemas_file,
+            "app.schemas.types": schemas_types,
         }
     )
 

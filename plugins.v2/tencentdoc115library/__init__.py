@@ -95,7 +95,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.9.7"
+    plugin_version = "0.9.8"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -108,9 +108,14 @@ class TencentDoc115Library(_PluginBase):
         self._config: Dict[str, Any] = dict(DEFAULT_CONFIG)
         self._enabled = False
         self._stop_event = Event()
+        self._pause_event = Event()
         self._task_lock = Lock()
         self._pipeline_lock = Lock()
         self._future: Optional[Future] = None
+        self._task_name = ""
+        self._task_state = "idle"
+        self._task_message = "没有后台任务"
+        self._resume_spec: Optional[Tuple[Any, Tuple[Any, ...], Dict[str, Any]]] = None
         self._store: Optional[CatalogStore] = None
         self._synchronizer: Optional[CatalogSynchronizer] = None
         self._resolver: Optional[ShareResolver] = None
@@ -131,6 +136,7 @@ class TencentDoc115Library(_PluginBase):
         """加载配置并初始化持久化和任务组件。"""
         self.stop_service()
         self._stop_event = Event()
+        self._pause_event.clear()
         self._config = {**DEFAULT_CONFIG, **(config or {})}
         config_changed = False
         # 清理旧版本曾保存的转存和 ISO 实验开关，避免升级后继续显示或生效。
@@ -176,12 +182,14 @@ class TencentDoc115Library(_PluginBase):
             config_provider=self._current_config,
             config_updater=self._replace_config,
             stop_event=self._stop_event,
+            pause_event=self._pause_event,
         )
         self._builder = LibraryBuilder(
             store=self._store,
             resolver=self._resolver,
             config_provider=self._current_config,
             stop_event=self._stop_event,
+            pause_event=self._pause_event,
         )
         self._direct_downloader = DirectDownloadManager(
             store=self._store,
@@ -239,24 +247,90 @@ class TencentDoc115Library(_PluginBase):
             on_token_refresh=self._save_tokens,
         )
 
-    def _submit(self, name: str, function: Any, *args: Any, **kwargs: Any) -> Response:
+    def _submit(
+        self,
+        name: str,
+        function: Any,
+        *args: Any,
+        resume_function: Optional[Any] = None,
+        resume_args: Optional[Tuple[Any, ...]] = None,
+        resume_kwargs: Optional[Dict[str, Any]] = None,
+        resume_paused: bool = False,
+        **kwargs: Any,
+    ) -> Response:
         """把长任务提交到 MoviePilot 共享线程池。"""
         with self._task_lock:
             if self._future and not self._future.done():
                 return Response(success=False, message="已有同步或构建任务正在运行")
+            if (
+                self._task_state == "paused"
+                and self._resume_spec is not None
+                and not resume_paused
+            ):
+                return Response(
+                    success=False,
+                    message="后台任务已暂停；请先点击恢复，或结束暂停任务后再启动其它操作",
+                )
             self._stop_event.clear()
+            self._pause_event.clear()
+            self._task_name = name
+            self._task_state = "running"
+            self._task_message = f"{name}已启动"
+            self._resume_spec = (
+                resume_function or function,
+                tuple(args if resume_args is None else resume_args),
+                dict(kwargs if resume_kwargs is None else resume_kwargs),
+            )
             self._future = ThreadHelper().submit(function, *args, **kwargs)
             self._future.add_done_callback(lambda future: self._task_done(name, future))
         return Response(success=True, message=f"{name}已在后台启动")
 
-    @staticmethod
-    def _task_done(name: str, future: Future) -> None:
+    def _task_done(self, name: str, future: Future) -> None:
         """记录后台任务异常，但不泄露任何凭据。"""
         try:
             result = future.result()
             logger.info(f"{name}完成：{result}")
         except Exception as error:
             logger.error(f"{name}失败：{error}")
+            with self._task_lock:
+                if self._future is not future:
+                    return
+                self._task_state = "failed"
+                self._task_message = f"{name}失败：{error}"
+                self._resume_spec = None
+            return
+        result_status = str(result.get("status") or "") if isinstance(result, dict) else ""
+        with self._task_lock:
+            # 前一任务结束与下一任务启动极近时，旧回调不得覆盖新任务状态。
+            if self._future is not future:
+                return
+            if result_status in {"stopped", "interrupted"} or self._stop_event.is_set():
+                self._task_state = "stopped"
+                self._task_message = f"{name}已停止；检查点和已生成内容已保留"
+                self._resume_spec = None
+            elif result_status == "paused" or self._pause_event.is_set():
+                self._task_state = "paused"
+                self._task_message = f"{name}已暂停；点击恢复可从断点继续"
+            elif result_status in {"failed", "configuration_error"}:
+                self._task_state = "failed"
+                self._task_message = str(result.get("message") or f"{name}失败")
+                self._resume_spec = None
+            else:
+                self._task_state = "completed"
+                self._task_message = str(result.get("message") or f"{name}已完成")
+                self._resume_spec = None
+
+    def _task_snapshot(self) -> Dict[str, Any]:
+        """返回后台任务控制状态。"""
+        with self._task_lock:
+            running = bool(self._future and not self._future.done())
+            return {
+                "name": self._task_name,
+                "state": self._task_state,
+                "message": self._task_message,
+                "running": running,
+                "can_resume": self._task_state == "paused" and self._resume_spec is not None,
+            }
 
     def get_state(self) -> bool:
         """返回插件启用状态。"""
@@ -382,6 +456,12 @@ class TencentDoc115Library(_PluginBase):
             reset=action.reset,
             max_pages=action.max_pages,
             mode="manual",
+            resume_function=self._synchronizer.sync,
+            resume_kwargs={
+                "reset": False,
+                "max_pages": action.max_pages,
+                "mode": "manual",
+            },
         )
 
     def start_build(
@@ -425,7 +505,7 @@ class TencentDoc115Library(_PluginBase):
             message="正在同步全部已勾选工作表",
             **totals,
         )
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self._pause_event.is_set():
             result = self._synchronizer.sync(mode="manual-all")
             totals["synced_pages"] += int(result.get("processed_pages") or 0)
             totals["synced_rows"] += int(result.get("processed_rows") or 0)
@@ -435,6 +515,13 @@ class TencentDoc115Library(_PluginBase):
                 message=str(result.get("message") or "正在同步"),
                 **totals,
             )
+            if self._pause_event.is_set():
+                self._set_pipeline_status(
+                    phase="paused",
+                    message="任务已暂停；同步检查点和 pending 队列已保留",
+                    **totals,
+                )
+                return {"status": "paused", **totals}
             if sync_status == "completed":
                 break
             if sync_status != "paused":
@@ -453,6 +540,13 @@ class TencentDoc115Library(_PluginBase):
                 **totals,
             )
             return {"status": "stopped", **totals}
+        if self._pause_event.is_set():
+            self._set_pipeline_status(
+                phase="paused",
+                message="任务已暂停；同步检查点和 pending 队列已保留",
+                **totals,
+            )
+            return {"status": "paused", **totals}
 
         self._set_pipeline_status(
             phase="building",
@@ -460,7 +554,7 @@ class TencentDoc115Library(_PluginBase):
             **totals,
         )
         known_usage_bytes: Optional[int] = None
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self._pause_event.is_set():
             result = self._builder.build(known_usage_bytes=known_usage_bytes)
             processed = int(result.get("processed") or 0)
             known_usage_bytes = int(result.get("usage_bytes") or 0)
@@ -475,6 +569,13 @@ class TencentDoc115Library(_PluginBase):
                 limit_bytes=int(result.get("limit_bytes") or 0),
                 **totals,
             )
+            if self._pause_event.is_set():
+                self._set_pipeline_status(
+                    phase="paused",
+                    message="任务已暂停；已生成内容和 pending 队列已保留",
+                    **totals,
+                )
+                return {"status": "paused", **totals}
             if build_status == "space_limit":
                 self._set_pipeline_status(
                     phase="space_limit",
@@ -498,6 +599,13 @@ class TencentDoc115Library(_PluginBase):
                 )
                 return {"status": "completed", **totals}
 
+        if self._pause_event.is_set() and not self._stop_event.is_set():
+            self._set_pipeline_status(
+                phase="paused",
+                message="任务已暂停；检查点和 pending 队列已保留",
+                **totals,
+            )
+            return {"status": "paused", **totals}
         self._set_pipeline_status(
             phase="stopped",
             message="任务已停止；检查点和 pending 队列已保留",
@@ -511,11 +619,68 @@ class TencentDoc115Library(_PluginBase):
             return Response(success=False, message="插件尚未初始化")
         return self._submit("同步全部并生成", self._sync_all_and_build)
 
+    def migrate_output(self) -> Response:
+        """后台按工作表分目录迁移已有 STRM、元数据和数据库路径。"""
+        if not self._builder:
+            return Response(success=False, message="插件尚未初始化")
+        if not self._config.get("separate_source_folders"):
+            return Response(
+                success=False,
+                message="请先开启“按工作表分开文件夹”并保存配置",
+            )
+        return self._submit("迁移现有目录", self._builder.migrate_existing_output)
+
+    def pause_background_tasks(self) -> Response:
+        """请求当前后台任务在当前页或资源完成后暂停。"""
+        with self._task_lock:
+            if not self._future or self._future.done():
+                if self._task_state == "paused":
+                    return Response(success=True, message="后台任务已经暂停")
+                return Response(success=False, message="当前没有正在运行的后台任务")
+            self._pause_event.set()
+            self._task_state = "pausing"
+            self._task_message = "正在暂停；当前小步骤完成后会保留断点"
+        if self._pipeline_snapshot().get("phase") in {"syncing", "building"}:
+            self._set_pipeline_status(
+                phase="pausing",
+                message="正在暂停；当前小步骤完成后会保留断点",
+            )
+        return Response(success=True, message="已发送暂停请求，请稍后刷新状态")
+
+    def resume_background_tasks(self) -> Response:
+        """恢复上一次暂停的后台任务。"""
+        with self._task_lock:
+            if self._future and not self._future.done():
+                return Response(success=False, message="当前后台任务仍在运行")
+            if self._task_state != "paused" or not self._resume_spec:
+                return Response(success=False, message="没有可恢复的暂停任务")
+            function, args, kwargs = self._resume_spec
+            name = self._task_name or "后台任务"
+        return self._submit(
+            name,
+            function,
+            *args,
+            resume_function=function,
+            resume_args=args,
+            resume_kwargs=kwargs,
+            resume_paused=True,
+            **kwargs,
+        )
+
     def stop_background_tasks(self) -> Response:
         """请求当前同步或生成任务在安全检查点停止。"""
-        if not self._future or self._future.done():
-            return Response(success=True, message="当前没有正在运行的后台任务")
-        self._stop_event.set()
+        with self._task_lock:
+            if not self._future or self._future.done():
+                if self._task_state == "paused":
+                    self._task_state = "stopped"
+                    self._task_message = "任务已结束暂停状态；检查点和已生成内容已保留"
+                    self._resume_spec = None
+                    return Response(success=True, message="已结束暂停任务")
+                return Response(success=True, message="当前没有正在运行的后台任务")
+            self._pause_event.clear()
+            self._stop_event.set()
+            self._task_state = "stopping"
+            self._task_message = "正在停止；当前小步骤完成后会保留断点"
         self._set_pipeline_status(
             phase="stopping",
             message="正在安全停止；当前小步骤完成后会保留断点",
@@ -532,6 +697,12 @@ class TencentDoc115Library(_PluginBase):
             reset=True,
             max_pages=None,
             mode="manual-reset",
+            resume_function=self._synchronizer.sync,
+            resume_kwargs={
+                "reset": False,
+                "max_pages": None,
+                "mode": "manual",
+            },
         )
 
     def retry_resources(self, payload: ResourceRetryRequest = Body(...)) -> Response:
@@ -566,7 +737,7 @@ class TencentDoc115Library(_PluginBase):
             **totals,
         )
         known_usage_bytes: Optional[int] = None
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self._pause_event.is_set():
             result = self._builder.build(known_usage_bytes=known_usage_bytes)
             processed = int(result.get("processed") or 0)
             known_usage_bytes = int(result.get("usage_bytes") or 0)
@@ -584,6 +755,13 @@ class TencentDoc115Library(_PluginBase):
                 limit_bytes=int(result.get("limit_bytes") or 0),
                 **totals,
             )
+            if self._pause_event.is_set():
+                self._set_pipeline_status(
+                    phase="paused",
+                    message="失败资源重试已暂停；剩余资源仍为 pending",
+                    **totals,
+                )
+                return {"status": "paused", "requeued": requeued, **totals}
             if build_status == "space_limit":
                 self._set_pipeline_status(
                     phase="space_limit",
@@ -609,6 +787,13 @@ class TencentDoc115Library(_PluginBase):
                     **totals,
                 )
                 return {"status": "completed", "requeued": requeued, **totals}
+        if self._pause_event.is_set() and not self._stop_event.is_set():
+            self._set_pipeline_status(
+                phase="paused",
+                message="失败资源重试已暂停；剩余资源仍为 pending",
+                **totals,
+            )
+            return {"status": "paused", "requeued": requeued, **totals}
         self._set_pipeline_status(
             phase="stopped",
             message="失败资源重试已停止；未处理资源仍为 pending",
@@ -627,7 +812,9 @@ class TencentDoc115Library(_PluginBase):
         if not self._store:
             return Response(success=False, message="插件尚未初始化")
         snapshot = self._store.status_snapshot()
-        snapshot["task_running"] = bool(self._future and not self._future.done())
+        task = self._task_snapshot()
+        snapshot["task_running"] = bool(task.get("running"))
+        snapshot["task"] = task
         snapshot["pipeline"] = self._pipeline_snapshot()
         snapshot["storage"] = self._builder.storage_snapshot() if self._builder else {}
         snapshot["direct_gateway"] = (
@@ -774,6 +961,20 @@ class TencentDoc115Library(_PluginBase):
                 "auth": "bear",
             },
             {
+                "path": "/tasks/pause",
+                "endpoint": self.pause_background_tasks,
+                "methods": ["POST"],
+                "summary": "暂停后台同步、生成或迁移",
+                "auth": "bear",
+            },
+            {
+                "path": "/tasks/resume",
+                "endpoint": self.resume_background_tasks,
+                "methods": ["POST"],
+                "summary": "恢复已暂停的后台任务",
+                "auth": "bear",
+            },
+            {
                 "path": "/sync/reset",
                 "endpoint": self.reset_sync,
                 "methods": ["POST"],
@@ -813,6 +1014,13 @@ class TencentDoc115Library(_PluginBase):
                 "endpoint": self.clear_all_data,
                 "methods": ["POST"],
                 "summary": "清空插件数据库和生成内容",
+                "auth": "bear",
+            },
+            {
+                "path": "/migrate-output",
+                "endpoint": self.migrate_output,
+                "methods": ["POST"],
+                "summary": "按工作表分目录迁移已有输出",
                 "auth": "bear",
             },
             {
@@ -1384,6 +1592,7 @@ class TencentDoc115Library(_PluginBase):
             }
         )
         pipeline = self._pipeline_snapshot()
+        task = self._task_snapshot()
         gateway = (
             self._gateway.status()
             if self._gateway
@@ -1401,7 +1610,10 @@ class TencentDoc115Library(_PluginBase):
                 "resources/retry-all",
                 "warning",
             ),
+            ("暂停后台任务", "mdi-pause-circle", "tasks/pause", "warning"),
+            ("恢复后台任务", "mdi-play-circle", "tasks/resume", "success"),
             ("停止后台任务", "mdi-stop-circle", "tasks/stop", "error"),
+            ("迁移现有目录", "mdi-folder-move", "migrate-output", "info"),
             (
                 "重启直链网关",
                 "mdi-lan-connect",
@@ -1415,6 +1627,7 @@ class TencentDoc115Library(_PluginBase):
                 "error",
             ),
         ]
+        task_state = str(task.get("state") or "idle")
         button_components = [
             {
                 "component": "VBtn",
@@ -1521,6 +1734,8 @@ class TencentDoc115Library(_PluginBase):
             "idle": "空闲",
             "syncing": "正在同步",
             "building": "正在刮削和生成",
+            "pausing": "正在暂停",
+            "paused": "已暂停",
             "stopping": "正在停止",
             "stopped": "已停止",
             "completed": "已完成",
@@ -1535,6 +1750,21 @@ class TencentDoc115Library(_PluginBase):
             f"生成 {int(pipeline.get('success') or 0)} 成功 / "
             f"{int(pipeline.get('failed') or 0)} 失败。"
             f"{pipeline.get('message') or ''}"
+        )
+        task_labels = {
+            "idle": "空闲",
+            "running": "运行中",
+            "pausing": "正在暂停",
+            "paused": "已暂停",
+            "stopping": "正在停止",
+            "stopped": "已停止",
+            "completed": "已完成",
+            "failed": "失败",
+        }
+        task_text = (
+            f"后台任务：{task_labels.get(task_state, task_state)}"
+            + (f" · {task.get('name')}" if task.get("name") else "")
+            + (f" · {task.get('message')}" if task.get("message") else "")
         )
         gateway_labels = {
             "disabled": "未启用",
@@ -1601,9 +1831,9 @@ class TencentDoc115Library(_PluginBase):
                             "type": "info",
                             "variant": "tonal",
                             "text": (
-                                f"{pipeline_text} 输出目录占用：{usage_text} / {limit_text}。"
+                                f"{pipeline_text} {task_text} 输出目录占用：{usage_text} / {limit_text}。"
                                 "“同步全部并生成”会在后台跑完已勾选工作表，再逐批处理 pending；"
-                                "可随时安全停止，重新点击会从断点继续。重新打开本页可刷新状态。"
+                                "可暂停或停止，恢复会从断点继续。重新打开本页可刷新状态。"
                             ),
                         },
                     },
@@ -1720,6 +1950,7 @@ class TencentDoc115Library(_PluginBase):
     def stop_service(self) -> None:
         """通知进行中的同步或构建在当前小步骤后安全退出。"""
         self._stop_event.set()
+        self._pause_event.set()
         if self._direct_downloader:
             self._direct_downloader.stop_all()
         if self._gateway:
