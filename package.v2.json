@@ -3,11 +3,12 @@
         "name": "腾讯文档115媒体库",
         "description": "同步腾讯文档或手动添加115分享，支持断点、MoviePilot刮削、异步原生检索下载和Emby直链网关",
         "labels": "媒体库,115网盘,STRM,直链下载,Emby",
-        "version": "0.10.3",
+        "version": "0.10.4",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.10.4": "剧集型多碟 ISO 在常规季集编号缺失时，支持按 D1、Disc1、CD1、DVD1、BD1、第一碟及纯数字文件名映射集号；保留原始编号缺口并跳过无法编号的附加盘",
             "v0.10.3": "修复未配置或未认证PT站点时 MoviePilot 在调用插件前直接结束搜索的问题；仅在原生搜索链中注入本地虚拟索引入口，SQLite 资源无需站点即可检索",
             "v0.10.2": "MoviePilot 默认检索全部有效目录资源；已生成STRM的结果标注“已入库”，未生成结果标注“待保存到媒体库”，已入库确认页不再显示重复保存按钮",
             "v0.10.1": "MoviePilot 原生检索默认只显示尚未生成STRM的目录资源；保留卡片点击下载，并通过结果右下角独立入口确认保存，按工作表既有分组和类型定向解析、刮削及生成STRM",

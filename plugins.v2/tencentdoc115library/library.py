@@ -79,6 +79,14 @@ EPISODE_PATTERNS = (
     ),
     re.compile(r"第\s*(?P<episode>[零〇一二三四五六七八九十百两\d]+)\s*[集话]"),
 )
+DISC_EPISODE_PATTERNS = (
+    re.compile(
+        r"(?<![A-Za-z0-9])(?:D(?:ISC|ISK)?|CD|DVD|BD)"
+        r"[ ._-]*(?P<episode>\d{1,3})(?!\d)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"第?\s*(?P<episode>\d{1,3})\s*[碟盘](?![A-Za-z0-9])"),
+)
 
 
 def chinese_number(value: str) -> Optional[int]:
@@ -960,6 +968,16 @@ class LibraryBuilder:
                 if match:
                     episode = chinese_number(match.group("episode"))
                     break
+        if episode is None and Path(file_name).suffix.lower() == ".iso":
+            for pattern in DISC_EPISODE_PATTERNS:
+                match = pattern.search(identity_text)
+                if match:
+                    episode = int(match.group("episode"))
+                    break
+            if episode is None:
+                bare_disc = re.fullmatch(r"0*(\d{1,3})", Path(file_name).stem)
+                if bare_disc:
+                    episode = int(bare_disc.group(1))
         if episode is None and season is not None:
             bare_episode = re.fullmatch(
                 r"(?:EP?|Episode)?[ ._-]*(\d{1,4})",

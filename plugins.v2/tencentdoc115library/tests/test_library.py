@@ -224,6 +224,76 @@ def test_mixed_sheet_accepts_moviepilot_tv_result_and_changes_group(
     assert episode_strms[0].parent.name == "Season 02"
 
 
+def test_tv_iso_disc_numbers_are_used_as_episode_numbers(tmp_path: Path) -> None:
+    captured_files = []
+
+    class Store:
+        @staticmethod
+        def replace_resource_files(_resource_id, files):
+            captured_files.extend(files)
+
+    builder = LibraryBuilder(
+        store=Store(),
+        resolver=object(),
+        config_provider=lambda: {
+            "public_base_url": "http://moviepilot:3000",
+            "playback_token": "test-token",
+        },
+        stop_event=Event(),
+    )
+    resource = {
+        "resource_id": "documentary-discs",
+        "title": "北美大地",
+        "year": "2013",
+    }
+    mediainfo = SimpleNamespace(title="北美大地", year="2013")
+    source_files = [
+        {
+            "file_id": "disc-1",
+            "file_name": "北美大地 North America 2013 Disc1.iso",
+            "file_path": "/北美大地/北美大地 North America 2013 Disc1.iso",
+        },
+        {
+            "file_id": "disc-3",
+            "file_name": "D3.iso",
+            "file_path": "/北美大地/D3.iso",
+        },
+        {
+            "file_id": "bonus",
+            "file_name": "Bonus.iso",
+            "file_path": "/北美大地/Bonus.iso",
+        },
+    ]
+
+    result = builder._build_tv(
+        resource,
+        meta=SimpleNamespace(),
+        mediainfo=mediainfo,
+        directory=tmp_path / "北美大地 (2013)",
+        source_files=source_files,
+    )
+
+    generated = sorted(Path(result).rglob("*.strm"))
+    assert [item.name for item in generated] == [
+        "北美大地 (2013) - S01E01.strm",
+        "北美大地 (2013) - S01E03.strm",
+    ]
+    assert [(item["season"], item["episode"]) for item in captured_files] == [
+        (1, 1),
+        (1, 3),
+    ]
+
+
+def test_tv_iso_disc_episode_patterns() -> None:
+    assert LibraryBuilder._episode_identity("D1.iso") == (1, 1)
+    assert LibraryBuilder._episode_identity("D2.iso") == (1, 2)
+    assert LibraryBuilder._episode_identity("North America Disc02.iso") == (1, 2)
+    assert LibraryBuilder._episode_identity("CD03.iso") == (1, 3)
+    assert LibraryBuilder._episode_identity("第4碟.iso") == (1, 4)
+    assert LibraryBuilder._episode_identity("05.iso") == (1, 5)
+    assert LibraryBuilder._episode_identity("Bonus.iso") == (None, None)
+
+
 def test_unrecognized_movie_still_generates_strm_without_metadata(
     tmp_path: Path,
 ) -> None:
