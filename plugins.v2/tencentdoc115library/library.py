@@ -197,6 +197,11 @@ class LibraryBuilder:
 
     @staticmethod
     def _effective_media_type(resource: Dict[str, Any]) -> str:
+        save_mode = str(resource.get("save_media_mode") or "").strip().lower()
+        if save_mode == "tv":
+            return "电视剧"
+        if save_mode == "movie":
+            return "电影"
         return str(
             resource.get("detected_media_type")
             or resource.get("media_type")
@@ -207,11 +212,15 @@ class LibraryBuilder:
     def _effective_group_name(resource: Dict[str, Any]) -> str:
         return str(
             resource.get("detected_group_name")
+            or resource.get("save_group_name")
             or resource.get("group_name")
             or ""
         )
 
     def _is_mixed_resource(self, resource: Dict[str, Any]) -> bool:
+        save_mode = str(resource.get("save_media_mode") or "").strip().lower()
+        if save_mode:
+            return save_mode == "mixed"
         sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
         return str(sheet.get("media_mode") or "").strip().lower() == "mixed"
 
@@ -220,6 +229,11 @@ class LibraryBuilder:
         resource: Dict[str, Any],
         source_files: Optional[List[Dict[str, Any]]] = None,
     ) -> MediaType:
+        save_mode = str(resource.get("save_media_mode") or "").strip().lower()
+        if save_mode == "tv":
+            return MediaType.TV
+        if save_mode == "movie":
+            return MediaType.MOVIE
         detected_type = str(resource.get("detected_media_type") or "").lower()
         if detected_type:
             if any(keyword in detected_type for keyword in TV_TYPE_KEYWORDS):
@@ -228,8 +242,7 @@ class LibraryBuilder:
                 return MediaType.MOVIE
         raw_type = str(resource.get("media_type") or "").lower()
         group_name = str(resource.get("group_name") or "").lower()
-        sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
-        is_mixed = str(sheet.get("media_mode") or "").strip().lower() == "mixed"
+        is_mixed = self._is_mixed_resource(resource)
         # 混合表中的类型标签只作提示。文件名/目录出现季集特征时优先按剧集处理。
         if is_mixed and source_files and any(
             self._looks_like_tv_path(
@@ -238,6 +251,8 @@ class LibraryBuilder:
             for source_file in source_files
         ):
             return MediaType.TV
+        if save_mode == "mixed":
+            return MediaType.MOVIE
         if any(keyword in raw_type for keyword in TV_TYPE_KEYWORDS):
             return MediaType.TV
         if any(keyword in raw_type for keyword in MOVIE_TYPE_KEYWORDS):
@@ -263,7 +278,10 @@ class LibraryBuilder:
             return
         sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
         base_group = str(
-            sheet.get("group_name") or resource.get("group_name") or "未分组"
+            resource.get("save_group_name")
+            or sheet.get("group_name")
+            or resource.get("group_name")
+            or "未分组"
         )
         if base_group.endswith("-剧集"):
             base_group = base_group[:-3]

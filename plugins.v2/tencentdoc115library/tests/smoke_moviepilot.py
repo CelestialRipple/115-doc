@@ -291,10 +291,12 @@ def main() -> None:
         assert results[0].site_downloader == "腾讯文档115直链"
         assert parse_download_marker(results[0].enclosure) == "smoke-resource"
         assert "/resources/save/smoke-resource" in results[0].page_url
-        save_page = plugin.save_search_resource(
-            SimpleNamespace(method="GET"),
-            "smoke-resource",
-            token=plugin._config["playback_token"],
+        save_page = asyncio.run(
+            plugin.save_search_resource(
+                SimpleNamespace(method="GET"),
+                "smoke-resource",
+                token=plugin._config["playback_token"],
+            )
         )
         assert "保存到媒体库" in save_page.body.decode("utf-8")
         async_results = asyncio.run(

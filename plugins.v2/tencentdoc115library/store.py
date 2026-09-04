@@ -8,7 +8,7 @@ from threading import RLock
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def utc_now() -> str:
@@ -98,6 +98,8 @@ class CatalogStore:
                     year TEXT,
                     group_name TEXT NOT NULL,
                     detected_group_name TEXT,
+                    save_group_name TEXT,
+                    save_media_mode TEXT,
                     row_hash TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     strm_status TEXT NOT NULL DEFAULT 'pending',
@@ -253,6 +255,14 @@ class CatalogStore:
             if "detected_group_name" not in resource_columns:
                 connection.execute(
                     "ALTER TABLE resource ADD COLUMN detected_group_name TEXT"
+                )
+            if "save_group_name" not in resource_columns:
+                connection.execute(
+                    "ALTER TABLE resource ADD COLUMN save_group_name TEXT"
+                )
+            if "save_media_mode" not in resource_columns:
+                connection.execute(
+                    "ALTER TABLE resource ADD COLUMN save_media_mode TEXT"
                 )
             if "imdb_id" not in resource_columns:
                 connection.execute(
@@ -1033,6 +1043,12 @@ class CatalogStore:
             statuses.extend(["metadata_error", "share_error", "build_error"])
         placeholders = ",".join("?" for _ in statuses)
         parameters: List[Any] = list(statuses)
+        status_clause = f"status IN ({placeholders})"
+        if retry_failed:
+            status_clause = (
+                f"({status_clause} OR "
+                "(status = 'ready' AND scrape_status = 'unrecognized'))"
+            )
         resource_clause = ""
         if resource_ids is not None:
             normalized_ids = [str(item) for item in resource_ids if str(item)]
@@ -1042,7 +1058,7 @@ class CatalogStore:
             resource_clause = f" AND resource_id IN ({id_placeholders})"
             parameters.extend(normalized_ids)
         query = (
-            f"SELECT * FROM resource WHERE status IN ({placeholders})"
+            f"SELECT * FROM resource WHERE {status_clause}"
             f"{resource_clause} "
             "ORDER BY updated_at, sheet_id, row_number LIMIT ?"
         )
@@ -1435,6 +1451,9 @@ class CatalogStore:
 
         :return int: 实际更新数量
         """
+        resource_ids = [str(item) for item in resource_ids if str(item)]
+        if not resource_ids:
+            return 0
         placeholders = ",".join("?" for _ in resource_ids)
         with self._lock, self.connection() as connection:
             cursor = connection.execute(
@@ -1446,6 +1465,44 @@ class CatalogStore:
                 (utc_now(), *resource_ids),
             )
         return int(cursor.rowcount)
+
+    def list_retryable_resource_ids(self) -> List[str]:
+        """列出本轮应重试的失败资源，供后台任务固定处理范围。"""
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT resource_id FROM resource
+                WHERE status IN ('share_error', 'metadata_error', 'build_error')
+                   OR (status = 'ready' AND scrape_status = 'unrecognized')
+                ORDER BY updated_at, sheet_id, row_number
+                """
+            ).fetchall()
+        return [str(row["resource_id"]) for row in rows]
+
+    def configure_resource_for_save(
+        self,
+        resource_id: str,
+        group_name: str,
+        media_mode: str,
+    ) -> bool:
+        """保存搜索结果的用户目录及类型覆盖，并将资源加入构建队列。"""
+        with self._lock, self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE resource
+                SET save_group_name = ?, save_media_mode = ?,
+                    detected_media_type = NULL, detected_group_name = NULL,
+                    status = 'pending', strm_status = 'pending',
+                    scrape_status = 'pending', last_error = NULL,
+                    strm_path = NULL,
+                    resolved_file_id = NULL, resolved_file_name = NULL,
+                    resolved_at = NULL, updated_at = ?
+                WHERE resource_id = ? AND status <> 'removed'
+                  AND strm_status <> 'ready'
+                """,
+                (group_name, media_mode, utc_now(), resource_id),
+            )
+        return bool(cursor.rowcount)
 
     def retry_all_failed_resources(self) -> int:
         """把失败及“未识别但已生成 STRM”的资源重新加入待生成队列。"""

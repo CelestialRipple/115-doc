@@ -5,7 +5,7 @@ from html import escape
 from secrets import compare_digest, token_urlsafe
 from threading import Event, Lock
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Body, Query, Request
@@ -127,7 +127,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.11.0"
+    plugin_version = "0.11.1"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -420,6 +420,11 @@ class TencentDoc115Library(_PluginBase):
     @staticmethod
     def _resource_media_type(resource: Dict[str, Any]) -> MediaType:
         """按表格类型和分组判断检索结果的影视类型。"""
+        save_mode = str(resource.get("save_media_mode") or "").strip().lower()
+        if save_mode == "tv":
+            return MediaType.TV
+        if save_mode == "movie":
+            return MediaType.MOVIE
         raw_type = str(
             resource.get("detected_media_type")
             or resource.get("media_type")
@@ -500,6 +505,7 @@ class TencentDoc115Library(_PluginBase):
             display_title = f"{title} ({year})" if year else title
             effective_group = str(
                 resource.get("detected_group_name")
+                or resource.get("save_group_name")
                 or resource.get("group_name")
                 or "腾讯文档"
             )
@@ -583,7 +589,7 @@ class TencentDoc115Library(_PluginBase):
             f"resources/save/{resource_id}?{query}"
         )
 
-    def save_search_resource(
+    async def save_search_resource(
         self,
         request: Request,
         resource_id: str,
@@ -598,25 +604,58 @@ class TencentDoc115Library(_PluginBase):
         resource = self._store.get_resource(resource_id)
         if not resource or resource.get("status") == "removed":
             return HTMLResponse("<h2>资源不存在或已移除</h2>", status_code=404)
-        title = escape(str(resource.get("title") or resource_id))
-        group_name = escape(
-            str(
-                resource.get("detected_group_name")
-                or resource.get("group_name")
-                or "未分组"
-            )
+        title = str(resource.get("title") or resource_id)
+        group_name = str(
+            resource.get("detected_group_name")
+            or resource.get("save_group_name")
+            or resource.get("group_name")
+            or "未分组"
         )
-        media_type = escape(
-            str(
+        configured_mode = str(resource.get("save_media_mode") or "").lower()
+        if configured_mode not in {"movie", "tv", "mixed"}:
+            raw_type = str(
                 resource.get("detected_media_type")
                 or resource.get("media_type")
-                or "自动识别"
+                or ""
+            ).lower()
+            configured_mode = (
+                "tv"
+                if any(item in raw_type for item in ("电视剧", "剧集", "tv", "番剧"))
+                else "movie"
+                if any(item in raw_type for item in ("电影", "movie", "影片"))
+                else "mixed"
             )
-        )
+        error_message = ""
         if request.method.upper() == "POST":
+            form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
+            requested_group = str((form.get("group_name") or [group_name])[0]).strip()
+            requested_mode = str((form.get("media_mode") or [configured_mode])[0]).lower()
+            if (
+                not requested_group
+                or len(requested_group) > 120
+                or requested_group in {".", ".."}
+                or "/" in requested_group
+                or "\\" in requested_group
+            ):
+                error_message = "文件夹名称不能为空、不能包含斜杠，且最多 120 个字符。"
+            elif requested_mode not in {"movie", "tv", "mixed"}:
+                error_message = "请选择电影、剧集或自动识别。"
+            else:
+                group_name = requested_group
+                configured_mode = requested_mode
             if str(resource.get("strm_status") or "") == "ready":
                 message = "该资源已经生成 STRM，无需重复保存。"
                 success = True
+            elif error_message:
+                message = error_message
+                success = False
+            elif not self._store.configure_resource_for_save(
+                resource_id,
+                group_name,
+                configured_mode,
+            ):
+                message = "资源状态已变化，请刷新页面后重试。"
+                success = False
             else:
                 response = self._submit(
                     "保存搜索资源到媒体库",
@@ -632,9 +671,10 @@ class TencentDoc115Library(_PluginBase):
                 self._save_page_html(
                     title,
                     group_name,
-                    media_type,
+                    configured_mode,
                     escape(message),
                     color,
+                    allow_submit=not success,
                 )
             )
         if str(resource.get("strm_status") or "") == "ready":
@@ -642,20 +682,22 @@ class TencentDoc115Library(_PluginBase):
                 self._save_page_html(
                     title,
                     group_name,
-                    media_type,
+                    configured_mode,
                     "该资源已经在影视库中。",
                     "#2e7d32",
+                    allow_submit=False,
                 )
             )
-        return HTMLResponse(self._save_page_html(title, group_name, media_type))
+        return HTMLResponse(self._save_page_html(title, group_name, configured_mode))
 
     @staticmethod
     def _save_page_html(
         title: str,
         group_name: str,
-        media_type: str,
+        media_mode: str,
         message: str = "",
         message_color: str = "#1565c0",
+        allow_submit: bool = True,
     ) -> str:
         """渲染无需 MoviePilot 前端扩展的轻量保存确认页。"""
         result = (
@@ -663,11 +705,26 @@ class TencentDoc115Library(_PluginBase):
             if message
             else ""
         )
-        button = (
+        title = escape(title)
+        group_name = escape(group_name, quote=True)
+        options = "".join(
+            f'<option value="{value}"{(" selected" if media_mode == value else "")}>{label}</option>'
+            for value, label in (
+                ("movie", "电影"),
+                ("tv", "剧集"),
+                ("mixed", "自动识别"),
+            )
+        )
+        form = (
             ""
-            if message
+            if not allow_submit
             else (
-                '<form method="post"><button type="submit">保存到媒体库</button>'
+                '<form method="post"><label>输出文件夹</label>'
+                f'<input name="group_name" value="{group_name}" maxlength="120" required>'
+                '<small>该文件夹位于输出根目录下，与“星火”同一级。</small>'
+                '<label>媒体类型</label>'
+                f'<select name="media_mode">{options}</select>'
+                '<button type="submit">保存到媒体库</button>'
                 "</form>"
             )
         )
@@ -679,10 +736,13 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 background:#10131a;color:#eef2f7;margin:0;padding:24px}}
 main{{max-width:560px;margin:10vh auto;background:#1b202b;border-radius:16px;
 padding:28px;box-shadow:0 12px 40px #0006}}
-p{{color:#b8c0cc;line-height:1.7}}button{{border:0;border-radius:10px;
+p{{color:#b8c0cc;line-height:1.7}}label{{display:block;margin:16px 0 7px}}
+input,select{{box-sizing:border-box;width:100%;border:1px solid #465064;
+border-radius:9px;background:#111620;color:#eef2f7;padding:11px;font-size:15px}}
+small{{display:block;color:#8e99aa;margin-top:6px}}button{{border:0;border-radius:10px;
 background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
 </style></head><body><main><h2>{title}</h2>
-<p>输出文件夹：{group_name}<br>媒体类型：{media_type}</p>{result}{button}
+{result}{form}
 </main></body></html>"""
 
     async def async_search_torrents(
@@ -1077,10 +1137,11 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         return Response(success=True, message=f"已重新排队 {count} 条资源")
 
     def _retry_all_failed_and_build(self) -> Dict[str, Any]:
-        """重新排队全部失败资源，并连续按批次重试一次。"""
+        """锁定当前全部失败资源，并连续按批次各重试一次。"""
         if not self._store or not self._builder:
             return {"status": "failed", "message": "插件尚未初始化"}
-        requeued = self._store.retry_all_failed_resources()
+        resource_ids = self._store.list_retryable_resource_ids()
+        requeued = len(resource_ids)
         totals = {
             "synced_pages": 0,
             "synced_rows": 0,
@@ -1097,13 +1158,48 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             return {"status": "completed", "requeued": 0, **totals}
         self._set_pipeline_status(
             phase="building",
-            message=f"已重新排队 {requeued} 条失败资源，正在按批次重试",
+            message=f"已锁定 {requeued} 条失败资源，正在逐条重试一次",
             **totals,
         )
         known_usage_bytes: Optional[int] = None
+        remaining_ids = list(resource_ids)
         while not self._stop_event.is_set() and not self._pause_event.is_set():
-            result = self._builder.build(known_usage_bytes=known_usage_bytes)
+            try:
+                batch_limit = min(
+                    max(int(self._config.get("build_batch") or 20), 1),
+                    500,
+                )
+            except (TypeError, ValueError):
+                batch_limit = 20
+            candidates = self._store.list_build_candidates(
+                batch_limit,
+                retry_failed=True,
+                resource_ids=remaining_ids,
+            )
+            batch_ids = [str(item["resource_id"]) for item in candidates]
+            if not batch_ids:
+                self._set_pipeline_status(
+                    phase="completed",
+                    message=(
+                        f"失败资源已完成一轮重试：{totals['success']} 成功 / "
+                        f"{totals['failed']} 再次失败"
+                    ),
+                    **totals,
+                )
+                return {"status": "completed", "requeued": requeued, **totals}
+            result = self._builder.build(
+                limit=len(batch_ids),
+                known_usage_bytes=known_usage_bytes,
+                retry_failed=True,
+                resource_ids=batch_ids,
+            )
             processed = int(result.get("processed") or 0)
+            processed_ids = set(batch_ids[:processed])
+            remaining_ids = [
+                resource_id
+                for resource_id in remaining_ids
+                if resource_id not in processed_ids
+            ]
             known_usage_bytes = int(result.get("usage_bytes") or 0)
             totals["built"] += processed
             totals["success"] += int(result.get("success") or 0)
@@ -1122,14 +1218,14 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             if self._pause_event.is_set():
                 self._set_pipeline_status(
                     phase="paused",
-                    message="失败资源重试已暂停；剩余资源仍为 pending",
+                    message="失败资源重试已暂停；未处理项保持原状态",
                     **totals,
                 )
                 return {"status": "paused", "requeued": requeued, **totals}
             if build_status == "space_limit":
                 self._set_pipeline_status(
                     phase="space_limit",
-                    message="重试已因输出空间上限停止，未处理资源仍为 pending",
+                    message="重试已因输出空间上限停止；未处理项保持原状态",
                     **totals,
                 )
                 return {"status": "space_limit", "requeued": requeued, **totals}
@@ -1143,18 +1239,15 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                 return {"status": final_phase, "requeued": requeued, **totals}
             if processed == 0:
                 self._set_pipeline_status(
-                    phase="completed",
-                    message=(
-                        f"失败资源已完成一轮重试：{totals['success']} 成功 / "
-                        f"{totals['failed']} 再次失败"
-                    ),
+                    phase="failed",
+                    message="失败资源重试未取得进展，请查看最近错误",
                     **totals,
                 )
-                return {"status": "completed", "requeued": requeued, **totals}
+                return {"status": "failed", "requeued": requeued, **totals}
         if self._pause_event.is_set() and not self._stop_event.is_set():
             self._set_pipeline_status(
                 phase="paused",
-                message="失败资源重试已暂停；剩余资源仍为 pending",
+                message="失败资源重试已暂停；未处理项保持原状态",
                 **totals,
             )
             return {"status": "paused", "requeued": requeued, **totals}

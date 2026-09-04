@@ -326,6 +326,7 @@ def test_build_progress_is_visible_and_all_failures_can_be_requeued(
         strm_status="ready",
         scrape_status="failed",
     )
+    assert store.list_retryable_resource_ids() == ["resource-1"]
     assert store.retry_all_failed_resources() == 1
     resource = store.get_resource("resource-1")
     assert resource["status"] == "pending"
@@ -360,8 +361,28 @@ def test_unrecognized_strm_can_be_requeued_for_future_recognition(
         strm_path="/media/movie.strm",
     )
 
+    assert store.list_retryable_resource_ids() == ["resource-1"]
+    candidates = store.list_build_candidates(10, retry_failed=True)
+    assert [item["resource_id"] for item in candidates] == ["resource-1"]
     assert store.retry_all_failed_resources() == 1
     resource = store.get_resource("resource-1")
     assert resource["status"] == "pending"
     assert resource["strm_status"] == "pending"
     assert resource["scrape_status"] == "pending"
+
+
+def test_search_save_overrides_survive_incremental_sheet_sync(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    resource = _resource()
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [resource], 99)
+
+    assert store.configure_resource_for_save("resource-1", "我的收藏", "tv")
+    configured = store.get_resource("resource-1")
+    assert configured["save_group_name"] == "我的收藏"
+    assert configured["save_media_mode"] == "tv"
+
+    store.save_page("sheet-1", checkpoint["scan_id"], 201, {}, [resource], 99)
+    configured = store.get_resource("resource-1")
+    assert configured["save_group_name"] == "我的收藏"
+    assert configured["save_media_mode"] == "tv"
