@@ -36,8 +36,14 @@ from .downloader import (
 from .download_marker import build_download_marker
 from .gateway import DirectPlayGateway
 from .library import LibraryBuilder
+from .manual import MANUAL_SHEET_PREFIX, ManualImportError, ManualLibraryImporter
 from .resolver import ShareResolutionError, ShareResolver
-from .schemas import BuildActionRequest, ResourceRetryRequest, SyncActionRequest
+from .schemas import (
+    BuildActionRequest,
+    ManualImportRequest,
+    ResourceRetryRequest,
+    SyncActionRequest,
+)
 from .storage_limit import format_gib
 from .store import CatalogStore
 
@@ -49,6 +55,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "build_cron": "*/5 * * * *",
     "document_url": "",
     "document_urls": "",
+    "manual_import_links": "",
+    "manual_import_group": "自定义",
+    "manual_import_media_mode": "mixed",
     "client_id": "",
     "client_secret": "",
     "openid": "",
@@ -95,7 +104,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.9.9"
+    plugin_version = "0.10.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -120,6 +129,7 @@ class TencentDoc115Library(_PluginBase):
         self._synchronizer: Optional[CatalogSynchronizer] = None
         self._resolver: Optional[ShareResolver] = None
         self._builder: Optional[LibraryBuilder] = None
+        self._manual_importer: Optional[ManualLibraryImporter] = None
         self._direct_downloader: Optional[DirectDownloadManager] = None
         self._gateway: Optional[DirectPlayGateway] = None
         self._pipeline_status: Dict[str, Any] = {
@@ -188,6 +198,12 @@ class TencentDoc115Library(_PluginBase):
             store=self._store,
             resolver=self._resolver,
             config_provider=self._current_config,
+            stop_event=self._stop_event,
+            pause_event=self._pause_event,
+        )
+        self._manual_importer = ManualLibraryImporter(
+            store=self._store,
+            resolver=self._resolver,
             stop_event=self._stop_event,
             pause_event=self._pause_event,
         )
@@ -341,9 +357,13 @@ class TencentDoc115Library(_PluginBase):
         if not self._config.get("native_search_enabled", True):
             return {}
         if not self._direct_downloader:
-            return {"search_torrents": self.search_torrents}
+            return {
+                "search_torrents": self.search_torrents,
+                "async_search_torrents": self.async_search_torrents,
+            }
         return {
             "search_torrents": self.search_torrents,
+            "async_search_torrents": self.async_search_torrents,
             "download": self._direct_downloader.download,
             "list_torrents": self._direct_downloader.list_torrents,
             "start_torrents": self._direct_downloader.start_torrents,
@@ -436,6 +456,16 @@ class TencentDoc115Library(_PluginBase):
             )
         return results
 
+    async def async_search_torrents(
+        self,
+        site: dict,
+        keyword: str,
+        mtype: Optional[MediaType] = None,
+        page: Optional[int] = 0,
+    ) -> List[TorrentInfo]:
+        """兼容最新版 MoviePilot V3 的异步插件检索入口。"""
+        return self.search_torrents(site, keyword, mtype, page)
+
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
         """返回远程命令；当前插件不注册聊天命令。"""
@@ -490,6 +520,92 @@ class TencentDoc115Library(_PluginBase):
             self._builder.build,
             limit=action.limit,
             retry_failed=action.retry_failed,
+        )
+
+    def _import_manual_resources(
+        self,
+        links: str,
+        group_name: str,
+        media_mode: str,
+    ) -> Dict[str, Any]:
+        """匿名解析手动115分享，并只构建本次新增或变化的资源。"""
+        if not self._manual_importer or not self._builder:
+            return {"status": "failed", "message": "插件尚未初始化"}
+        imported = self._manual_importer.import_links(
+            links,
+            group_name,
+            media_mode,
+        )
+        queued_ids = list(imported.get("queued_ids") or [])
+        if imported.get("paused"):
+            return {
+                **imported,
+                "status": "paused",
+                "message": "手动导入已暂停；已保存的资源和文件列表不会丢失",
+            }
+        if imported.get("interrupted"):
+            return {
+                **imported,
+                "status": "interrupted",
+                "message": "手动导入已停止；已保存的资源不会丢失",
+            }
+        if not queued_ids:
+            return {
+                **imported,
+                "status": "completed",
+                "message": (
+                    f"手动导入完成：0 条需要生成，{imported['unchanged']} 条未变化，"
+                    f"{imported['failed']} 条分享无效或解析失败"
+                ),
+            }
+        built = self._builder.build(
+            limit=len(queued_ids),
+            resource_ids=queued_ids,
+        )
+        return {
+            **imported,
+            **built,
+            "message": (
+                f"手动导入 {imported['imported']} 条，"
+                f"STRM/刮削 {built.get('success', 0)} 成功、"
+                f"{built.get('failed', 0)} 失败；"
+                f"另有 {imported['unchanged']} 条未变化、"
+                f"{imported['failed']} 条分享无效或解析失败"
+            ),
+        }
+
+    def import_manual_resources(
+        self,
+        payload: Optional[ManualImportRequest] = Body(default=None),
+    ) -> Response:
+        """单条或批量添加115分享，并在后台解析、刮削和生成 STRM。"""
+        if not self._manual_importer or not self._builder:
+            return Response(success=False, message="插件尚未初始化")
+        action = payload or ManualImportRequest()
+        links = str(action.links or self._config.get("manual_import_links") or "")
+        group_name = str(
+            action.group_name or self._config.get("manual_import_group") or ""
+        ).strip()
+        media_mode = str(
+            action.media_mode
+            or self._config.get("manual_import_media_mode")
+            or "mixed"
+        ).strip().lower()
+        try:
+            if not group_name:
+                raise ManualImportError("请填写自定义资源输出文件夹")
+            if media_mode not in {"movie", "tv", "mixed"}:
+                raise ManualImportError("媒体类型必须是电影、剧集或自动识别")
+            if not self._manual_importer.parse_entries(links):
+                raise ManualImportError("没有识别到有效的115分享链接")
+        except ManualImportError as error:
+            return Response(success=False, message=str(error))
+        return self._submit(
+            "导入自定义115资源",
+            self._import_manual_resources,
+            links,
+            group_name,
+            media_mode,
         )
 
     def _set_pipeline_status(self, **values: Any) -> None:
@@ -960,6 +1076,13 @@ class TencentDoc115Library(_PluginBase):
                 "auth": "bear",
             },
             {
+                "path": "/resources/import-manual",
+                "endpoint": self.import_manual_resources,
+                "methods": ["POST"],
+                "summary": "单条或批量导入115分享并生成媒体库",
+                "auth": "bear",
+            },
+            {
                 "path": "/sync-all",
                 "endpoint": self.start_sync_all,
                 "methods": ["POST"],
@@ -1157,7 +1280,17 @@ class TencentDoc115Library(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """返回凭据、同步保护、115 和工作表分组配置。"""
-        sheets = self._store.list_sheets() if self._store else []
+        sheets = (
+            [
+                sheet
+                for sheet in self._store.list_sheets()
+                if not str(sheet.get("sheet_id") or "").startswith(
+                    MANUAL_SHEET_PREFIX
+                )
+            ]
+            if self._store
+            else []
+        )
         sheet_rows: List[Dict[str, Any]] = []
         for sheet in sheets:
             key = sheet_config_key(sheet["sheet_id"])
@@ -1423,6 +1556,69 @@ class TencentDoc115Library(_PluginBase):
                     {
                         "component": "div",
                         "props": {"class": "text-h6 mb-2"},
+                        "text": "自定义115分享链接",
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "class": "mb-3",
+                            "text": (
+                                "填写后先保存设置，再到详情页点击“导入自定义115资源”。"
+                                "插件会匿名解析分享、调用 MoviePilot 识别和刮削，并立即生成 STRM；"
+                                "同一批链接使用下方同一个文件夹和媒体类型。"
+                            ),
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._textarea_field(
+                                "manual_import_links",
+                                "115分享链接（每行一条，最多100条）",
+                                "支持：链接；标题|链接；标题|年份|链接。访问码可放在链接参数中。",
+                            ),
+                            self._text_field(
+                                "manual_import_group",
+                                "输出文件夹",
+                                6,
+                                hint="例如：自定义、朋友分享；作为输出根目录下的一级分组",
+                            ),
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "manual_import_media_mode",
+                                            "label": "媒体类型",
+                                            "items": [
+                                                {"title": "电影", "value": "movie"},
+                                                {"title": "剧集", "value": "tv"},
+                                                {
+                                                    "title": "自动识别并分流",
+                                                    "value": "mixed",
+                                                },
+                                            ],
+                                            "item-title": "title",
+                                            "item-value": "value",
+                                            "persistent-hint": True,
+                                            "hint": "自动模式会按文件特征和 MoviePilot 识别结果分到电影或“文件夹-剧集”",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VDivider",
+                        "props": {"class": "my-4"},
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-h6 mb-2"},
                         "text": "内置 Emby 直链网关",
                     },
                     {
@@ -1613,6 +1809,12 @@ class TencentDoc115Library(_PluginBase):
         )
         buttons = [
             ("发现工作表", "mdi-table-search", "discover", "primary"),
+            (
+                "导入自定义115资源",
+                "mdi-link-plus",
+                "resources/import-manual",
+                "info",
+            ),
             ("继续同步", "mdi-sync", "sync", "primary"),
             ("同步全部并生成", "mdi-playlist-check", "sync-all", "success"),
             ("重新扫描", "mdi-restart-alert", "sync/reset", "warning"),
@@ -1667,6 +1869,8 @@ class TencentDoc115Library(_PluginBase):
             "mixed": "混合",
         }
         for sheet in snapshot.get("sheets", []):
+            if str(sheet.get("sheet_id") or "").startswith(MANUAL_SHEET_PREFIX):
+                continue
             total = int(sheet.get("used_row_count") or sheet.get("row_count") or 0)
             checkpoint = max(int(sheet.get("checkpoint_row") or 1) - 1, 0)
             sheet_items.append(

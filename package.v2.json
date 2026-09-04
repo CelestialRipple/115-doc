@@ -1,13 +1,14 @@
 {
     "TencentDoc115Library": {
         "name": "腾讯文档115媒体库",
-        "description": "同步多个腾讯文档中的115分享资源，支持断点、MoviePilot刮削、原生检索下载和内置Emby直链网关",
+        "description": "同步腾讯文档或手动添加115分享，支持断点、MoviePilot刮削、异步原生检索下载和Emby直链网关",
         "labels": "媒体库,115网盘,STRM,直链下载,Emby",
-        "version": "0.9.9",
+        "version": "0.10.0",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.10.0": "兼容最新版 MoviePilot V3 异步 SQLite 检索；新增单条/批量自定义115分享导入，可选择输出文件夹与电影、剧集或自动类型，并立即匿名解析、刮削和生成STRM",
             "v0.9.9": "混合工作表支持由 MoviePilot 识别结果纠正电影/电视剧分类并持久化到对应分组；未识别媒体降级生成无元数据 STRM，不再遗漏资源，且可稍后重新识别",
             "v0.9.8": "新增现有目录迁移按钮，无需重新刮削即可按工作表拆分目录并更新 SQLite 路径；后台同步、生成、重试和迁移支持明确的暂停、恢复与停止状态",
             "v0.9.7": "协调并行刮削中的同片任务：同一电影或剧集同时出现在多个工作表时只执行一次元数据刮削，后续目录复用结果",

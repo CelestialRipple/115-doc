@@ -1,5 +1,6 @@
 """在官方 MoviePilot 镜像中运行的插件装载冒烟测试。"""
 
+import asyncio
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,6 +35,7 @@ def main() -> None:
         module = plugin.get_module()
         expected_methods = {
             "search_torrents",
+            "async_search_torrents",
             "download",
             "list_torrents",
             "start_torrents",
@@ -55,6 +57,7 @@ def main() -> None:
         assert "/tasks/resume" in api_paths
         assert "/migrate-output" in api_paths
         assert "/resources/retry-all" in api_paths
+        assert "/resources/import-manual" in api_paths
         assert "/gateway/restart" in api_paths
         assert "/clear-all" in api_paths
         page_text = str(plugin.get_page())
@@ -63,6 +66,7 @@ def main() -> None:
         assert "内置直链网关" in page_text
         assert "清空并重新开始" in page_text
         assert "迁移现有目录" in page_text
+        assert "导入自定义115资源" in page_text
 
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()
@@ -282,6 +286,10 @@ def main() -> None:
         assert len(results) == 1
         assert results[0].site_downloader == "腾讯文档115直链"
         assert parse_download_marker(results[0].enclosure) == "smoke-resource"
+        async_results = asyncio.run(
+            module["async_search_torrents"]({}, "测试电影")
+        )
+        assert len(async_results) == 1
 
         store.upsert_download_task(
             {

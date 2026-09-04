@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -452,6 +453,131 @@ class CatalogStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def upsert_manual_resource(
+        self,
+        *,
+        sheet_id: str,
+        resource_id: str,
+        title: str,
+        year: str,
+        share_url: str,
+        media_type: str,
+        group_name: str,
+        media_mode: str,
+        status: str,
+        error: Optional[str] = None,
+    ) -> bool:
+        """保存一条手动115资源，返回它是否需要重新进入构建队列。"""
+        now = utc_now()
+        identity = "\n".join(
+            (title, year, share_url, media_type, group_name, media_mode)
+        )
+        row_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO sheet_state (
+                    sheet_id, title, source_title, document_title,
+                    remote_sheet_id, enabled, group_name, media_mode,
+                    scan_status, updated_at
+                ) VALUES (?, ?, ?, '手动添加', ?, 0, ?, ?, 'idle', ?)
+                ON CONFLICT(sheet_id) DO UPDATE SET
+                    title = excluded.title,
+                    source_title = excluded.source_title,
+                    group_name = excluded.group_name,
+                    media_mode = excluded.media_mode,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    sheet_id,
+                    f"自定义115（{group_name}）",
+                    f"自定义115（{group_name}）",
+                    sheet_id,
+                    group_name,
+                    media_mode,
+                    now,
+                ),
+            )
+            existing = connection.execute(
+                "SELECT row_hash, status FROM resource WHERE resource_id = ?",
+                (resource_id,),
+            ).fetchone()
+            changed = bool(existing and existing["row_hash"] != row_hash)
+            queued = status == "pending" and (
+                existing is None
+                or changed
+                or existing["status"]
+                not in {"ready", "pending", "processing"}
+            )
+            if existing is None:
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(row_number), 0) + 1 AS next_row "
+                    "FROM resource WHERE sheet_id = ?",
+                    (sheet_id,),
+                ).fetchone()
+                row_number = int(row["next_row"] or 1)
+                connection.execute(
+                    """
+                    INSERT INTO resource (
+                        resource_id, sheet_id, row_number, title, version,
+                        share_url, media_type, rating, year, group_name,
+                        row_hash, status, strm_status, scrape_status,
+                        last_error, last_seen_scan, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, '', ?, ?, '', ?, ?, ?, ?, ?, ?, ?,
+                              'manual', ?, ?)
+                    """,
+                    (
+                        resource_id,
+                        sheet_id,
+                        row_number,
+                        title,
+                        share_url,
+                        media_type,
+                        year,
+                        group_name,
+                        row_hash,
+                        status,
+                        "pending" if status == "pending" else "failed",
+                        "pending" if status == "pending" else "blocked",
+                        error,
+                        now,
+                        now,
+                    ),
+                )
+            elif queued or status != "pending":
+                connection.execute(
+                    """
+                    UPDATE resource
+                    SET title = ?, share_url = ?, media_type = ?, year = ?,
+                        group_name = ?, row_hash = ?, status = ?,
+                        strm_status = ?, scrape_status = ?, last_error = ?,
+                        strm_path = NULL, detected_media_type = NULL,
+                        detected_group_name = NULL, resolved_file_id = NULL,
+                        resolved_file_name = NULL, resolved_at = NULL,
+                        last_seen_scan = 'manual', updated_at = ?
+                    WHERE resource_id = ?
+                    """,
+                    (
+                        title,
+                        share_url,
+                        media_type,
+                        year,
+                        group_name,
+                        row_hash,
+                        status,
+                        "pending" if status == "pending" else "failed",
+                        "pending" if status == "pending" else "blocked",
+                        error,
+                        now,
+                        resource_id,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM resource_file WHERE resource_id = ?",
+                    (resource_id,),
+                )
+            return queued
+
     def reset_sheet_scan(self, sheet_id: str) -> None:
         """
         清除指定工作表的扫描检查点
@@ -751,6 +877,7 @@ class CatalogStore:
         self,
         limit: int,
         retry_failed: bool = False,
+        resource_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         查询待生成 STRM 的资源
@@ -764,12 +891,23 @@ class CatalogStore:
         if retry_failed:
             statuses.extend(["metadata_error", "share_error", "build_error"])
         placeholders = ",".join("?" for _ in statuses)
+        parameters: List[Any] = list(statuses)
+        resource_clause = ""
+        if resource_ids is not None:
+            normalized_ids = [str(item) for item in resource_ids if str(item)]
+            if not normalized_ids:
+                return []
+            id_placeholders = ",".join("?" for _ in normalized_ids)
+            resource_clause = f" AND resource_id IN ({id_placeholders})"
+            parameters.extend(normalized_ids)
         query = (
-            f"SELECT * FROM resource WHERE status IN ({placeholders}) "
+            f"SELECT * FROM resource WHERE status IN ({placeholders})"
+            f"{resource_clause} "
             "ORDER BY updated_at, sheet_id, row_number LIMIT ?"
         )
+        parameters.append(int(limit))
         with self.connection() as connection:
-            rows = connection.execute(query, (*statuses, int(limit))).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
     def search_resources(

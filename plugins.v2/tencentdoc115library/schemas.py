@@ -52,3 +52,11 @@ class ResourceRetryRequest(BaseModel):
         max_length=100,
         description="要重试的资源 ID 列表",
     )
+
+
+class ManualImportRequest(BaseModel):
+    """手动添加115分享资源；空字段会读取插件配置页中已保存的值。"""
+
+    links: Optional[str] = Field(default=None, description="单条或批量115分享链接")
+    group_name: Optional[str] = Field(default=None, max_length=120)
+    media_mode: Optional[str] = Field(default=None, description="movie、tv 或 mixed")

@@ -334,7 +334,9 @@ class LibraryBuilder:
         group = safe_path_segment(self._effective_group_name(resource) or "未分组")
         media_directory = self._media_directory_name(resource, mediainfo)
         target_parent = root / group
-        if config.get("separate_source_folders"):
+        if config.get("separate_source_folders") and not str(
+            resource.get("sheet_id") or ""
+        ).startswith("manual:"):
             sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
             source_name = safe_path_segment(
                 str(sheet.get("title") or sheet.get("source_title") or "工作表")
@@ -1036,6 +1038,7 @@ class LibraryBuilder:
         limit: Optional[int] = None,
         retry_failed: bool = False,
         known_usage_bytes: Optional[int] = None,
+        resource_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         限量处理待生成资源
@@ -1043,6 +1046,7 @@ class LibraryBuilder:
         :param limit (int): 本次最大资源数
         :param retry_failed (bool): 是否包含失败资源
         :param known_usage_bytes (int): 连续批次沿用的已知目录占用，避免反复扫描
+        :param resource_ids (List[str]): 只处理指定资源，供手动导入立即构建
 
         :return Dict: 处理统计
         """
@@ -1143,6 +1147,7 @@ class LibraryBuilder:
             resources = self.store.list_build_candidates(
                 batch_limit,
                 retry_failed=retry_failed,
+                resource_ids=resource_ids,
             )
             for resource in resources:
                 if scrape_executor and len(pending_scrapes) >= scrape_workers:
@@ -1167,7 +1172,15 @@ class LibraryBuilder:
                         strm_status="validating",
                         scrape_status="pending",
                     )
-                    source_files = self.resolver.list_video_files(resource["share_url"])
+                    sheet = self.store.get_sheet(resource["sheet_id"]) or {}
+                    prefetched_files = (
+                        self.store.list_resource_files(resource["resource_id"])
+                        if str(sheet.get("sheet_id") or "").startswith("manual:")
+                        else []
+                    )
+                    source_files = prefetched_files or self.resolver.list_video_files(
+                        resource["share_url"]
+                    )
                     media_type = self._media_type(resource, source_files)
                     mixed_resource = self._is_mixed_resource(resource)
                     current_stage = "recognizing"
