@@ -1,3 +1,5 @@
+import asyncio
+import re
 from concurrent.futures import Future
 from html import escape
 from secrets import compare_digest, token_urlsafe
@@ -117,7 +119,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.10.5"
+    plugin_version = "0.10.6"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -133,6 +135,8 @@ class TencentDoc115Library(_PluginBase):
         self._pause_event = Event()
         self._task_lock = Lock()
         self._pipeline_lock = Lock()
+        self._search_id_lock = Lock()
+        self._imdb_tmdb_cache: Dict[str, Tuple[str, ...]] = {}
         self._future: Optional[Future] = None
         self._task_name = ""
         self._task_state = "idle"
@@ -446,6 +450,13 @@ class TencentDoc115Library(_PluginBase):
         ).strip().lower()
         if search_scope not in {"unbuilt", "all", "ready"}:
             search_scope = "all"
+        normalized_keyword = str(keyword or "").strip()
+        imdb_id = (
+            normalized_keyword
+            if re.fullmatch(r"tt\d+", normalized_keyword, re.I)
+            else ""
+        )
+        tmdb_ids = self._tmdb_ids_for_imdb(imdb_id, mtype) if imdb_id else []
         resources = self._store.search_resources(
             keyword=keyword,
             limit=page_size,
@@ -458,6 +469,8 @@ class TencentDoc115Library(_PluginBase):
                 )
             ),
             unbuilt_only=search_scope == "unbuilt",
+            imdb_id=imdb_id,
+            tmdb_ids=tmdb_ids,
         )
         results: List[TorrentInfo] = []
         for resource in resources:
@@ -477,8 +490,6 @@ class TencentDoc115Library(_PluginBase):
             year = str(resource.get("year") or "").strip()
             version = str(resource.get("version") or "").strip()
             display_title = f"{title} ({year})" if year else title
-            if version:
-                display_title = f"{display_title} {version}"
             effective_group = str(
                 resource.get("detected_group_name")
                 or resource.get("group_name")
@@ -510,11 +521,50 @@ class TencentDoc115Library(_PluginBase):
                     ],
                     pri_order=100,
                     category=media_type.value,
+                    imdbid=imdb_id or str(resource.get("imdb_id") or "") or None,
                 )
             )
         if local_indexer:
             return LocalSearchResults(results)
         return results
+
+    def _tmdb_ids_for_imdb(
+        self,
+        imdb_id: str,
+        media_type: Optional[MediaType],
+    ) -> List[str]:
+        """把详情页的 IMDb 搜索词映射为目录中已有的 TMDB ID。"""
+        cache_key = (
+            f"{imdb_id.lower()}::"
+            f"{getattr(media_type, 'value', media_type) or ''}"
+        )
+        with self._search_id_lock:
+            cached = self._imdb_tmdb_cache.get(cache_key)
+            if cached is not None:
+                return list(cached)
+            ids: List[str] = []
+            try:
+                from app.modules.themoviedb.tmdbv3api import Find
+
+                found = Find().find_by_imdb_id(imdb_id) or {}
+                result_keys = (
+                    ("tv_results",)
+                    if media_type == MediaType.TV
+                    else ("movie_results",)
+                    if media_type == MediaType.MOVIE
+                    else ("movie_results", "tv_results")
+                )
+                for result_key in result_keys:
+                    for item in found.get(result_key) or []:
+                        tmdb_id = str(item.get("id") or "").strip()
+                        if tmdb_id and tmdb_id not in ids:
+                            ids.append(tmdb_id)
+            except Exception as error:
+                logger.warning(f"IMDb 搜索映射 TMDB 失败：{imdb_id} - {error}")
+            if len(self._imdb_tmdb_cache) >= 256:
+                self._imdb_tmdb_cache.pop(next(iter(self._imdb_tmdb_cache)))
+            self._imdb_tmdb_cache[cache_key] = tuple(ids)
+            return ids
 
     def _library_save_url(self, resource_id: str) -> str:
         """生成带插件密钥的搜索结果保存确认页地址。"""
@@ -635,7 +685,13 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         page: Optional[int] = 0,
     ) -> List[TorrentInfo]:
         """兼容最新版 MoviePilot V3 的异步插件检索入口。"""
-        return self.search_torrents(site, keyword, mtype, page)
+        return await asyncio.to_thread(
+            self.search_torrents,
+            site,
+            keyword,
+            mtype,
+            page,
+        )
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:

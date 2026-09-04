@@ -5,10 +5,10 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def utc_now() -> str:
@@ -106,6 +106,7 @@ class CatalogStore:
                     media_source TEXT,
                     media_id TEXT,
                     tmdb_id TEXT,
+                    imdb_id TEXT,
                     strm_path TEXT,
                     resolved_file_id TEXT,
                     resolved_file_name TEXT,
@@ -231,6 +232,13 @@ class CatalogStore:
                 connection.execute(
                     "ALTER TABLE resource ADD COLUMN detected_group_name TEXT"
                 )
+            if "imdb_id" not in resource_columns:
+                connection.execute(
+                    "ALTER TABLE resource ADD COLUMN imdb_id TEXT"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_resource_imdb ON resource(imdb_id)"
+            )
             connection.execute("""
                 UPDATE resource
                 SET strm_status = CASE
@@ -917,6 +925,8 @@ class CatalogStore:
         offset: int = 0,
         ready_only: bool = True,
         unbuilt_only: bool = False,
+        imdb_id: str = "",
+        tmdb_ids: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """从本地镜像目录搜索资源，不访问腾讯文档或 115。"""
         escaped = (
@@ -938,28 +948,40 @@ class CatalogStore:
             status_clause = (
                 "AND status NOT IN ('removed', 'invalid_share')"
             )
+        search_conditions = [
+            "title LIKE ? ESCAPE '\\'",
+            "year LIKE ? ESCAPE '\\'",
+            "version LIKE ? ESCAPE '\\'",
+        ]
+        parameters: List[Any] = [pattern, pattern, pattern]
+        normalized_imdb_id = str(imdb_id or "").strip()
+        if normalized_imdb_id:
+            search_conditions.append("imdb_id = ?")
+            parameters.append(normalized_imdb_id)
+        normalized_tmdb_ids = [
+            str(value).strip() for value in (tmdb_ids or []) if str(value).strip()
+        ]
+        if normalized_tmdb_ids:
+            placeholders = ",".join("?" for _ in normalized_tmdb_ids)
+            search_conditions.append(f"tmdb_id IN ({placeholders})")
+            parameters.extend(normalized_tmdb_ids)
         query = f"""
             SELECT * FROM resource
-            WHERE (title LIKE ? ESCAPE '\\'
-                   OR year LIKE ? ESCAPE '\\'
-                   OR version LIKE ? ESCAPE '\\')
+            WHERE ({' OR '.join(search_conditions)})
               {status_clause}
             ORDER BY CASE WHEN title = ? THEN 0 ELSE 1 END,
                      title, year, version
             LIMIT ? OFFSET ?
         """
         with self.connection() as connection:
-            rows = connection.execute(
-                query,
-                (
-                    pattern,
-                    pattern,
-                    pattern,
+            parameters.extend(
+                [
                     str(keyword or "").strip(),
                     min(max(int(limit), 1), 100),
                     max(int(offset), 0),
-                ),
-            ).fetchall()
+                ]
+            )
+            rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
     def upsert_download_task(self, task: Dict[str, Any]) -> None:
@@ -1148,6 +1170,7 @@ class CatalogStore:
             "media_source",
             "media_id",
             "tmdb_id",
+            "imdb_id",
             "strm_path",
             "resolved_file_id",
             "resolved_file_name",

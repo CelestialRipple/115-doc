@@ -347,6 +347,7 @@ class LibraryBuilder:
             source="",
             media_id="",
             tmdb_id="",
+            imdb_id="",
         )
         return meta, mediainfo
 
@@ -1170,6 +1171,7 @@ class LibraryBuilder:
                     ),
                     media_id=str(getattr(mediainfo, "media_id", None) or ""),
                     tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
+                    imdb_id=str(getattr(mediainfo, "imdb_id", None) or ""),
                     strm_path=output_path,
                 )
                 self._remember_metadata(resource, mediainfo, directory)
@@ -1340,6 +1342,7 @@ class LibraryBuilder:
                             media_source="",
                             media_id="",
                             tmdb_id="",
+                            imdb_id="",
                             strm_path=output_path,
                         )
                         success_count += 1
@@ -1360,6 +1363,7 @@ class LibraryBuilder:
                             ),
                             media_id=str(getattr(mediainfo, "media_id", None) or ""),
                             tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
+                            imdb_id=str(getattr(mediainfo, "imdb_id", None) or ""),
                             strm_path=output_path,
                         )
                         success_count += 1
@@ -1377,6 +1381,7 @@ class LibraryBuilder:
                             ),
                             media_id=str(getattr(mediainfo, "media_id", None) or ""),
                             tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
+                            imdb_id=str(getattr(mediainfo, "imdb_id", None) or ""),
                             strm_path=output_path,
                         )
                         self._remember_metadata(resource, mediainfo, directory)

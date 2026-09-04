@@ -179,6 +179,29 @@ def test_local_search_can_show_only_resources_without_strm(tmp_path: Path) -> No
     ) == []
 
 
+def test_local_search_supports_moviepilot_imdb_lookup(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+    store.update_resource_status(
+        "resource-1",
+        "ready",
+        strm_status="ready",
+        tmdb_id="129",
+        imdb_id="tt0245429",
+    )
+
+    by_imdb = store.search_resources("tt0245429", imdb_id="tt0245429")
+    assert [item["resource_id"] for item in by_imdb] == ["resource-1"]
+
+    by_tmdb_mapping = store.search_resources(
+        "tt0245429",
+        imdb_id="tt-does-not-exist",
+        tmdb_ids=["129"],
+    )
+    assert [item["resource_id"] for item in by_tmdb_mapping] == ["resource-1"]
+
+
 def test_find_metadata_source_matches_media_identity(tmp_path: Path) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")

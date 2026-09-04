@@ -286,6 +286,8 @@ def main() -> None:
 
         results = plugin.search_torrents({}, "测试电影")
         assert len(results) == 1
+        assert results[0].title == "测试电影 (2024)"
+        assert "4K" in results[0].description
         assert results[0].site_downloader == "腾讯文档115直链"
         assert parse_download_marker(results[0].enclosure) == "smoke-resource"
         assert "/resources/save/smoke-resource" in results[0].page_url
@@ -299,6 +301,15 @@ def main() -> None:
             module["async_search_torrents"]({}, "测试电影")
         )
         assert len(async_results) == 1
+
+        plugin._imdb_tmdb_cache["tt0000001::电影"] = ("1",)
+        imdb_results = plugin.search_torrents(
+            {},
+            "tt0000001",
+            MediaType.MOVIE,
+        )
+        assert len(imdb_results) == 1
+        assert imdb_results[0].imdbid == "tt0000001"
 
         store.upsert_download_task(
             {
