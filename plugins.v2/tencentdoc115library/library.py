@@ -6,6 +6,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from inspect import signature
 from pathlib import Path
 from threading import Event, Lock
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
@@ -121,6 +122,10 @@ class LibraryBuildError(RuntimeError):
     """媒体识别、STRM 生成或本地刮削错误"""
 
 
+class MediaNotRecognizedError(LibraryBuildError):
+    """MoviePilot 未识别媒体；调用方可降级为仅生成 STRM。"""
+
+
 class LibraryBuilder:
     """
     把目录记录限量生成为本地 STRM 和 MoviePilot 元数据
@@ -155,12 +160,48 @@ class LibraryBuilder:
         self._metadata_inflight: Dict[Tuple[str, str], Event] = {}
 
     @staticmethod
+    def _effective_media_type(resource: Dict[str, Any]) -> str:
+        return str(
+            resource.get("detected_media_type")
+            or resource.get("media_type")
+            or ""
+        )
+
+    @staticmethod
+    def _effective_group_name(resource: Dict[str, Any]) -> str:
+        return str(
+            resource.get("detected_group_name")
+            or resource.get("group_name")
+            or ""
+        )
+
+    def _is_mixed_resource(self, resource: Dict[str, Any]) -> bool:
+        sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
+        return str(sheet.get("media_mode") or "").strip().lower() == "mixed"
+
     def _media_type(
+        self,
         resource: Dict[str, Any],
         source_files: Optional[List[Dict[str, Any]]] = None,
     ) -> MediaType:
+        detected_type = str(resource.get("detected_media_type") or "").lower()
+        if detected_type:
+            if any(keyword in detected_type for keyword in TV_TYPE_KEYWORDS):
+                return MediaType.TV
+            if any(keyword in detected_type for keyword in MOVIE_TYPE_KEYWORDS):
+                return MediaType.MOVIE
         raw_type = str(resource.get("media_type") or "").lower()
         group_name = str(resource.get("group_name") or "").lower()
+        sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
+        is_mixed = str(sheet.get("media_mode") or "").strip().lower() == "mixed"
+        # 混合表中的类型标签只作提示。文件名/目录出现季集特征时优先按剧集处理。
+        if is_mixed and source_files and any(
+            self._looks_like_tv_path(
+                str(source_file.get("file_path") or source_file.get("file_name") or "")
+            )
+            for source_file in source_files
+        ):
+            return MediaType.TV
         if any(keyword in raw_type for keyword in TV_TYPE_KEYWORDS):
             return MediaType.TV
         if any(keyword in raw_type for keyword in MOVIE_TYPE_KEYWORDS):
@@ -176,6 +217,33 @@ class LibraryBuilder:
             return MediaType.TV
         return MediaType.MOVIE
 
+    def _save_detected_type(
+        self,
+        resource: Dict[str, Any],
+        media_type: MediaType,
+    ) -> None:
+        """持久化混合表的最终类型，并把剧集稳定路由到“分组-剧集”。"""
+        if not self._is_mixed_resource(resource):
+            return
+        sheet = self.store.get_sheet(str(resource.get("sheet_id") or "")) or {}
+        base_group = str(
+            sheet.get("group_name") or resource.get("group_name") or "未分组"
+        )
+        if base_group.endswith("-剧集"):
+            base_group = base_group[:-3]
+        detected_group = (
+            f"{base_group}-剧集" if media_type == MediaType.TV else base_group
+        )
+        detected_type = getattr(media_type, "value", str(media_type))
+        resource["detected_media_type"] = detected_type
+        resource["detected_group_name"] = detected_group
+        self.store.update_resource_status(
+            str(resource.get("resource_id") or ""),
+            "processing",
+            detected_media_type=detected_type,
+            detected_group_name=detected_group,
+        )
+
     @staticmethod
     def _looks_like_tv_path(value: str) -> bool:
         """判断完整分享路径是否包含季、集标记。"""
@@ -184,7 +252,11 @@ class LibraryBuilder:
         )
 
     @staticmethod
-    def _recognize(resource: Dict[str, Any], media_type: MediaType) -> Tuple[Any, Any]:
+    def _recognize(
+        resource: Dict[str, Any],
+        media_type: MediaType,
+        allow_type_correction: bool = False,
+    ) -> Tuple[Any, Any]:
         title = str(resource.get("title") or "").strip()
         version = str(resource.get("version") or "").strip()
         meta = MetaInfo(title=title, subtitle=version or None)
@@ -196,13 +268,16 @@ class LibraryBuilder:
             "obtain_images": True,
         }
         try:
-            if "mtype" in signature(recognize_method).parameters:
+            if (
+                not allow_type_correction
+                and "mtype" in signature(recognize_method).parameters
+            ):
                 recognize_kwargs["mtype"] = media_type
         except (TypeError, ValueError):
             pass
         mediainfo = recognize_method(**recognize_kwargs)
         if not mediainfo:
-            raise LibraryBuildError(
+            raise MediaNotRecognizedError(
                 f"MoviePilot 未识别到媒体：{title}"
                 + (f" ({meta.year})" if meta.year else "")
             )
@@ -210,13 +285,34 @@ class LibraryBuilder:
             raise LibraryBuildError(
                 f"MoviePilot 返回了不支持的媒体类型：{mediainfo.type}"
             )
-        if mediainfo.type != media_type:
+        if mediainfo.type != media_type and not allow_type_correction:
             expected_type = getattr(media_type, "value", str(media_type))
             actual_type = getattr(mediainfo.type, "value", str(mediainfo.type))
             raise LibraryBuildError(
                 f"MoviePilot 媒体类型不匹配：要求 {expected_type}，"
                 f"实际返回 {actual_type}；已拒绝写入错误元数据"
             )
+        if mediainfo.type != media_type:
+            meta.type = mediainfo.type
+        return meta, mediainfo
+
+    @staticmethod
+    def _fallback_media(
+        resource: Dict[str, Any], media_type: MediaType
+    ) -> Tuple[Any, Any]:
+        """构造仅用于目录和 STRM 命名的最小媒体信息，不伪造元数据 ID。"""
+        title = str(resource.get("title") or "未命名").strip()
+        year = str(resource.get("year") or "").strip()
+        meta = SimpleNamespace(title=title, year=year or None, type=media_type)
+        mediainfo = SimpleNamespace(
+            title=title,
+            year=year or None,
+            type=media_type,
+            media_source="",
+            source="",
+            media_id="",
+            tmdb_id="",
+        )
         return meta, mediainfo
 
     @staticmethod
@@ -235,7 +331,7 @@ class LibraryBuilder:
         if not output_root:
             raise LibraryBuildError("未配置 STRM 输出目录")
         root = Path(output_root).expanduser().resolve()
-        group = safe_path_segment(str(resource.get("group_name") or "未分组"))
+        group = safe_path_segment(self._effective_group_name(resource) or "未分组")
         media_directory = self._media_directory_name(resource, mediainfo)
         target_parent = root / group
         if config.get("separate_source_folders"):
@@ -255,7 +351,7 @@ class LibraryBuilder:
         """生成跨工作表复用元数据的稳定媒体键。"""
         media_type = str(
             getattr(mediainfo, "type", None)
-            or resource.get("media_type")
+            or LibraryBuilder._effective_media_type(resource)
             or ""
         )
         identity = str(
@@ -294,7 +390,7 @@ class LibraryBuilder:
         record = self.store.find_metadata_source(
             media_id=str(getattr(mediainfo, "media_id", None) or ""),
             tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
-            media_type=str(resource.get("media_type") or ""),
+            media_type=self._effective_media_type(resource),
             title=str(getattr(mediainfo, "title", None) or resource.get("title") or ""),
             year=str(getattr(mediainfo, "year", None) or resource.get("year") or ""),
             exclude_resource_id=str(resource.get("resource_id") or ""),
@@ -593,7 +689,9 @@ class LibraryBuilder:
             source_name = safe_path_segment(
                 str(sheet.get("title") or sheet.get("source_title") or "工作表")
             )
-            group_name = safe_path_segment(str(resource.get("group_name") or "未分组"))
+            group_name = safe_path_segment(
+                self._effective_group_name(resource) or "未分组"
+            )
             media_name = safe_path_segment(source_directory.name)
             target_directory = (root / group_name / source_name / media_name).resolve()
             migration_items.append(
@@ -1071,6 +1169,7 @@ class LibraryBuilder:
                     )
                     source_files = self.resolver.list_video_files(resource["share_url"])
                     media_type = self._media_type(resource, source_files)
+                    mixed_resource = self._is_mixed_resource(resource)
                     current_stage = "recognizing"
                     self.store.update_resource_status(
                         resource["resource_id"],
@@ -1078,13 +1177,27 @@ class LibraryBuilder:
                         strm_status="validated",
                         scrape_status="recognizing",
                     )
-                    meta, mediainfo = self._recognize(resource, media_type)
+                    recognition_error = ""
+                    try:
+                        meta, mediainfo = self._recognize(
+                            resource,
+                            media_type,
+                            allow_type_correction=mixed_resource,
+                        )
+                        # MoviePilot 的识别结论优先于混合表格中不可靠的类型标签。
+                        media_type = mediainfo.type
+                    except MediaNotRecognizedError as error:
+                        recognition_error = str(error)
+                        meta, mediainfo = self._fallback_media(resource, media_type)
+                    self._save_detected_type(resource, media_type)
                     current_stage = "generating"
                     self.store.update_resource_status(
                         resource["resource_id"],
                         "processing",
                         strm_status="generating",
-                        scrape_status="recognized",
+                        scrape_status=(
+                            "unrecognized" if recognition_error else "recognized"
+                        ),
                     )
                     directory = self._base_directory(resource, mediainfo)
                     directory_size_before = directory_size(directory)
@@ -1106,7 +1219,7 @@ class LibraryBuilder:
                         )
                     deferred_scrape = False
                     metadata_reused = False
-                    if scrape_enabled:
+                    if scrape_enabled and not recognition_error:
                         current_stage = "scraping"
                         self.store.update_resource_status(
                             resource["resource_id"],
@@ -1141,7 +1254,23 @@ class LibraryBuilder:
                                 logger.info(
                                     f"复用已有元数据完成：{resource['title']}"
                                 )
-                    if not deferred_scrape and not scrape_enabled:
+                    if recognition_error:
+                        self.store.update_resource_status(
+                            resource["resource_id"],
+                            "ready",
+                            strm_status="ready",
+                            scrape_status="unrecognized",
+                            media_source="",
+                            media_id="",
+                            tmdb_id="",
+                            strm_path=output_path,
+                        )
+                        success_count += 1
+                        logger.warning(
+                            f"MoviePilot 未识别，已降级生成 STRM："
+                            f"{resource['title']}"
+                        )
+                    elif not deferred_scrape and not scrape_enabled:
                         self.store.update_resource_status(
                             resource["resource_id"],
                             "ready",

@@ -1,8 +1,11 @@
 import os
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
+import tencentdoc115library.library as library_module
 from tencentdoc115library.library import LibraryBuilder
+from tencentdoc115library.library import MediaType
 from tencentdoc115library.store import CatalogStore
 
 
@@ -107,12 +110,12 @@ def test_migrate_shared_old_directory_splits_strm_without_rescraping(
         assert (target_a / "movie.nfo").stat().st_ino == (
             target_b / "movie.nfo"
         ).stat().st_ino
-    assert store.get_resource("resource-a")["strm_path"] == str(
+    assert Path(store.get_resource("resource-a")["strm_path"]).resolve() == (
         target_a / first_strm.name
-    )
-    assert store.get_resource("resource-b")["strm_path"] == str(
+    ).resolve()
+    assert Path(store.get_resource("resource-b")["strm_path"]).resolve() == (
         target_b / second_strm.name
-    )
+    ).resolve()
 
 
 def test_build_honors_pause_before_starting_next_resource(tmp_path: Path) -> None:
@@ -148,3 +151,147 @@ def test_build_honors_pause_before_starting_next_resource(tmp_path: Path) -> Non
     assert result["status"] == "paused"
     assert result["processed"] == 0
     assert store.get_resource("resource-a")["status"] == "pending"
+
+
+def test_mixed_sheet_accepts_moviepilot_tv_result_and_changes_group(
+    tmp_path: Path,
+) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    store.upsert_sheets([_sheet("sheet-a", "星火4K全站资源")])
+    store.configure_sheets(
+        {"sheet-a": {"enabled": True, "group_name": "星火", "media_mode": "mixed"}}
+    )
+    checkpoint = store.begin_sheet_scan("sheet-a")
+    resource = _resource(
+        "resource-a", "魔奇少年 第二季", "https://115.com/s/example"
+    )
+    resource["group_name"] = "星火"
+    store.save_page(
+        "sheet-a", checkpoint["scan_id"], 3, {}, [resource], 1
+    )
+    resource = store.get_resource("resource-a")
+
+    class TelevisionMediaChain:
+        @staticmethod
+        def recognize_by_meta(metainfo, obtain_images=False):
+            return SimpleNamespace(
+                title="魔奇少年",
+                year="2013",
+                type=MediaType.TV,
+                media_id="tv-1",
+                tmdb_id="60637",
+            )
+
+    class Resolver:
+        @staticmethod
+        def list_video_files(_share_url):
+            return [
+                {
+                    "file_id": "episode-1",
+                    "file_name": "魔奇少年.S02E01.mkv",
+                    "file_path": "/魔奇少年/Season 02/魔奇少年.S02E01.mkv",
+                    "size": 1024,
+                }
+            ]
+
+    original_media_chain = library_module.MediaChain
+    library_module.MediaChain = TelevisionMediaChain
+    try:
+        builder = LibraryBuilder(
+            store=store,
+            resolver=Resolver(),
+            config_provider=lambda: {
+                "output_root": str(tmp_path / "output"),
+                "public_base_url": "http://moviepilot:3000",
+                "playback_token": "test-token",
+                "scrape_metadata": False,
+            },
+            stop_event=Event(),
+        )
+        # 模拟表格标签把动画剧集预判为电影；最终以 MoviePilot 返回类型为准。
+        builder._media_type = lambda _resource, _files=None: MediaType.MOVIE
+        result = builder.build(limit=1)
+    finally:
+        library_module.MediaChain = original_media_chain
+
+    updated = store.get_resource("resource-a")
+    assert result["success"] == 1
+    assert updated["detected_media_type"] == "电视剧"
+    assert updated["detected_group_name"] == "星火-剧集"
+    assert "星火-剧集" in Path(updated["strm_path"]).parts
+    episode_strms = list(Path(updated["strm_path"]).rglob("*.strm"))
+    assert len(episode_strms) == 1
+    assert episode_strms[0].parent.name == "Season 02"
+
+
+def test_unrecognized_movie_still_generates_strm_without_metadata(
+    tmp_path: Path,
+) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    store.upsert_sheets([_sheet("sheet-a", "星火4K全站资源")])
+    store.configure_sheets(
+        {"sheet-a": {"enabled": True, "group_name": "星火", "media_mode": "mixed"}}
+    )
+    checkpoint = store.begin_sheet_scan("sheet-a")
+    resource = _resource(
+        "resource-a", "77年航空港", "https://115.com/s/example"
+    )
+    resource["year"] = "1977"
+    resource["group_name"] = "星火"
+    store.save_page(
+        "sheet-a", checkpoint["scan_id"], 3, {}, [resource], 1
+    )
+
+    class UnrecognizedMediaChain:
+        @staticmethod
+        def recognize_by_meta(metainfo, obtain_images=False):
+            return None
+
+    class Resolver:
+        @staticmethod
+        def list_video_files(_share_url):
+            return [
+                {
+                    "file_id": "file-1",
+                    "file_name": "77年航空港.1977.mkv",
+                    "file_path": "/77年航空港.1977.mkv",
+                    "size": 1024,
+                }
+            ]
+
+        @staticmethod
+        def choose_movie_file(files):
+            return files[0]
+
+    original_media_chain = library_module.MediaChain
+    library_module.MediaChain = UnrecognizedMediaChain
+    try:
+        builder = LibraryBuilder(
+            store=store,
+            resolver=Resolver(),
+            config_provider=lambda: {
+                "output_root": str(tmp_path / "output"),
+                "public_base_url": "http://moviepilot:3000",
+                "playback_token": "test-token",
+                "scrape_metadata": True,
+            },
+            stop_event=Event(),
+        )
+        result = builder.build(limit=1)
+    finally:
+        library_module.MediaChain = original_media_chain
+
+    updated = store.get_resource("resource-a")
+    assert result["success"] == 1
+    assert result["failed"] == 0
+    assert updated["status"] == "ready"
+    assert updated["strm_status"] == "ready"
+    assert updated["scrape_status"] == "unrecognized"
+    assert updated["detected_media_type"] == "电影"
+    assert updated["detected_group_name"] == "星火"
+    strm_path = Path(updated["strm_path"])
+    assert strm_path.is_file()
+    assert "TencentDoc115Library/play/resource-a" in strm_path.read_text(
+        encoding="utf-8"
+    )
+    assert not list(strm_path.parent.glob("*.nfo"))

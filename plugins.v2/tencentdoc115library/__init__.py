@@ -95,7 +95,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.9.8"
+    plugin_version = "0.9.9"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -356,8 +356,16 @@ class TencentDoc115Library(_PluginBase):
     @staticmethod
     def _resource_media_type(resource: Dict[str, Any]) -> MediaType:
         """按表格类型和分组判断检索结果的影视类型。"""
-        raw_type = str(resource.get("media_type") or "").lower()
-        group_name = str(resource.get("group_name") or "").lower()
+        raw_type = str(
+            resource.get("detected_media_type")
+            or resource.get("media_type")
+            or ""
+        ).lower()
+        group_name = str(
+            resource.get("detected_group_name")
+            or resource.get("group_name")
+            or ""
+        ).lower()
         if any(
             keyword in raw_type or keyword in group_name
             for keyword in ("电视剧", "剧集", "连续剧", "tv", "番剧")
@@ -397,8 +405,13 @@ class TencentDoc115Library(_PluginBase):
             display_title = f"{title} ({year})" if year else title
             if version:
                 display_title = f"{display_title} {version}"
+            effective_group = str(
+                resource.get("detected_group_name")
+                or resource.get("group_name")
+                or "腾讯文档"
+            )
             details = [
-                str(resource.get("group_name") or "腾讯文档"),
+                effective_group,
                 version,
                 f"评分 {resource['rating']}" if resource.get("rating") else "",
             ]
@@ -415,7 +428,7 @@ class TencentDoc115Library(_PluginBase):
                     labels=[
                         "腾讯文档",
                         "115分享",
-                        str(resource.get("group_name") or "未分组"),
+                        effective_group,
                     ],
                     pri_order=100,
                     category=media_type.value,
@@ -1695,6 +1708,7 @@ class TencentDoc115Library(_PluginBase):
             "scraping": "正在刮削元数据",
             "ready": "刮削完成",
             "skipped": "已关闭刮削",
+            "unrecognized": "未识别（仅 STRM）",
             "failed": "刮削失败",
             "blocked": "前序失败，未刮削",
         }
@@ -1715,6 +1729,8 @@ class TencentDoc115Library(_PluginBase):
         scrape_ready = int(scrape_counts.get("ready") or 0) + int(
             scrape_counts.get("skipped") or 0
         )
+        scrape_unrecognized = int(scrape_counts.get("unrecognized") or 0)
+        scrape_ready += scrape_unrecognized
         scrape_failed = int(scrape_counts.get("failed") or 0)
         scrape_blocked = int(scrape_counts.get("blocked") or 0)
         scrape_waiting = max(
@@ -1883,6 +1899,7 @@ class TencentDoc115Library(_PluginBase):
                                 "props": {"class": "mb-1"},
                                 "text": (
                                     f"元数据刮削：{scrape_ready}/{active_resources} 完成 · "
+                                    f"{scrape_unrecognized} 未识别但已生成 · "
                                     f"{scrape_waiting} 等待 · {scrape_blocked} 前序阻断 · "
                                     f"{scrape_failed} 失败 · {scrape_percent}%"
                                 ),

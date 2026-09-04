@@ -56,8 +56,16 @@ class DirectDownloadManager:
 
     @staticmethod
     def _is_tv(resource: Dict[str, Any]) -> bool:
-        media_type = str(resource.get("media_type") or "").lower()
-        group_name = str(resource.get("group_name") or "").lower()
+        media_type = str(
+            resource.get("detected_media_type")
+            or resource.get("media_type")
+            or ""
+        ).lower()
+        group_name = str(
+            resource.get("detected_group_name")
+            or resource.get("group_name")
+            or ""
+        ).lower()
         return any(
             keyword in media_type or keyword in group_name
             for keyword in ("电视剧", "剧集", "连续剧", "tv", "番剧")

@@ -276,3 +276,25 @@ def test_build_progress_is_visible_and_all_failures_can_be_requeued(
     assert store.retry_all_failed_resources() == 0
     assert store.retry_resources(["resource-1"]) == 0
     assert store.get_resource("resource-1")["status"] == "invalid_share"
+
+
+def test_unrecognized_strm_can_be_requeued_for_future_recognition(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+    store.update_resource_status(
+        "resource-1",
+        "ready",
+        "MoviePilot 未识别到媒体；已仅生成 STRM",
+        strm_status="ready",
+        scrape_status="unrecognized",
+        strm_path="/media/movie.strm",
+    )
+
+    assert store.retry_all_failed_resources() == 1
+    resource = store.get_resource("resource-1")
+    assert resource["status"] == "pending"
+    assert resource["strm_status"] == "pending"
+    assert resource["scrape_status"] == "pending"

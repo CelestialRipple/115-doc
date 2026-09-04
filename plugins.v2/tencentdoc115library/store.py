@@ -7,7 +7,7 @@ from threading import RLock
 from typing import Any, Dict, Generator, List, Optional, Tuple
 from uuid import uuid4
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def utc_now() -> str:
@@ -92,9 +92,11 @@ class CatalogStore:
                     version TEXT,
                     share_url TEXT NOT NULL,
                     media_type TEXT,
+                    detected_media_type TEXT,
                     rating TEXT,
                     year TEXT,
                     group_name TEXT NOT NULL,
+                    detected_group_name TEXT,
                     row_hash TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     strm_status TEXT NOT NULL DEFAULT 'pending',
@@ -219,6 +221,14 @@ class CatalogStore:
                 connection.execute(
                     "ALTER TABLE resource ADD COLUMN scrape_status "
                     "TEXT NOT NULL DEFAULT 'pending'"
+                )
+            if "detected_media_type" not in resource_columns:
+                connection.execute(
+                    "ALTER TABLE resource ADD COLUMN detected_media_type TEXT"
+                )
+            if "detected_group_name" not in resource_columns:
+                connection.execute(
+                    "ALTER TABLE resource ADD COLUMN detected_group_name TEXT"
                 )
             connection.execute("""
                 UPDATE resource
@@ -378,7 +388,8 @@ class CatalogStore:
                         "UPDATE resource SET group_name = CASE "
                         "WHEN ? = 'mixed' AND (media_type LIKE '%剧集%' "
                         "OR LOWER(media_type) LIKE '%tv%' OR media_type LIKE '%番剧%') "
-                        "THEN ? ELSE ? END, status = 'pending', "
+                        "THEN ? ELSE ? END, detected_group_name = NULL, "
+                        "status = 'pending', "
                         "strm_status = 'pending', scrape_status = 'pending', "
                         "strm_path = NULL, last_error = NULL, updated_at = ? "
                         "WHERE sheet_id = ? AND status <> 'removed'",
@@ -566,6 +577,8 @@ class CatalogStore:
                         scrape_status = CASE WHEN ? THEN 'pending' ELSE resource.scrape_status END,
                         last_error = CASE WHEN ? THEN NULL ELSE resource.last_error END,
                         strm_path = CASE WHEN ? THEN NULL ELSE resource.strm_path END,
+                        detected_media_type = CASE WHEN ? THEN NULL ELSE resource.detected_media_type END,
+                        detected_group_name = CASE WHEN ? THEN NULL ELSE resource.detected_group_name END,
                         resolved_file_id = CASE WHEN ? THEN NULL ELSE resource.resolved_file_id END,
                         resolved_file_name = CASE WHEN ? THEN NULL ELSE resource.resolved_file_name END,
                         resolved_at = CASE WHEN ? THEN NULL ELSE resource.resolved_at END,
@@ -587,6 +600,8 @@ class CatalogStore:
                         scan_id,
                         now,
                         now,
+                        changed,
+                        changed,
                         changed,
                         changed,
                         changed,
@@ -953,7 +968,9 @@ class CatalogStore:
             "(" + " OR ".join(identity_conditions) + ")",
         ]
         if str(media_type or "").strip():
-            conditions.append("media_type = ?")
+            conditions.append(
+                "COALESCE(NULLIF(detected_media_type, ''), media_type) = ?"
+            )
             parameters.append(str(media_type).strip())
         if exclude_resource_id:
             conditions.append("resource_id <> ?")
@@ -992,6 +1009,8 @@ class CatalogStore:
             "resolved_at",
             "strm_status",
             "scrape_status",
+            "detected_media_type",
+            "detected_group_name",
         }
         updates = ["status = ?", "last_error = ?", "updated_at = ?"]
         parameters: List[Any] = [status, error, utc_now()]
@@ -1128,7 +1147,7 @@ class CatalogStore:
         return int(cursor.rowcount)
 
     def retry_all_failed_resources(self) -> int:
-        """把全部生成、分享和刮削失败资源重新加入待生成队列。"""
+        """把失败及“未识别但已生成 STRM”的资源重新加入待生成队列。"""
         with self._lock, self.connection() as connection:
             cursor = connection.execute(
                 """
@@ -1136,6 +1155,7 @@ class CatalogStore:
                 SET status = 'pending', strm_status = 'pending',
                     scrape_status = 'pending', last_error = NULL, updated_at = ?
                 WHERE status IN ('share_error', 'metadata_error', 'build_error')
+                   OR (status = 'ready' AND scrape_status = 'unrecognized')
                 """,
                 (utc_now(),),
             )
@@ -1190,7 +1210,10 @@ class CatalogStore:
                 ).fetchall()
             }
             current_resources = [dict(row) for row in connection.execute("""
-                    SELECT resource_id, title, group_name, strm_status,
+                    SELECT resource_id, title,
+                           COALESCE(NULLIF(detected_group_name, ''), group_name)
+                               AS group_name,
+                           strm_status,
                            scrape_status, updated_at
                     FROM resource
                     WHERE status = 'processing'
