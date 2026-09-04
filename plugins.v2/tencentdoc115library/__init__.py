@@ -51,6 +51,11 @@ from .schemas import (
     ResourceRetryRequest,
     SyncActionRequest,
 )
+from .search_bridge import (
+    LOCAL_INDEXER_MARKER,
+    LocalSearchResults,
+    MoviePilotSearchBridge,
+)
 from .storage_limit import format_gib
 from .store import CatalogStore
 
@@ -112,7 +117,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.10.2"
+    plugin_version = "0.10.3"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -140,6 +145,10 @@ class TencentDoc115Library(_PluginBase):
         self._manual_importer: Optional[ManualLibraryImporter] = None
         self._direct_downloader: Optional[DirectDownloadManager] = None
         self._gateway: Optional[DirectPlayGateway] = None
+        self._search_bridge = MoviePilotSearchBridge(
+            lambda: self._enabled
+            and bool(self._config.get("native_search_enabled", True))
+        )
         self._pipeline_status: Dict[str, Any] = {
             "phase": "idle",
             "message": "尚未启动同步全部任务",
@@ -220,6 +229,12 @@ class TencentDoc115Library(_PluginBase):
             resolver=self._resolver,
             config_provider=self._current_config,
         )
+        if (
+            self._enabled
+            and bool(self._config.get("native_search_enabled", True))
+            and self._search_bridge.install()
+        ):
+            logger.info("已启用无站点原生搜索兼容桥接")
         self._gateway.start_background()
 
     def _current_config(self) -> Dict[str, Any]:
@@ -409,8 +424,9 @@ class TencentDoc115Library(_PluginBase):
         page: Optional[int] = 0,
     ) -> List[TorrentInfo]:
         """搜索插件本地 SQLite 镜像；不会访问腾讯文档或 115。"""
+        local_indexer = bool((site or {}).get(LOCAL_INDEXER_MARKER))
         if not self._store or not str(keyword or "").strip():
-            return []
+            return LocalSearchResults([]) if local_indexer else []
         page_size = min(
             max(int(self._config.get("search_page_size") or 50), 1),
             100,
@@ -487,6 +503,8 @@ class TencentDoc115Library(_PluginBase):
                     category=media_type.value,
                 )
             )
+        if local_indexer:
+            return LocalSearchResults(results)
         return results
 
     def _library_save_url(self, resource_id: str) -> str:
@@ -2339,6 +2357,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
 
     def stop_service(self) -> None:
         """通知进行中的同步或构建在当前小步骤后安全退出。"""
+        self._search_bridge.uninstall()
         self._stop_event.set()
         self._pause_event.set()
         if self._direct_downloader:
