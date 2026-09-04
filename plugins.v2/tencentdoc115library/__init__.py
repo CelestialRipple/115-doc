@@ -58,6 +58,7 @@ from .search_bridge import (
     LocalSearchResults,
     MoviePilotSearchBridge,
 )
+from .source_link import is_offline_link
 from .storage_limit import format_gib
 from .store import CatalogStore
 
@@ -100,6 +101,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "request_interval": 0.5,
     "request_retries": 4,
     "direct_url_cache_ttl": 6000,
+    "offline_playback_enabled": True,
+    "offline_temp_path": "/temp/tencentdoc115library",
+    "offline_wait_seconds": 60,
+    "offline_poll_seconds": 2,
+    "offline_retention_hours": 24,
+    "offline_cleanup_cron": "*/30 * * * *",
+    "offline_clear_recycle": True,
     "download_retries": 4,
     "download_chunk_size": 1048576,
     "video_extensions": ".mp4,.mkv,.ts,.m2ts,.avi,.mov,.wmv,.flv,.webm,.iso",
@@ -117,9 +125,9 @@ class TencentDoc115Library(_PluginBase):
     """将腾讯文档中的 115 分享资源构建为可按需播放的媒体库。"""
 
     plugin_name = "腾讯文档115媒体库"
-    plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
+    plugin_desc = "同步115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.10.6"
+    plugin_version = "0.11.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -515,7 +523,7 @@ class TencentDoc115Library(_PluginBase):
                     seeders=1,
                     labels=[
                         "腾讯文档",
-                        "115分享",
+                        "115离线" if is_offline_link(resource["share_url"]) else "115分享",
                         effective_group,
                         "右下角ⓘ保存" if is_unbuilt else "已入库",
                     ],
@@ -755,7 +763,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         group_name: str,
         media_mode: str,
     ) -> Dict[str, Any]:
-        """匿名解析手动115分享，并只构建本次新增或变化的资源。"""
+        """解析手动资源，并只构建本次新增或变化的资源。"""
         if not self._manual_importer or not self._builder:
             return {"status": "failed", "message": "插件尚未初始化"}
         imported = self._manual_importer.import_links(
@@ -782,7 +790,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                 "status": "completed",
                 "message": (
                     f"手动导入完成：0 条需要生成，{imported['unchanged']} 条未变化，"
-                    f"{imported['failed']} 条分享无效或解析失败"
+                    f"{imported['failed']} 条链接无效或解析失败"
                 ),
             }
         built = self._builder.build(
@@ -797,7 +805,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                 f"STRM/刮削 {built.get('success', 0)} 成功、"
                 f"{built.get('failed', 0)} 失败；"
                 f"另有 {imported['unchanged']} 条未变化、"
-                f"{imported['failed']} 条分享无效或解析失败"
+                f"{imported['failed']} 条链接无效或解析失败"
             ),
         }
 
@@ -805,7 +813,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         self,
         payload: Optional[ManualImportRequest] = Body(default=None),
     ) -> Response:
-        """单条或批量添加115分享，并在后台解析、刮削和生成 STRM。"""
+        """单条或批量添加115分享、磁力或ED2K并生成 STRM。"""
         if not self._manual_importer or not self._builder:
             return Response(success=False, message="插件尚未初始化")
         action = payload or ManualImportRequest()
@@ -824,11 +832,11 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             if media_mode not in {"movie", "tv", "mixed"}:
                 raise ManualImportError("媒体类型必须是电影、剧集或自动识别")
             if not self._manual_importer.parse_entries(links):
-                raise ManualImportError("没有识别到有效的115分享链接")
+                raise ManualImportError("没有识别到有效的115分享、磁力或ED2K链接")
         except ManualImportError as error:
             return Response(success=False, message=str(error))
         return self._submit(
-            "导入自定义115资源",
+            "导入自定义资源",
             self._import_manual_resources,
             links,
             group_name,
@@ -1173,6 +1181,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         snapshot["task"] = task
         snapshot["pipeline"] = self._pipeline_snapshot()
         snapshot["storage"] = self._builder.storage_snapshot() if self._builder else {}
+        snapshot["offline_playback"] = self._store.offline_playback_snapshot()
         snapshot["direct_gateway"] = (
             self._gateway.status() if self._gateway else {"state": "disabled"}
         )
@@ -1202,6 +1211,17 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         if not self._store or not self._builder:
             return Response(success=False, message="插件尚未初始化")
         try:
+            offline_cleanup = (
+                self._resolver.cleanup_offline_cache(include_all=True)
+                if self._resolver
+                else {"failed": 0, "removed": 0}
+            )
+            if offline_cleanup.get("failed"):
+                return Response(
+                    success=False,
+                    message="115离线缓存清理失败，已保留数据库记录供稍后重试",
+                    data=offline_cleanup,
+                )
             cleanup = self._builder.clear_generated_output()
             self._store.clear_all()
             if self._gateway:
@@ -1245,7 +1265,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         token: str = Query(default=""),
         file_id: Optional[str] = Query(default=None),
     ) -> HttpResponse:
-        """校验 STRM 密钥，按需解析 115 临时地址并返回 307。"""
+        """校验 STRM 密钥，按需解析 115 临时地址并返回 302。"""
         expected_token = str(self._config.get("playback_token") or "")
         if not expected_token or not compare_digest(token, expected_token):
             return JSONResponse(
@@ -1265,7 +1285,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             )
             return RedirectResponse(
                 url=direct_url,
-                status_code=307,
+                status_code=302,
                 headers={
                     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                     "Pragma": "no-cache",
@@ -1306,7 +1326,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                 "path": "/resources/import-manual",
                 "endpoint": self.import_manual_resources,
                 "methods": ["POST"],
-                "summary": "单条或批量导入115分享并生成媒体库",
+                "summary": "导入115分享、磁力或ED2K并生成媒体库",
                 "auth": "bear",
             },
             {
@@ -1421,6 +1441,14 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             return
         self._submit("自动媒体库生成", self._builder.build)
 
+    def _automatic_offline_cleanup(self) -> None:
+        """清理到期的磁力和ED2K离线播放文件。"""
+        if not self._enabled or not self._resolver:
+            return
+        result = self._resolver.cleanup_offline_cache()
+        if result.get("checked"):
+            logger.info(f"115离线缓存定时清理完成：{result}")
+
     def get_service(self) -> List[Dict[str, Any]]:
         """按配置注册自动同步任务。"""
         if not self._enabled:
@@ -1462,6 +1490,22 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                     "kwargs": {},
                 }
             )
+        if self._config.get("offline_playback_enabled", True):
+            cron = str(self._config.get("offline_cleanup_cron") or "").strip()
+            if cron:
+                try:
+                    trigger = CronTrigger.from_crontab(cron)
+                    services.append(
+                        {
+                            "id": "TencentDoc115LibraryOfflineCleanup",
+                            "name": "腾讯文档115媒体库离线缓存清理",
+                            "trigger": trigger,
+                            "func": self._automatic_offline_cleanup,
+                            "kwargs": {},
+                        }
+                    )
+                except ValueError as error:
+                    logger.error(f"115离线缓存清理定时表达式错误：{error}")
         return services
 
     @staticmethod
@@ -1799,6 +1843,37 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                             self._text_field(
                                 "p115_cookie", "115 Cookie（复用失败时使用）", 8, True
                             ),
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "offline_playback_enabled",
+                                            "label": "允许磁力/ED2K按需离线",
+                                        },
+                                    }
+                                ],
+                            },
+                            self._text_field(
+                                "offline_temp_path",
+                                "115离线临时目录",
+                                4,
+                                hint="必须是 /temp 下的独立子目录；插件只会清理这里由自己创建的资源目录",
+                            ),
+                            self._text_field(
+                                "offline_wait_seconds",
+                                "首次播放等待（秒）",
+                                4,
+                                hint="超时只会提示稍后重试，115离线任务仍会继续",
+                            ),
+                            self._text_field(
+                                "offline_retention_hours",
+                                "离线文件保留（小时）",
+                                4,
+                                hint="按最后一次播放续期；为避免中途清理，实际最短为24小时",
+                            ),
                         ],
                     },
                     {
@@ -1808,7 +1883,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                     {
                         "component": "div",
                         "props": {"class": "text-h6 mb-2"},
-                        "text": "自定义115分享链接",
+                        "text": "自定义资源链接",
                     },
                     {
                         "component": "VAlert",
@@ -1817,8 +1892,8 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                             "variant": "tonal",
                             "class": "mb-3",
                             "text": (
-                                "填写后先保存设置，再到详情页点击“导入自定义115资源”。"
-                                "插件会匿名解析分享、调用 MoviePilot 识别和刮削，并立即生成 STRM；"
+                                "填写后先保存设置，再到详情页点击“导入自定义资源”。"
+                                "115分享会匿名解析；磁力/ED2K只先识别和生成STRM，首次播放才提交115离线任务；"
                                 "同一批链接使用下方同一个文件夹和媒体类型。"
                             ),
                         },
@@ -1828,8 +1903,8 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                         "content": [
                             self._textarea_field(
                                 "manual_import_links",
-                                "115分享链接（每行一条，最多100条）",
-                                "支持：链接；标题|链接；标题|年份|链接。访问码可放在链接参数中。",
+                                "115分享/磁力/ED2K（每行一条，最多100条）",
+                                "支持：链接；标题|链接；标题|年份|链接。115访问码可放在链接参数中。",
                             ),
                             self._text_field(
                                 "manual_import_group",
@@ -2059,10 +2134,15 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             if self._gateway
             else {"enabled": False, "state": "disabled", "port": 8097}
         )
+        offline_playback = (
+            self._store.offline_playback_snapshot()
+            if self._store
+            else {"total": 0, "states": {}, "total_size": 0}
+        )
         buttons = [
             ("发现工作表", "mdi-table-search", "discover", "primary"),
             (
-                "导入自定义115资源",
+                "导入自定义资源",
                 "mdi-link-plus",
                 "resources/import-manual",
                 "info",
@@ -2252,6 +2332,13 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         )
         if gateway.get("last_error"):
             gateway_text += f" · 错误：{gateway.get('last_error')}"
+        offline_states = offline_playback.get("states") or {}
+        gateway_text += (
+            f" · 115离线：{int(offline_playback.get('total') or 0)} 条"
+            f"（完成 {int(offline_states.get('ready') or 0)} / "
+            f"进行中 {int(offline_states.get('downloading') or 0)} / "
+            f"失败 {int(offline_states.get('failed') or 0)}）"
+        )
         error_items: List[Dict[str, Any]] = []
         for item in snapshot.get("recent_errors", [])[:10]:
             error_items.append(

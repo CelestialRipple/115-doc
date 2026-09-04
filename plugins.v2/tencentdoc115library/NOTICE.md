@@ -8,7 +8,7 @@
 - License：修改版 GNU Affero General Public License 3，附加非商业使用、
   开源修改及注明来源的要求
 
-ISO 媒体按需触发 Emby OpenStream 探测、为直链使用 HTTP 307 以及保持
+ISO 媒体按需触发 Emby OpenStream 探测、为直链使用 HTTP 302 以及保持
 MediaSourceId 的流程还参考：
 
 - go-emby2openlist：https://github.com/AmbitiousJun/go-emby2openlist

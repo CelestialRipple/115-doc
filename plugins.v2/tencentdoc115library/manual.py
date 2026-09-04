@@ -5,20 +5,26 @@ from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
 
 from .resolver import ShareResolutionError, ShareResolver
+from .source_link import (
+    extract_source_links,
+    is_offline_link,
+    offline_file_hint,
+    offline_info_hash,
+    offline_title_year,
+)
 from .store import CatalogStore
 
 
-URL_PATTERN = re.compile(r"https?://[^\s\]）)}>，]+", re.IGNORECASE)
 YEAR_PATTERN = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
 MANUAL_SHEET_PREFIX = "manual:"
 
 
 class ManualImportError(ValueError):
-    """手动115资源输入格式错误。"""
+    """手动资源输入格式错误。"""
 
 
 class ManualLibraryImporter:
-    """把用户粘贴的115分享链接导入现有目录和构建队列。"""
+    """把用户粘贴的115分享、磁力或ED2K导入目录和构建队列。"""
 
     def __init__(
         self,
@@ -68,19 +74,27 @@ class ManualLibraryImporter:
         entries: List[Dict[str, str]] = []
         seen = set()
         for line in str(raw or "").splitlines():
-            matches = list(URL_PATTERN.finditer(line))
+            matches = extract_source_links(line)
             for index, match in enumerate(matches):
-                url = match.group(0).rstrip(".。;；")
-                try:
-                    share_code, _ = ShareResolver.parse_share_url(url)
-                except ShareResolutionError:
-                    continue
-                identity = share_code.lower()
+                url = str(match["url"])
+                if is_offline_link(url):
+                    identity = f"{match['kind']}:{offline_info_hash(url)}"
+                    share_code = identity
+                else:
+                    try:
+                        share_code, _ = ShareResolver.parse_share_url(url)
+                    except ShareResolutionError:
+                        continue
+                    identity = share_code.lower()
                 if identity in seen:
                     continue
                 seen.add(identity)
-                prefix = line[: match.start()] if index == 0 else ""
+                prefix = line[: int(match["start"])] if index == 0 else ""
                 title, year = cls._line_title(prefix)
+                if is_offline_link(url) and not title:
+                    derived = offline_title_year(url)
+                    title = derived["title"]
+                    year = year or derived["year"]
                 entries.append(
                     {
                         "share_url": url,
@@ -125,7 +139,7 @@ class ManualLibraryImporter:
         media_mode: str,
         maximum: int = 100,
     ) -> Dict[str, Any]:
-        """匿名校验分享并保存资源，返回需要立即构建的资源 ID。"""
+        """校验并保存资源，磁力和ED2K只登记、不在导入时离线下载。"""
         group_name = str(group_name or "").strip()
         if not group_name:
             raise ManualImportError("请填写自定义资源输出文件夹")
@@ -134,9 +148,9 @@ class ManualLibraryImporter:
             raise ManualImportError("媒体类型必须是电影、剧集或自动识别")
         entries = self.parse_entries(raw)
         if not entries:
-            raise ManualImportError("没有识别到有效的115分享链接")
+            raise ManualImportError("没有识别到有效的115分享、磁力或ED2K链接")
         if len(entries) > maximum:
-            raise ManualImportError(f"一次最多导入 {maximum} 条115分享链接")
+            raise ManualImportError(f"一次最多导入 {maximum} 条资源链接")
 
         sheet_id = self._sheet_id(group_name, media_mode)
         media_type = {
@@ -155,8 +169,17 @@ class ManualLibraryImporter:
             resource_id = self._resource_id(sheet_id, entry["share_code"])
             fallback_title = entry["title"] or f"自定义资源 {entry['share_code']}"
             try:
-                source_files = self.resolver.list_video_files(entry["share_url"])
-                derived_title, derived_year = self._derived_title(source_files)
+                offline = is_offline_link(entry["share_url"])
+                if offline:
+                    source_files = [
+                        offline_file_hint(entry["share_url"], fallback_title)
+                    ]
+                    derived = offline_title_year(entry["share_url"])
+                    derived_title = derived["title"]
+                    derived_year = derived["year"]
+                else:
+                    source_files = self.resolver.list_video_files(entry["share_url"])
+                    derived_title, derived_year = self._derived_title(source_files)
                 title = entry["title"] or derived_title
                 year = entry["year"] or derived_year
                 queued = self.store.upsert_manual_resource(
@@ -193,7 +216,7 @@ class ManualLibraryImporter:
                 failed += 1
                 errors.append(f"{fallback_title}：{error}")
             except Exception as error:
-                message = f"解析115分享时发生临时错误：{error}"
+                message = f"解析资源链接时发生临时错误：{error}"
                 self.store.upsert_manual_resource(
                     sheet_id=sheet_id,
                     resource_id=resource_id,

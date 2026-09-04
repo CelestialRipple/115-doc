@@ -8,7 +8,7 @@ from threading import RLock
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def utc_now() -> str:
@@ -173,6 +173,28 @@ class CatalogStore:
 
                 CREATE INDEX IF NOT EXISTS idx_direct_download_state
                     ON direct_download_task(state, organized, updated_at);
+
+                CREATE TABLE IF NOT EXISTS offline_playback (
+                    resource_id TEXT PRIMARY KEY,
+                    source_hash TEXT NOT NULL,
+                    task_hash TEXT,
+                    directory_id TEXT,
+                    owned_file_id TEXT,
+                    pick_code TEXT,
+                    file_name TEXT,
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    last_access_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(resource_id) REFERENCES resource(resource_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_offline_playback_expiry
+                    ON offline_playback(state, expires_at);
 
                 """)
             # 0.9.4 移除了播放前转存功能；升级旧数据库时一并删除其
@@ -422,12 +444,123 @@ class CatalogStore:
         """清空全部工作表、资源、下载任务和同步历史记录"""
         with self._lock, self.connection() as connection:
             connection.execute("DELETE FROM direct_download_task")
+            connection.execute("DELETE FROM offline_playback")
             connection.execute("DELETE FROM resource_file")
             connection.execute("DELETE FROM resource")
             connection.execute("DELETE FROM sheet_state")
             connection.execute("DELETE FROM sync_run")
         with self._lock, self.connection() as connection:
             connection.execute("VACUUM")
+
+    def get_offline_playback(self, resource_id: str) -> Optional[Dict[str, Any]]:
+        """查询磁力或ED2K资源的115离线缓存记录。"""
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM offline_playback WHERE resource_id = ?",
+                (resource_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_offline_playback(self, record: Dict[str, Any]) -> None:
+        """保存115离线任务、个人文件和缓存租约。"""
+        now = utc_now()
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO offline_playback (
+                    resource_id, source_hash, task_hash, directory_id,
+                    owned_file_id, pick_code, file_name, file_size, state,
+                    last_access_at, expires_at, last_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(resource_id) DO UPDATE SET
+                    source_hash = excluded.source_hash,
+                    task_hash = excluded.task_hash,
+                    directory_id = excluded.directory_id,
+                    owned_file_id = excluded.owned_file_id,
+                    pick_code = excluded.pick_code,
+                    file_name = excluded.file_name,
+                    file_size = excluded.file_size,
+                    state = excluded.state,
+                    last_access_at = excluded.last_access_at,
+                    expires_at = excluded.expires_at,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record["resource_id"],
+                    record["source_hash"],
+                    record.get("task_hash"),
+                    record.get("directory_id"),
+                    record.get("owned_file_id"),
+                    record.get("pick_code"),
+                    record.get("file_name"),
+                    int(record.get("file_size") or 0),
+                    record.get("state") or "pending",
+                    record.get("last_access_at") or now,
+                    record["expires_at"],
+                    record.get("last_error"),
+                    now,
+                    now,
+                ),
+            )
+
+    def touch_offline_playback(
+        self,
+        resource_id: str,
+        expires_at: str,
+    ) -> None:
+        """续租一次离线缓存，防止播放期间被定时清理。"""
+        now = utc_now()
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                "UPDATE offline_playback SET last_access_at = ?, expires_at = ?, "
+                "updated_at = ? WHERE resource_id = ?",
+                (now, expires_at, now, resource_id),
+            )
+
+    def list_offline_playbacks(
+        self,
+        expired_before: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """列出全部或已经到期的115离线缓存。"""
+        query = "SELECT * FROM offline_playback"
+        parameters: Tuple[Any, ...] = ()
+        if expired_before:
+            query += " WHERE expires_at <= ?"
+            parameters = (expired_before,)
+        query += " ORDER BY expires_at"
+        with self.connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_offline_playback(self, resource_id: str) -> None:
+        """删除一条离线缓存记录，不直接操作115文件。"""
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                "DELETE FROM offline_playback WHERE resource_id = ?",
+                (resource_id,),
+            )
+
+    def offline_playback_snapshot(self) -> Dict[str, Any]:
+        """汇总磁力和ED2K离线任务状态与占用。"""
+        with self.connection() as connection:
+            states = {
+                row["state"]: int(row["count"])
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM offline_playback "
+                    "GROUP BY state"
+                ).fetchall()
+            }
+            row = connection.execute(
+                "SELECT COALESCE(SUM(file_size), 0) AS total_size, "
+                "MIN(expires_at) AS next_expiry FROM offline_playback"
+            ).fetchone()
+        return {
+            "total": sum(states.values()),
+            "states": states,
+            "total_size": int(row["total_size"] or 0),
+            "next_expiry": row["next_expiry"],
+        }
 
     def list_sheets(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
         """
@@ -475,7 +608,7 @@ class CatalogStore:
         status: str,
         error: Optional[str] = None,
     ) -> bool:
-        """保存一条手动115资源，返回它是否需要重新进入构建队列。"""
+        """保存一条手动资源，返回它是否需要重新进入构建队列。"""
         now = utc_now()
         identity = "\n".join(
             (title, year, share_url, media_type, group_name, media_mode)
@@ -498,8 +631,8 @@ class CatalogStore:
                 """,
                 (
                     sheet_id,
-                    f"自定义115（{group_name}）",
-                    f"自定义115（{group_name}）",
+                    f"自定义资源（{group_name}）",
+                    f"自定义资源（{group_name}）",
                     sheet_id,
                     group_name,
                     media_mode,

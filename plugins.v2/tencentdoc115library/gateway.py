@@ -762,9 +762,9 @@ class DirectPlayGateway:
                 f"返回115直链：{request.method} {request.path}，"
                 f"UA={request.headers.get('user-agent', '')[:160]}"
             )
-            # 与 go-emby2openlist 一致使用 307，完整保留 GET、HEAD 和 Range 语义。
+            # 只返回115地址，视频正文始终由播放器直接向115请求。
             return web.Response(
-                status=307,
+                status=302,
                 headers={
                     "Location": direct_url,
                     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",

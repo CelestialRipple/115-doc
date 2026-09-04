@@ -132,6 +132,36 @@ def test_parser_prioritizes_share_path_across_alternate_domains() -> None:
     assert resource["share_url"] == ("https://115cdn.com/s/swsbevb3hkk?password=sk4k&")
 
 
+def test_parser_accepts_ed2k_and_magnet_rows() -> None:
+    ed2k = (
+        "ed2k://|file|Example.Movie.2026.iso|42714660864|"
+        "19B8C66BBDCE9D7B920015F96FDC113C|/"
+    )
+    ed2k_resource = CatalogParser.parse_row(
+        sheet_id="sheet-offline",
+        sheet_title="混合资源",
+        group_name="离线",
+        row_number=2,
+        row=["示例电影", ed2k],
+        header_map={"title": 0, "share_url": 1},
+        media_mode="movie",
+    )
+    magnet_resource = CatalogParser.parse_row(
+        sheet_id="sheet-offline",
+        sheet_title="混合资源",
+        group_name="离线",
+        row_number=3,
+        row=["示例电影2", "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"],
+        header_map={"title": 0, "share_url": 1},
+        media_mode="movie",
+    )
+
+    assert ed2k_resource is not None
+    assert ed2k_resource["share_url"] == ed2k
+    assert magnet_resource is not None
+    assert magnet_resource["share_url"].startswith("magnet:?")
+
+
 def test_mixed_sheet_splits_tv_rows_into_separate_group() -> None:
     mapping = CatalogParser.identify_headers(
         ["影片名称", "资源版本", "资源链接", "类型", "年份"]

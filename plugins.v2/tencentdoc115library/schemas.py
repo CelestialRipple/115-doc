@@ -55,8 +55,8 @@ class ResourceRetryRequest(BaseModel):
 
 
 class ManualImportRequest(BaseModel):
-    """手动添加115分享资源；空字段会读取插件配置页中已保存的值。"""
+    """手动添加115分享、磁力或ED2K；空字段读取已保存配置。"""
 
-    links: Optional[str] = Field(default=None, description="单条或批量115分享链接")
+    links: Optional[str] = Field(default=None, description="单条或批量资源链接")
     group_name: Optional[str] = Field(default=None, max_length=120)
     media_mode: Optional[str] = Field(default=None, description="movie、tv 或 mixed")

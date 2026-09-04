@@ -27,6 +27,7 @@ except ImportError:
     from app.log import logger
 
 from .resolver import ShareResolutionError, ShareResolver
+from .source_link import is_offline_link, offline_file_hint
 from .storage_limit import configured_limit_bytes, directory_size
 from .store import CatalogStore
 
@@ -165,7 +166,7 @@ class LibraryBuilder:
     """
     把目录记录限量生成为本地 STRM 和 MoviePilot 元数据
 
-    电影和电视剧都会先匿名展开 115 分享；播放取直链时才使用用户 Cookie
+    115分享会匿名展开；磁力和ED2K只生成占位STRM，首次播放才离线下载
     """
 
     def __init__(
@@ -1244,9 +1245,22 @@ class LibraryBuilder:
                         if str(sheet.get("sheet_id") or "").startswith("manual:")
                         else []
                     )
-                    source_files = prefetched_files or self.resolver.list_video_files(
-                        resource["share_url"]
-                    )
+                    if prefetched_files:
+                        source_files = prefetched_files
+                    elif is_offline_link(resource["share_url"]):
+                        source_files = [
+                            offline_file_hint(
+                                resource["share_url"],
+                                str(resource.get("title") or "未命名"),
+                            )
+                        ]
+                        self.store.replace_resource_files(
+                            resource["resource_id"], source_files
+                        )
+                    else:
+                        source_files = self.resolver.list_video_files(
+                            resource["share_url"]
+                        )
                     media_type = self._media_type(resource, source_files)
                     mixed_resource = self._is_mixed_resource(resource)
                     current_stage = "recognizing"

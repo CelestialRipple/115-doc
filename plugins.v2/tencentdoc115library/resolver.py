@@ -1,5 +1,6 @@
 import hashlib
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock, RLock
 from time import monotonic, sleep
@@ -18,6 +19,7 @@ except ImportError:
     from app.utils.http import RequestUtils
 
 from .store import CatalogStore, utc_now
+from .source_link import is_offline_link, offline_info_hash
 
 # 115 分享临时下载地址通常约两小时有效，留出足够的提前量重新获取
 DIRECT_URL_CACHE_TTL_SECONDS = 100 * 60
@@ -337,6 +339,13 @@ class ShareResolver:
             "file_path": path,
             "file_size": size,
             "is_dir": is_dir,
+            "pick_code": str(
+                normalized.get("pickcode")
+                or normalized.get("pick_code")
+                or item.get("pc")
+                or item.get("pickcode")
+                or ""
+            ),
         }
 
     def list_video_files(self, share_url: str) -> List[Dict[str, Any]]:
@@ -592,6 +601,472 @@ class ShareResolver:
             self._store_url(share_url, file_id, user_agent or "", url)
         return url
 
+    def _offline_root(self) -> str:
+        """返回经过安全约束的插件专属115离线目录。"""
+        value = str(
+            self.config_provider().get("offline_temp_path")
+            or "/temp/tencentdoc115library"
+        ).strip()
+        value = "/" + value.strip("/")
+        if value == "/temp" or not value.startswith("/temp/"):
+            raise ShareResolutionError(
+                "115离线缓存目录必须是 /temp 下的独立子目录",
+                status_code=422,
+                retryable=False,
+            )
+        return value
+
+    def _offline_path(self, resource_id: str) -> str:
+        safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", resource_id)[:64]
+        return f"{self._offline_root()}/{safe_id}"
+
+    def _offline_expiry(self) -> str:
+        """按最后访问时间计算离线文件租约，最短保留24小时。"""
+        raw = self.config_provider().get("offline_retention_hours")
+        try:
+            hours = float(raw if raw not in (None, "") else 24)
+        except (TypeError, ValueError):
+            hours = 24
+        hours = min(max(hours, 24), 24 * 30)
+        return (
+            datetime.now(timezone.utc) + timedelta(hours=hours)
+        ).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _response_id(response: Any) -> str:
+        """从115不同版本的目录创建响应中提取 ID。"""
+        if not isinstance(response, dict):
+            return ""
+        data = response.get("data")
+        candidates = [response, data] if isinstance(data, dict) else [response]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("cid") or item.get("id") or item.get("file_id")
+            if value not in (None, "", 0, "0"):
+                return str(value)
+        return ""
+
+    def _ensure_private_directory(self, client: Any, path: str) -> str:
+        """逐级定位或创建115个人网盘目录。"""
+        try:
+            directory_id = self._response_id(client.fs_dir_getid(path))
+            if directory_id:
+                return directory_id
+        except Exception:
+            pass
+        parent_id = "0"
+        current_path = ""
+        for name in [part for part in path.strip("/").split("/") if part]:
+            current_path = f"{current_path}/{name}"
+            try:
+                directory_id = self._response_id(client.fs_dir_getid(current_path))
+            except Exception:
+                directory_id = ""
+            if not directory_id:
+                response = self._call_with_retry(
+                    lambda name=name, parent_id=parent_id: client.fs_mkdir(
+                        name,
+                        pid=int(parent_id),
+                    )
+                )
+                directory_id = self._response_id(response)
+            if not directory_id:
+                raise ShareResolutionError(
+                    f"115未返回离线缓存目录ID：{current_path}",
+                    status_code=502,
+                    retryable=True,
+                )
+            parent_id = directory_id
+        return parent_id
+
+    @staticmethod
+    def _response_items(response: Any) -> Tuple[List[Dict[str, Any]], int]:
+        """兼容提取115个人文件列表和总数。"""
+        if not isinstance(response, dict):
+            return [], 0
+        data = response.get("data")
+        if isinstance(data, list):
+            items = data
+            total = response.get("count") or response.get("total") or len(items)
+        elif isinstance(data, dict):
+            items = data.get("list") or data.get("data") or []
+            total = data.get("count") or data.get("total") or len(items)
+        else:
+            items = response.get("list") or []
+            total = response.get("count") or response.get("total") or len(items)
+        normalized_items = [item for item in items if isinstance(item, dict)]
+        try:
+            return normalized_items, int(total)
+        except (TypeError, ValueError):
+            return normalized_items, len(normalized_items)
+
+    def _list_private_video_files(
+        self,
+        client: Any,
+        directory_id: str,
+    ) -> List[Dict[str, Any]]:
+        """递归查找115离线缓存目录中的全部视频文件。"""
+        config = self.config_provider()
+        extensions = {
+            value if value.startswith(".") else f".{value}"
+            for value in (
+                item.strip().lower()
+                for item in str(
+                    config.get("video_extensions")
+                    or ",".join(sorted(DEFAULT_VIDEO_EXTENSIONS))
+                ).replace("，", ",").split(",")
+            )
+            if value
+        }
+        pending: List[Tuple[str, str]] = [(str(directory_id), "")]
+        visited = set()
+        videos: List[Dict[str, Any]] = []
+        while pending:
+            current_id, parent_path = pending.pop(0)
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+            offset = 0
+            while True:
+                response = self._call_with_retry(
+                    lambda current_id=current_id, offset=offset: client.fs_files(
+                        {
+                            "cid": int(current_id),
+                            "limit": 1150,
+                            "offset": offset,
+                            "show_dir": 1,
+                            "cur": 1,
+                        }
+                    )
+                )
+                items, total = self._response_items(response)
+                for item in items:
+                    normalized = self._normalize_item(item, parent_path)
+                    if not normalized["file_id"] or not normalized["file_name"]:
+                        continue
+                    if normalized["is_dir"]:
+                        pending.append(
+                            (normalized["file_id"], normalized["file_path"])
+                        )
+                    elif (
+                        Path(normalized["file_name"]).suffix.lower() in extensions
+                        and normalized["pick_code"]
+                    ):
+                        videos.append(normalized)
+                offset += len(items)
+                if not items or offset >= total:
+                    break
+        return videos
+
+    @staticmethod
+    def _find_task_payload(value: Any, task_hash: str) -> Dict[str, Any]:
+        """从115离线任务响应中递归定位目标任务。"""
+        if isinstance(value, dict):
+            current_hash = str(
+                value.get("info_hash") or value.get("hash") or ""
+            ).lower()
+            if current_hash and (not task_hash or current_hash == task_hash.lower()):
+                return value
+            for child in value.values():
+                found = ShareResolver._find_task_payload(child, task_hash)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = ShareResolver._find_task_payload(child, task_hash)
+                if found:
+                    return found
+        return {}
+
+    def _offline_task_hash(self, response: Any, fallback: str) -> str:
+        task = self._find_task_payload(response, "")
+        return str(task.get("info_hash") or task.get("hash") or fallback).lower()
+
+    def _offline_task_error(self, task: Dict[str, Any]) -> str:
+        """识别115离线任务的终止错误。"""
+        message = str(
+            task.get("error_msg")
+            or task.get("last_error")
+            or task.get("error")
+            or ""
+        ).strip()
+        try:
+            status = int(task.get("status"))
+        except (TypeError, ValueError):
+            status = 0
+        if status < 0:
+            return (
+                message
+                or str(task.get("message") or task.get("msg") or "")
+                or f"离线任务失败，状态 {status}"
+            )
+        if message:
+            return message
+        return ""
+
+    @staticmethod
+    def _offline_task_complete(task: Dict[str, Any]) -> bool:
+        """判断115离线任务是否已经完整结束。"""
+        try:
+            return int(task.get("status")) == 2
+        except (TypeError, ValueError):
+            return False
+
+    def _private_download_url(self, pick_code: str, user_agent: str) -> str:
+        """为个人网盘文件生成临时直链。"""
+        agent = user_agent or "Mozilla/5.0 MoviePilot TencentDoc115Library"
+        result = self._call_with_retry(
+            lambda: self._get_client().download_url(
+                pick_code,
+                user_agent=agent,
+            )
+        )
+        url = str(result or "").strip()
+        if not url:
+            raise ShareResolutionError(
+                "115个人网盘下载接口未返回可播放地址",
+                status_code=502,
+                retryable=True,
+            )
+        return url
+
+    def _ready_offline_url(
+        self,
+        resource_id: str,
+        record: Dict[str, Any],
+        user_agent: str,
+    ) -> str:
+        """续租已有115离线文件并返回带缓存的直链。"""
+        pick_code = str(record.get("pick_code") or "")
+        if not pick_code:
+            raise ShareResolutionError(
+                "115离线缓存缺少PickCode，准备重新定位文件",
+                status_code=502,
+                retryable=True,
+            )
+        self.store.touch_offline_playback(resource_id, self._offline_expiry())
+        cache_key = f"offline:{record.get('source_hash') or resource_id}"
+        cached = self._cached_url(cache_key, pick_code, user_agent)
+        if cached:
+            return cached
+        url = self._private_download_url(pick_code, user_agent)
+        self._store_url(cache_key, pick_code, user_agent, url)
+        return url
+
+    def _resolve_offline(
+        self,
+        resource: Dict[str, Any],
+        user_agent: str,
+    ) -> str:
+        """首次播放时提交磁力或ED2K到115，完成后返回个人直链。"""
+        if not self.config_provider().get("offline_playback_enabled", True):
+            raise ShareResolutionError(
+                "磁力/ED2K播放功能未启用",
+                status_code=503,
+                retryable=False,
+            )
+        resource_id = str(resource["resource_id"])
+        source_url = str(resource["share_url"])
+        source_hash = offline_info_hash(source_url)
+        client = self._get_client()
+        record = self.store.get_offline_playback(resource_id) or {}
+        if (
+            record.get("source_hash") == source_hash
+            and record.get("state") == "ready"
+            and record.get("pick_code")
+        ):
+            try:
+                return self._ready_offline_url(resource_id, record, user_agent)
+            except ShareResolutionError as error:
+                logger.warning(f"115离线缓存直链失效，重新定位：{resource_id} - {error}")
+
+        directory_id = str(record.get("directory_id") or "")
+        if not directory_id:
+            directory_id = self._ensure_private_directory(
+                client,
+                self._offline_path(resource_id),
+            )
+        videos = (
+            []
+            if record.get("state") in {"downloading", "failed"}
+            else self._list_private_video_files(client, directory_id)
+        )
+        if videos:
+            selected = self.choose_movie_file(videos)
+            ready_record = {
+                "resource_id": resource_id,
+                "source_hash": source_hash,
+                "task_hash": record.get("task_hash") or source_hash,
+                "directory_id": directory_id,
+                "owned_file_id": selected["file_id"],
+                "pick_code": selected["pick_code"],
+                "file_name": selected["file_name"],
+                "file_size": selected["file_size"],
+                "state": "ready",
+                "last_access_at": utc_now(),
+                "expires_at": self._offline_expiry(),
+                "last_error": None,
+            }
+            self.store.upsert_offline_playback(ready_record)
+            return self._ready_offline_url(resource_id, ready_record, user_agent)
+
+        task_hash = str(record.get("task_hash") or "")
+        if not task_hash:
+            response = self._call_with_retry(
+                lambda: client.clouddownload_task_add_urls(
+                    {"url[0]": source_url, "wp_path_id": int(directory_id)}
+                )
+            )
+            task_hash = self._offline_task_hash(response, source_hash)
+            logger.info(
+                f"已提交115离线播放任务：{resource.get('title') or resource_id}"
+            )
+        waiting_record = {
+            "resource_id": resource_id,
+            "source_hash": source_hash,
+            "task_hash": task_hash,
+            "directory_id": directory_id,
+            "owned_file_id": "",
+            "pick_code": "",
+            "file_name": "",
+            "file_size": 0,
+            "state": "downloading",
+            "last_access_at": utc_now(),
+            "expires_at": self._offline_expiry(),
+            "last_error": None,
+        }
+        self.store.upsert_offline_playback(waiting_record)
+        config = self.config_provider()
+        try:
+            wait_seconds = min(
+                max(int(config.get("offline_wait_seconds") or 60), 5),
+                300,
+            )
+            poll_seconds = min(
+                max(float(config.get("offline_poll_seconds") or 2), 1),
+                15,
+            )
+        except (TypeError, ValueError):
+            wait_seconds, poll_seconds = 60, 2
+        deadline = monotonic() + wait_seconds
+        while monotonic() < deadline:
+            task: Dict[str, Any] = {}
+            try:
+                task_response = self._call_with_retry(
+                    lambda: client.clouddownload_task(task_hash)
+                )
+                task = self._find_task_payload(task_response, task_hash)
+                task_error = self._offline_task_error(task) if task else ""
+                if task_error:
+                    waiting_record.update(
+                        {"state": "failed", "last_error": task_error}
+                    )
+                    self.store.upsert_offline_playback(waiting_record)
+                    raise ShareResolutionError(
+                        f"115离线下载失败：{task_error}",
+                        status_code=422,
+                        retryable=False,
+                    )
+            except ShareResolutionError:
+                raise
+            except Exception as error:
+                logger.warning(f"查询115离线任务状态失败，将继续等待：{error}")
+            if not task or self._offline_task_complete(task):
+                videos = self._list_private_video_files(client, directory_id)
+                if videos:
+                    selected = self.choose_movie_file(videos)
+                    ready_record = {
+                        **waiting_record,
+                        "owned_file_id": selected["file_id"],
+                        "pick_code": selected["pick_code"],
+                        "file_name": selected["file_name"],
+                        "file_size": selected["file_size"],
+                        "state": "ready",
+                        "last_access_at": utc_now(),
+                        "expires_at": self._offline_expiry(),
+                    }
+                    self.store.upsert_offline_playback(ready_record)
+                    return self._ready_offline_url(
+                        resource_id, ready_record, user_agent
+                    )
+            sleep(poll_seconds)
+        raise ShareResolutionError(
+            f"115离线任务仍在进行，{wait_seconds}秒后可再次播放继续检查",
+            status_code=504,
+            retryable=True,
+        )
+
+    def cleanup_offline_cache(self, include_all: bool = False) -> Dict[str, int]:
+        """精确清理到期的插件离线目录，不触碰115中的其它文件。"""
+        records = self.store.list_offline_playbacks(
+            None if include_all else utc_now()
+        )
+        removed = 0
+        skipped = 0
+        failed = 0
+        for record in records:
+            resource_id = str(record.get("resource_id") or "")
+            with self._resource_locks_guard:
+                lock = self._resource_locks.setdefault(resource_id, Lock())
+            if not lock.acquire(blocking=False):
+                skipped += 1
+                continue
+            try:
+                current = self.store.get_offline_playback(resource_id)
+                if not current:
+                    continue
+                if not include_all and str(current.get("expires_at") or "") > utc_now():
+                    skipped += 1
+                    continue
+                client = self._get_client()
+                task_hash = str(current.get("task_hash") or "")
+                if task_hash:
+                    try:
+                        self._call_with_retry(
+                            lambda: client.clouddownload_task_del(
+                                {"hash[0]": task_hash, "flag": 0}
+                            )
+                        )
+                    except Exception as error:
+                        logger.warning(f"删除115离线任务记录失败，将继续清理目录：{error}")
+                directory_id = str(current.get("directory_id") or "")
+                if directory_id:
+                    if current.get("state") != "recycled":
+                        self._call_with_retry(
+                            lambda: client.fs_delete([directory_id])
+                        )
+                        current.update(
+                            {
+                                "state": "recycled",
+                                "last_access_at": current.get("last_access_at")
+                                or utc_now(),
+                                "last_error": None,
+                            }
+                        )
+                        self.store.upsert_offline_playback(current)
+                    if self.config_provider().get("offline_clear_recycle", True):
+                        self._call_with_retry(
+                            lambda: client.recyclebin_clean({"tid": directory_id})
+                        )
+                self.store.delete_offline_playback(resource_id)
+                self.invalidate_file_url(
+                    f"offline:{current.get('source_hash') or resource_id}",
+                    str(current.get("pick_code") or ""),
+                )
+                removed += 1
+            except Exception as error:
+                failed += 1
+                logger.warning(f"115离线缓存清理失败：{resource_id} - {error}")
+            finally:
+                lock.release()
+        return {
+            "checked": len(records),
+            "removed": removed,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
     def resolve(
         self,
         resource_id: str,
@@ -614,6 +1089,16 @@ class ShareResolver:
                 status_code=404,
                 retryable=False,
             )
+        if is_offline_link(str(resource.get("share_url") or "")):
+            with self._resource_locks_guard:
+                lock = self._resource_locks.setdefault(resource_id, Lock())
+            with lock:
+                try:
+                    return self._resolve_offline(resource, user_agent or "")
+                except ShareResolutionError as error:
+                    self.store.update_resource_status(resource_id, "ready", str(error))
+                    logger.warning(f"115离线播放解析失败：{resource_id} - {error}")
+                    raise
         known_file_id = (
             str(file_id or "").strip()
             or str(resource.get("resolved_file_id") or "").strip()

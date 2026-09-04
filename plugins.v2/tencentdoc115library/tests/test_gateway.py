@@ -347,7 +347,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         headers={"User-Agent": "gateway-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status == 307
+                        assert response.status == 302
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/video.mkv"
                         )
@@ -373,7 +373,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         headers={"User-Agent": "infuse-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status == 307
+                        assert response.status == 302
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/video.mkv"
                         )
@@ -385,7 +385,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                             headers={"User-Agent": "infuse-test"},
                             allow_redirects=False,
                         ) as response:
-                            assert response.status == 307
+                            assert response.status == 302
                             assert response.headers["Location"].startswith(
                                 "https://115cdn.example/video.mkv"
                             )
@@ -510,7 +510,7 @@ def test_iso_stream_preserves_playback_info_and_redirects_directly():
                         headers={"User-Agent": "infuse-iso-test"},
                         allow_redirects=False,
                     ) as response:
-                        assert response.status == 307
+                        assert response.status == 302
                         assert response.headers["Location"].startswith(
                             "https://115cdn.example/test.iso"
                         )

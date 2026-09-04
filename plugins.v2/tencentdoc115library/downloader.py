@@ -26,6 +26,7 @@ except ImportError:
 from .download_marker import parse_download_marker
 from .library import safe_path_segment
 from .resolver import ShareResolutionError, ShareResolver
+from .source_link import is_offline_link, offline_file_hint
 from .store import CatalogStore
 
 
@@ -118,6 +119,27 @@ class DirectDownloadManager:
         resource: Dict[str, Any],
         selected_episodes: Set[int],
     ) -> List[Dict[str, Any]]:
+        if is_offline_link(str(resource.get("share_url") or "")):
+            self.resolver.resolve(
+                resource["resource_id"],
+                user_agent="MoviePilot TencentDoc115Library",
+            )
+            record = self.store.get_offline_playback(resource["resource_id"]) or {}
+            if record.get("pick_code"):
+                return [
+                    {
+                        "file_id": record.get("owned_file_id") or "offline",
+                        "file_name": record.get("file_name") or "video.mkv",
+                        "file_path": f"/{record.get('file_name') or 'video.mkv'}",
+                        "file_size": int(record.get("file_size") or 0),
+                    }
+                ]
+            return [
+                offline_file_hint(
+                    resource["share_url"],
+                    str(resource.get("title") or "未命名"),
+                )
+            ]
         if self._is_tv(resource):
             files = self.store.list_resource_files(resource["resource_id"])
             if not files:
@@ -186,11 +208,17 @@ class DirectDownloadManager:
             headers = {"User-Agent": "MoviePilot TencentDoc115Library"}
             if existing:
                 headers["Range"] = f"bytes={existing}-"
-            direct_url = self.resolver.resolve_file_url(
-                resource["share_url"],
-                str(source_file["file_id"]),
-                headers["User-Agent"],
-            )
+            if is_offline_link(str(resource.get("share_url") or "")):
+                direct_url = self.resolver.resolve(
+                    resource["resource_id"],
+                    user_agent=headers["User-Agent"],
+                )
+            else:
+                direct_url = self.resolver.resolve_file_url(
+                    resource["share_url"],
+                    str(source_file["file_id"]),
+                    headers["User-Agent"],
+                )
             response = self._request.get_res(
                 url=direct_url,
                 headers=headers,

@@ -10,7 +10,8 @@ try:
 except ImportError:
     from app.log import logger
 
-from .client import TencentDocumentClient, TencentDocumentError, looks_like_url
+from .client import TencentDocumentClient, TencentDocumentError
+from .source_link import extract_source_links, supported_link
 from .store import CatalogStore
 
 HEADER_ALIASES = {
@@ -184,20 +185,21 @@ class CatalogParser:
     @staticmethod
     def _extract_share_url(value: str, row: List[str]) -> str:
         candidates = [value, *row]
-        urls = []
+        links: List[Dict[str, Any]] = []
         for candidate in candidates:
-            urls.extend(
-                match.group(0).rstrip(".。")
-                for match in re.finditer(
-                    r"https?://[^\s\]）)}>,，]+",
-                    str(candidate or ""),
-                    re.IGNORECASE,
-                )
-            )
-        for url in urls:
-            if re.search(r"/(?:s|share)/[^/?#&]+", urlsplit(url).path, re.IGNORECASE):
+            links.extend(extract_source_links(str(candidate or "")))
+        for link in links:
+            url = str(link["url"])
+            if link["kind"] == "http" and re.search(
+                r"/(?:s|share)/[^/?#&]+",
+                urlsplit(url).path,
+                re.IGNORECASE,
+            ):
                 return url
-        return urls[0] if urls else ""
+        for link in links:
+            if link["kind"] in {"magnet", "ed2k"}:
+                return str(link["url"])
+        return str(links[0]["url"]) if links else ""
 
     @staticmethod
     def _resource_id(sheet_id: str, title: str, version: str, share_url: str) -> str:
@@ -245,7 +247,7 @@ class CatalogParser:
         version = cls._value(row, header_map, "version")
         raw_link = cls._value(row, header_map, "share_url")
         share_url = cls._extract_share_url(raw_link, row)
-        if not title or not share_url or not looks_like_url(share_url):
+        if not title or not share_url or not supported_link(share_url):
             return None
         raw_media_type = cls._value(row, header_map, "media_type")
         normalized_mode = str(media_mode or "auto").strip().lower()

@@ -68,7 +68,7 @@ def main() -> None:
         assert "内置直链网关" in page_text
         assert "清空并重新开始" in page_text
         assert "迁移现有目录" in page_text
-        assert "导入自定义115资源" in page_text
+        assert "导入自定义资源" in page_text
 
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()

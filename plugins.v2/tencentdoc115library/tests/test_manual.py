@@ -76,3 +76,21 @@ def test_targeted_build_candidates_do_not_consume_other_pending_rows(tmp_path):
 
     assert [row["resource_id"] for row in rows] == second["queued_ids"]
     assert first["queued_ids"][0] != rows[0]["resource_id"]
+
+
+def test_manual_ed2k_import_does_not_resolve_before_playback(tmp_path):
+    store = CatalogStore(tmp_path / "catalog.db")
+    resolver = FakeResolver()
+    importer = ManualLibraryImporter(store, resolver, Event())
+    ed2k = (
+        "示例电影|2026|ed2k://|file|Example.Movie.2026.iso|42714660864|"
+        "19B8C66BBDCE9D7B920015F96FDC113C|/"
+    )
+
+    result = importer.import_links(ed2k, "离线", "movie")
+
+    assert result["imported"] == 1
+    assert resolver.calls == []
+    files = store.list_resource_files(result["queued_ids"][0])
+    assert files[0]["file_name"] == "Example.Movie.2026.iso"
+    assert files[0]["file_size"] == 42714660864

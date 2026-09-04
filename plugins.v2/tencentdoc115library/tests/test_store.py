@@ -129,8 +129,26 @@ def test_clear_all_removes_database_records(tmp_path: Path) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")
     store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+    store.upsert_offline_playback(
+        {
+            "resource_id": "resource-1",
+            "source_hash": "hash-1",
+            "task_hash": "hash-1",
+            "directory_id": "100",
+            "owned_file_id": "200",
+            "pick_code": "pick-code",
+            "file_name": "movie.iso",
+            "file_size": 1024,
+            "state": "ready",
+            "last_access_at": "2026-09-05T00:00:00+00:00",
+            "expires_at": "2026-09-06T00:00:00+00:00",
+        }
+    )
+    assert store.get_offline_playback("resource-1")["pick_code"] == "pick-code"
 
     store.clear_all()
+
+    assert store.list_offline_playbacks() == []
 
     assert store.list_sheets() == []
     assert store.get_resource("resource-1") is None
