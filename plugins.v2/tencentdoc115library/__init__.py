@@ -82,7 +82,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "playback_token": "",
     "scrape_metadata": True,
     "native_search_enabled": True,
-    "native_search_scope": "unbuilt",
+    "native_search_scope": "all",
     "search_ready_only": True,
     "search_page_size": 50,
     "reuse_p115_cookie": True,
@@ -112,7 +112,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.10.1"
+    plugin_version = "0.10.2"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -417,10 +417,10 @@ class TencentDoc115Library(_PluginBase):
         )
         page_index = max(int(page or 0), 0)
         search_scope = str(
-            self._config.get("native_search_scope") or "unbuilt"
+            self._config.get("native_search_scope") or "all"
         ).strip().lower()
         if search_scope not in {"unbuilt", "all", "ready"}:
-            search_scope = "unbuilt"
+            search_scope = "all"
         resources = self._store.search_resources(
             keyword=keyword,
             limit=page_size,
@@ -552,9 +552,17 @@ class TencentDoc115Library(_PluginBase):
                     color,
                 )
             )
-        return HTMLResponse(
-            self._save_page_html(title, group_name, media_type)
-        )
+        if str(resource.get("strm_status") or "") == "ready":
+            return HTMLResponse(
+                self._save_page_html(
+                    title,
+                    group_name,
+                    media_type,
+                    "该资源已经在影视库中。",
+                    "#2e7d32",
+                )
+            )
+        return HTMLResponse(self._save_page_html(title, group_name, media_type))
 
     @staticmethod
     def _save_page_html(
@@ -1584,12 +1592,12 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                                             "label": "MoviePilot检索范围",
                                             "items": [
                                                 {
-                                                    "title": "仅未入库资源",
-                                                    "value": "unbuilt",
-                                                },
-                                                {
                                                     "title": "全部有效资源",
                                                     "value": "all",
+                                                },
+                                                {
+                                                    "title": "仅未入库资源",
+                                                    "value": "unbuilt",
                                                 },
                                                 {
                                                     "title": "仅已生成STRM",
@@ -1599,7 +1607,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                                             "item-title": "title",
                                             "item-value": "value",
                                             "persistent-hint": True,
-                                            "hint": "推荐仅未入库；生成后改在 Emby 中搜索",
+                                            "hint": "默认全部显示；已生成资源会标注“已入库”",
                                         },
                                     }
                                 ],
