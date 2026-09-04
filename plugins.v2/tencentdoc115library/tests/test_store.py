@@ -153,6 +153,32 @@ def test_local_search_defaults_to_ready_resources(tmp_path: Path) -> None:
     assert [item["resource_id"] for item in results] == ["resource-1"]
 
 
+def test_local_search_can_show_only_resources_without_strm(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+
+    pending = store.search_resources(
+        "测试",
+        ready_only=False,
+        unbuilt_only=True,
+    )
+    assert [item["resource_id"] for item in pending] == ["resource-1"]
+
+    store.update_resource_status(
+        "resource-1",
+        "ready",
+        strm_status="ready",
+        scrape_status="ready",
+        strm_path="/media/电影合集/测试电影/测试电影.strm",
+    )
+    assert store.search_resources(
+        "测试",
+        ready_only=False,
+        unbuilt_only=True,
+    ) == []
+
+
 def test_find_metadata_source_matches_media_identity(tmp_path: Path) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")

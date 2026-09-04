@@ -27,6 +27,7 @@ def main() -> None:
             {
                 "enabled": True,
                 "native_search_enabled": True,
+                "native_search_scope": "all",
                 "search_ready_only": True,
                 "output_root": str(Path(temporary_directory) / "output"),
                 "output_size_limit_gb": 1,
@@ -58,6 +59,7 @@ def main() -> None:
         assert "/migrate-output" in api_paths
         assert "/resources/retry-all" in api_paths
         assert "/resources/import-manual" in api_paths
+        assert "/resources/save/{resource_id}" in api_paths
         assert "/gateway/restart" in api_paths
         assert "/clear-all" in api_paths
         page_text = str(plugin.get_page())
@@ -286,6 +288,13 @@ def main() -> None:
         assert len(results) == 1
         assert results[0].site_downloader == "腾讯文档115直链"
         assert parse_download_marker(results[0].enclosure) == "smoke-resource"
+        assert "/resources/save/smoke-resource" in results[0].page_url
+        save_page = plugin.save_search_resource(
+            SimpleNamespace(method="GET"),
+            "smoke-resource",
+            token=plugin._config["playback_token"],
+        )
+        assert "保存到媒体库" in save_page.body.decode("utf-8")
         async_results = asyncio.run(
             module["async_search_torrents"]({}, "测试电影")
         )

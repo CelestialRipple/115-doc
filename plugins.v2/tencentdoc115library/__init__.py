@@ -1,11 +1,18 @@
 from concurrent.futures import Future
+from html import escape
 from secrets import compare_digest, token_urlsafe
 from threading import Event, Lock
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Body, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response as HttpResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response as HttpResponse,
+)
 
 from app.log import logger
 from app.plugins import _PluginBase
@@ -75,6 +82,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "playback_token": "",
     "scrape_metadata": True,
     "native_search_enabled": True,
+    "native_search_scope": "unbuilt",
     "search_ready_only": True,
     "search_page_size": 50,
     "reuse_p115_cookie": True,
@@ -104,7 +112,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.10.0"
+    plugin_version = "0.10.1"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -408,17 +416,38 @@ class TencentDoc115Library(_PluginBase):
             100,
         )
         page_index = max(int(page or 0), 0)
+        search_scope = str(
+            self._config.get("native_search_scope") or "unbuilt"
+        ).strip().lower()
+        if search_scope not in {"unbuilt", "all", "ready"}:
+            search_scope = "unbuilt"
         resources = self._store.search_resources(
             keyword=keyword,
             limit=page_size,
             offset=page_index * page_size,
-            ready_only=bool(self._config.get("search_ready_only", True)),
+            ready_only=(
+                search_scope == "ready"
+                or (
+                    "native_search_scope" not in self._config
+                    and bool(self._config.get("search_ready_only", True))
+                )
+            ),
+            unbuilt_only=search_scope == "unbuilt",
         )
         results: List[TorrentInfo] = []
         for resource in resources:
             media_type = self._resource_media_type(resource)
             if mtype and media_type != mtype:
-                continue
+                sheet = self._store.get_sheet(
+                    str(resource.get("sheet_id") or "")
+                ) or {}
+                unresolved_mixed = (
+                    str(sheet.get("media_mode") or "").lower() == "mixed"
+                    and not str(resource.get("detected_media_type") or "").strip()
+                )
+                if not unresolved_mixed:
+                    continue
+                media_type = mtype
             title = str(resource.get("title") or "").strip()
             year = str(resource.get("year") or "").strip()
             version = str(resource.get("version") or "").strip()
@@ -430,8 +459,10 @@ class TencentDoc115Library(_PluginBase):
                 or resource.get("group_name")
                 or "腾讯文档"
             )
+            is_unbuilt = str(resource.get("strm_status") or "") != "ready"
             details = [
                 effective_group,
+                "待保存到媒体库" if is_unbuilt else "STRM已生成",
                 version,
                 f"评分 {resource['rating']}" if resource.get("rating") else "",
             ]
@@ -443,18 +474,123 @@ class TencentDoc115Library(_PluginBase):
                     title=display_title,
                     description=" · ".join(item for item in details if item),
                     enclosure=build_download_marker(resource["resource_id"]),
+                    page_url=self._library_save_url(resource["resource_id"]),
                     size=0,
                     seeders=1,
                     labels=[
                         "腾讯文档",
                         "115分享",
                         effective_group,
+                        "右下角ⓘ保存" if is_unbuilt else "已入库",
                     ],
                     pri_order=100,
                     category=media_type.value,
                 )
             )
         return results
+
+    def _library_save_url(self, resource_id: str) -> str:
+        """生成带插件密钥的搜索结果保存确认页地址。"""
+        token = str(self._config.get("playback_token") or "")
+        query = urlencode({"token": token})
+        return (
+            "/api/v1/plugin/TencentDoc115Library/"
+            f"resources/save/{resource_id}?{query}"
+        )
+
+    def save_search_resource(
+        self,
+        request: Request,
+        resource_id: str,
+        token: str = Query(default=""),
+    ) -> HttpResponse:
+        """显示或执行搜索结果的定向 STRM 入库操作。"""
+        expected_token = str(self._config.get("playback_token") or "")
+        if not expected_token or not compare_digest(token, expected_token):
+            return HTMLResponse("<h2>保存密钥无效</h2>", status_code=401)
+        if not self._store or not self._builder:
+            return HTMLResponse("<h2>插件尚未初始化</h2>", status_code=503)
+        resource = self._store.get_resource(resource_id)
+        if not resource or resource.get("status") == "removed":
+            return HTMLResponse("<h2>资源不存在或已移除</h2>", status_code=404)
+        title = escape(str(resource.get("title") or resource_id))
+        group_name = escape(
+            str(
+                resource.get("detected_group_name")
+                or resource.get("group_name")
+                or "未分组"
+            )
+        )
+        media_type = escape(
+            str(
+                resource.get("detected_media_type")
+                or resource.get("media_type")
+                or "自动识别"
+            )
+        )
+        if request.method.upper() == "POST":
+            if str(resource.get("strm_status") or "") == "ready":
+                message = "该资源已经生成 STRM，无需重复保存。"
+                success = True
+            else:
+                response = self._submit(
+                    "保存搜索资源到媒体库",
+                    self._builder.build,
+                    limit=1,
+                    retry_failed=True,
+                    resource_ids=[resource_id],
+                )
+                success = bool(response.success)
+                message = str(response.message or "已提交")
+            color = "#2e7d32" if success else "#c62828"
+            return HTMLResponse(
+                self._save_page_html(
+                    title,
+                    group_name,
+                    media_type,
+                    escape(message),
+                    color,
+                )
+            )
+        return HTMLResponse(
+            self._save_page_html(title, group_name, media_type)
+        )
+
+    @staticmethod
+    def _save_page_html(
+        title: str,
+        group_name: str,
+        media_type: str,
+        message: str = "",
+        message_color: str = "#1565c0",
+    ) -> str:
+        """渲染无需 MoviePilot 前端扩展的轻量保存确认页。"""
+        result = (
+            f'<p style="color:{message_color};font-weight:600">{message}</p>'
+            if message
+            else ""
+        )
+        button = (
+            ""
+            if message
+            else (
+                '<form method="post"><button type="submit">保存到媒体库</button>'
+                "</form>"
+            )
+        )
+        return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>保存到媒体库</title><style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+background:#10131a;color:#eef2f7;margin:0;padding:24px}}
+main{{max-width:560px;margin:10vh auto;background:#1b202b;border-radius:16px;
+padding:28px;box-shadow:0 12px 40px #0006}}
+p{{color:#b8c0cc;line-height:1.7}}button{{border:0;border-radius:10px;
+background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
+</style></head><body><main><h2>{title}</h2>
+<p>输出文件夹：{group_name}<br>媒体类型：{media_type}</p>{result}{button}
+</main></body></html>"""
 
     async def async_search_torrents(
         self,
@@ -1083,6 +1219,13 @@ class TencentDoc115Library(_PluginBase):
                 "auth": "bear",
             },
             {
+                "path": "/resources/save/{resource_id}",
+                "endpoint": self.save_search_resource,
+                "methods": ["GET", "POST"],
+                "summary": "确认并保存原生搜索结果到 STRM 媒体库",
+                "allow_anonymous": True,
+            },
+            {
                 "path": "/sync-all",
                 "endpoint": self.start_sync_all,
                 "methods": ["POST"],
@@ -1432,13 +1575,31 @@ class TencentDoc115Library(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VSwitch",
+                                        "component": "VSelect",
                                         "props": {
-                                            "model": "search_ready_only",
-                                            "label": "只检索已生成STRM资源",
+                                            "model": "native_search_scope",
+                                            "label": "MoviePilot检索范围",
+                                            "items": [
+                                                {
+                                                    "title": "仅未入库资源",
+                                                    "value": "unbuilt",
+                                                },
+                                                {
+                                                    "title": "全部有效资源",
+                                                    "value": "all",
+                                                },
+                                                {
+                                                    "title": "仅已生成STRM",
+                                                    "value": "ready",
+                                                },
+                                            ],
+                                            "item-title": "title",
+                                            "item-value": "value",
+                                            "persistent-hint": True,
+                                            "hint": "推荐仅未入库；生成后改在 Emby 中搜索",
                                         },
                                     }
                                 ],

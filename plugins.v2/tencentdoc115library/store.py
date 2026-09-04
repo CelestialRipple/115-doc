@@ -916,6 +916,7 @@ class CatalogStore:
         limit: int = 50,
         offset: int = 0,
         ready_only: bool = True,
+        unbuilt_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """从本地镜像目录搜索资源，不访问腾讯文档或 115。"""
         escaped = (
@@ -926,11 +927,17 @@ class CatalogStore:
             .replace("_", "\\_")
         )
         pattern = f"%{escaped}%"
-        status_clause = (
-            "AND status = 'ready'"
-            if ready_only
-            else ("AND status NOT IN ('removed', 'invalid_share', 'share_error')")
-        )
+        if unbuilt_only:
+            status_clause = (
+                "AND strm_status <> 'ready' "
+                "AND status NOT IN ('removed', 'invalid_share')"
+            )
+        elif ready_only:
+            status_clause = "AND status = 'ready'"
+        else:
+            status_clause = (
+                "AND status NOT IN ('removed', 'invalid_share')"
+            )
         query = f"""
             SELECT * FROM resource
             WHERE (title LIKE ? ESCAPE '\\'
