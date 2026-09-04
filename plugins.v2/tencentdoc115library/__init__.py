@@ -117,7 +117,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "匿名校验 115 分享并识别电影、剧集，使用 MoviePilot 刮削和按需直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.10.4"
+    plugin_version = "0.10.5"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -195,6 +195,15 @@ class TencentDoc115Library(_PluginBase):
         )
         if retried:
             logger.info(f"已自动重新排队 {retried} 条 V2 识别接口兼容失败资源")
+        repaired_builds = sum(
+            self._store.retry_errors_containing(fragment)
+            for fragment in (
+                "无法识别任何剧集编号",
+                "File name too long",
+            )
+        )
+        if repaired_builds:
+            logger.info(f"已自动重新排队 {repaired_builds} 条可修复的构建失败资源")
         self._resolver = ShareResolver(
             store=self._store,
             config_provider=self._current_config,

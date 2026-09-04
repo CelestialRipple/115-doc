@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import tencentdoc115library.library as library_module
 from tencentdoc115library.library import LibraryBuilder
 from tencentdoc115library.library import MediaType
+from tencentdoc115library.library import safe_path_segment
 from tencentdoc115library.store import CatalogStore
 
 
@@ -292,6 +293,97 @@ def test_tv_iso_disc_episode_patterns() -> None:
     assert LibraryBuilder._episode_identity("第4碟.iso") == (1, 4)
     assert LibraryBuilder._episode_identity("05.iso") == (1, 5)
     assert LibraryBuilder._episode_identity("Bonus.iso") == (None, None)
+
+
+def test_tv_files_without_episode_markers_use_natural_path_order(
+    tmp_path: Path,
+) -> None:
+    captured_files = []
+
+    class Store:
+        @staticmethod
+        def replace_resource_files(_resource_id, files):
+            captured_files.extend(files)
+
+    builder = LibraryBuilder(
+        store=Store(),
+        resolver=object(),
+        config_provider=lambda: {
+            "public_base_url": "http://moviepilot:3000",
+            "playback_token": "test-token",
+        },
+        stop_event=Event(),
+    )
+    source_files = [
+        {"file_id": "ten", "file_name": "video10.mkv", "file_path": "/video10.mkv"},
+        {"file_id": "two", "file_name": "video2.mkv", "file_path": "/video2.mkv"},
+        {
+            "file_id": "amazon",
+            "file_name": "[神话亚马逊 Mythos Amazonas 2010][无中字].iso",
+            "file_path": "/[神话亚马逊 Mythos Amazonas 2010][无中字].iso",
+        },
+    ]
+
+    result = builder._build_tv(
+        {"resource_id": "natural-tv", "title": "测试剧集", "year": "2020"},
+        meta=SimpleNamespace(begin_season=2),
+        mediainfo=SimpleNamespace(title="测试剧集", year="2020"),
+        directory=tmp_path / "测试剧集 (2020)",
+        source_files=source_files,
+    )
+
+    generated = sorted(Path(result).rglob("*.strm"))
+    assert [item.name for item in generated] == [
+        "测试剧集 (2020) - S02E01.strm",
+        "测试剧集 (2020) - S02E02.strm",
+        "测试剧集 (2020) - S02E03.strm",
+    ]
+    assert [item["file_id"] for item in captured_files] == ["amazon", "two", "ten"]
+    assert [item["episode"] for item in captured_files] == [1, 2, 3]
+
+
+def test_movie_strm_filename_respects_utf8_path_segment_limit(tmp_path: Path) -> None:
+    captured_files = []
+
+    class Store:
+        @staticmethod
+        def replace_resource_files(_resource_id, files):
+            captured_files.extend(files)
+
+    class Resolver:
+        @staticmethod
+        def choose_movie_file(files):
+            return files[0]
+
+    builder = LibraryBuilder(
+        store=Store(),
+        resolver=Resolver(),
+        config_provider=lambda: {
+            "public_base_url": "http://moviepilot:3000",
+            "playback_token": "test-token",
+        },
+        stop_event=Event(),
+    )
+    resource = {
+        "resource_id": "long-movie",
+        "title": "天国王朝",
+        "year": "2005",
+        "version": "导演剪辑版国语简繁字幕" * 30,
+    }
+    path = builder._build_movie(
+        resource,
+        meta=SimpleNamespace(),
+        mediainfo=SimpleNamespace(title="天国王朝", year="2005"),
+        directory=tmp_path / "天国王朝 (2005)",
+        source_files=[
+            {"file_id": "movie", "file_name": "movie.iso", "file_path": "/movie.iso"}
+        ],
+    )
+
+    assert Path(path).is_file()
+    assert len(Path(path).name.encode("utf-8")) <= 255
+    assert len(safe_path_segment("中" * 200).encode("utf-8")) <= 180
+    assert captured_files[0]["strm_path"] == path
 
 
 def test_unrecognized_movie_still_generates_strm_without_metadata(

@@ -31,6 +31,7 @@ from .storage_limit import configured_limit_bytes, directory_size
 from .store import CatalogStore
 
 INVALID_PATH_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+MAX_PATH_SEGMENT_BYTES = 180
 TV_TYPE_KEYWORDS = ("电视剧", "剧集", "连续剧", "tv", "番剧")
 MOVIE_TYPE_KEYWORDS = ("电影", "movie", "影片")
 GENERATED_METADATA_SUFFIXES = {
@@ -112,6 +113,14 @@ def chinese_number(value: str) -> Optional[int]:
     return int("".join(str(digit) for digit in digits))
 
 
+def truncate_utf8(value: str, max_bytes: int) -> str:
+    """按 UTF-8 字节安全截断，不留下半个多字节字符。"""
+    encoded = str(value or "").encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return str(value or "")
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(" .")
+
+
 def safe_path_segment(value: str, fallback: str = "未命名") -> str:
     """
     把外部标题转换为安全的单个路径片段
@@ -123,7 +132,25 @@ def safe_path_segment(value: str, fallback: str = "未命名") -> str:
     """
     result = INVALID_PATH_CHARACTERS.sub(" ", str(value or ""))
     result = re.sub(r"\s+", " ", result).strip(" .")
-    return result[:180] or fallback
+    result = truncate_utf8(result, MAX_PATH_SEGMENT_BYTES)
+    if result:
+        return result
+    fallback_value = INVALID_PATH_CHARACTERS.sub(" ", str(fallback or ""))
+    fallback_value = re.sub(r"\s+", " ", fallback_value).strip(" .")
+    return truncate_utf8(fallback_value, MAX_PATH_SEGMENT_BYTES)
+
+
+def strm_file_name(stem: str) -> str:
+    """生成不会超过常见 NAS 单路径片段限制的 STRM 文件名。"""
+    return f"{safe_path_segment(stem)}.strm"
+
+
+def natural_path_key(value: str) -> Tuple[Tuple[int, Any], ...]:
+    """按路径中的文字和数字自然排序，保证跨平台结果稳定。"""
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part.casefold())
+        for part in re.split(r"(\d+)", str(value or ""))
+    )
 
 
 class LibraryBuildError(RuntimeError):
@@ -928,7 +955,9 @@ class LibraryBuilder:
         directory = directory or self._base_directory(resource, mediainfo)
         base_name = self._media_directory_name(resource, mediainfo)
         version = safe_path_segment(str(resource.get("version") or ""), "")
-        filename = f"{base_name} - {version}.strm" if version else f"{base_name}.strm"
+        filename = strm_file_name(
+            f"{base_name} - {version}" if version else base_name
+        )
         strm_path = directory / filename
         self._write_strm(
             strm_path,
@@ -1007,24 +1036,41 @@ class LibraryBuilder:
         if source_files is None:
             source_files = self.resolver.list_video_files(resource["share_url"])
         expanded_files: List[Dict[str, Any]] = []
-        unrecognized_files = []
+        identified_files = []
         media_name = self._media_directory_name(resource, mediainfo)
         for source_file in source_files:
             season, episode = self._episode_identity(
                 source_file["file_name"],
                 str(source_file.get("file_path") or ""),
             )
+            identified_files.append((source_file, season, episode))
+        if not any(episode is not None for _, _, episode in identified_files):
+            fallback_season = int(getattr(meta, "begin_season", None) or 1)
+            identified_files = [
+                (source_file, fallback_season, index)
+                for index, source_file in enumerate(
+                    sorted(
+                        source_files,
+                        key=lambda item: natural_path_key(
+                            str(item.get("file_path") or item.get("file_name") or "")
+                        ),
+                    ),
+                    start=1,
+                )
+            ]
+        unrecognized_files = []
+        for source_file, season, episode in identified_files:
             if episode is None:
                 unrecognized_files.append(source_file["file_name"])
                 continue
             season_directory = directory / f"Season {season:02d}"
-            strm_path = season_directory / (
-                f"{media_name} - S{season:02d}E{episode:02d}.strm"
+            strm_path = season_directory / strm_file_name(
+                f"{media_name} - S{season:02d}E{episode:02d}"
             )
             if any(item.get("strm_path") == str(strm_path) for item in expanded_files):
                 suffix = safe_path_segment(Path(source_file["file_name"]).stem)
-                strm_path = season_directory / (
-                    f"{media_name} - S{season:02d}E{episode:02d} - {suffix}.strm"
+                strm_path = season_directory / strm_file_name(
+                    f"{media_name} - S{season:02d}E{episode:02d} - {suffix}"
                 )
             self._write_strm(
                 strm_path,
