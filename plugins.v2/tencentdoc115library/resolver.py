@@ -809,9 +809,24 @@ class ShareResolver:
     def _offline_task_complete(task: Dict[str, Any]) -> bool:
         """判断115离线任务是否已经完整结束。"""
         try:
-            return int(task.get("status")) == 2
+            status = int(task.get("status"))
         except (TypeError, ValueError):
             return False
+        if status == 2:
+            return True
+        raw_percent = (
+            task.get("percentDone")
+            or task.get("percent")
+            or task.get("progress")
+            or 0
+        )
+        try:
+            percent = float(str(raw_percent).rstrip("%"))
+        except (TypeError, ValueError):
+            percent = 0
+        # 当前群晖套件中的 p115client 在文件已经可签发直链时仍可能返回
+        # status=1、percent=100，因此同时接受这一稳定状态。
+        return status == 1 and percent >= 100
 
     def _private_download_url(self, pick_code: str, user_agent: str) -> str:
         """为个人网盘文件生成临时直链。"""

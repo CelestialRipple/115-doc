@@ -119,3 +119,9 @@ def test_direct_url_force_refresh_bypasses_cache() -> None:
 
     assert first != second
     assert len(calls) == 2
+
+
+def test_offline_task_complete_accepts_dsm_ready_state() -> None:
+    assert ShareResolver._offline_task_complete({"status": 1, "percent": 100})
+    assert ShareResolver._offline_task_complete({"status": 2, "percent": 0})
+    assert not ShareResolver._offline_task_complete({"status": 1, "percent": 99})
