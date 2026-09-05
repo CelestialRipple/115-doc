@@ -55,5 +55,18 @@
             "v0.2.0": "增加同步全部并生成后台流水线、安全停止按钮，以及 STRM/NFO/图片输出目录空间上限",
             "v0.1.0": "首个开发版本：工作表分组、分页同步、SQLite断点、限量构建、按需播放和原生检索下载"
         }
+    },
+    "Re0Search": {
+        "name": "RE0资源搜索",
+        "description": "使用MoviePilot内置浏览器登录RE0，按TMDB搜索、确认解锁并可保存到媒体库",
+        "labels": "资源搜索,115网盘,磁力,ED2K",
+        "version": "0.1.0",
+        "icon": "https://re0.me/apple-touch-icon.png",
+        "author": "CelestialRipple",
+        "level": 1,
+        "system_version": ">=2.13.14",
+        "history": {
+            "v0.1.0": "独立RE0登录会话、MoviePilot媒体识别、资源搜索、积分确认解锁、可选媒体库导入和每日签到"
+        }
     }
 }
