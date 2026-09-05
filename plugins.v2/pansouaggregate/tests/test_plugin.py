@@ -164,3 +164,46 @@ def test_115_download_lists_files_preserves_code_and_user_agent(
     )
     assert calls[-1][0][1:] == ("2", "Browser-UA")
     assert calls[-1][1] == {"force_refresh": True}
+
+
+def test_save_type_is_visible_validated_and_forwarded(plugin, client, monkeypatch):
+    captured = []
+    target = SimpleNamespace(
+        import_manual_resources=lambda action: (
+            captured.append(action) or SimpleNamespace(message="已提交")
+        )
+    )
+    monkeypatch.setattr("pansouaggregate.library_plugin", lambda: target)
+    item = Resource("Movie", "https://115.com/s/abc", "PanSou", "115")
+    plugin._engine._remember([item])
+    url = plugin._resource_url(item.id)
+    page = client.get(url).text
+    assert '<select name="media_mode">' in page
+    assert 'value="mixed" selected' in page
+    for mode in ["movie", "tv", "mixed"]:
+        assert (
+            client.post(url, content="group=Movies&media_mode=" + mode).status_code
+            == 200
+        )
+        assert captured[-1].media_mode == mode
+    assert client.post(url, content="media_mode=invalid").status_code == 400
+    assert len(captured) == 3
+
+
+def test_custom_web_native_entries_redirect_without_library_calls(
+    plugin, client, monkeypatch
+):
+    monkeypatch.setattr("pansouaggregate.engine.PanSouClient.search", lambda *a: [])
+    plugin._engine.config["web_searches"] = (
+        "Example|https://example.com/search?q={keyword}"
+    )
+    native = plugin.search_torrents({}, "千与千寻")
+    item = next(t for t in native if t.site_name == "聚合网页搜索")
+    for url in [
+        item.page_url,
+        item.page_url.split("#")[0].replace("/resource/", "/download/"),
+    ]:
+        response = client.get(url, follow_redirects=False)
+        assert response.status_code == 302
+        assert response.headers["location"].startswith("https://example.com/search?q=")
+    assert client.post(item.page_url, content="group=Movies").status_code == 400

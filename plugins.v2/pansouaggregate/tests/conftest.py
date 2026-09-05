@@ -40,6 +40,7 @@ def plugin():
             "pansou_url": "http://nas:7080",
             "ui_key": "test-private-key",
             "bt4g_enabled": True,
+            "web_searches": "",
         }
     )
     yield plugin

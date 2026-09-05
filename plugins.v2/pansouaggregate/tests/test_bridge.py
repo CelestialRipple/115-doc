@@ -71,3 +71,27 @@ def test_modern_moviepilot_does_not_patch_sites(monkeypatch):
     bridge = SearchBridge(SimpleNamespace())
     assert bridge.install() == "原生插件搜索"
     assert bridge.patches == []
+
+
+def test_protected_inherited_host_methods_restore_across_config_reloads():
+    class Protected(type):
+        def __delattr__(cls, name):
+            if name == "get_indexers":
+                raise AttributeError("Cannot delete protected attribute")
+            return super().__delattr__(name)
+
+    class Base:
+        def get_indexers(self):
+            return ["existing"]
+
+    class Helper(Base, metaclass=Protected):
+        pass
+
+    original = Helper.get_indexers
+    for _ in range(3):
+        bridge = SearchBridge(SimpleNamespace())
+        bridge._patch(Helper, "get_indexers", lambda self: ["aggregate"])
+        assert Helper().get_indexers() == ["aggregate"]
+        bridge.uninstall()
+        assert Helper.get_indexers is original
+        assert Helper().get_indexers() == ["existing"]

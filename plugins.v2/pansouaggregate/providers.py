@@ -88,7 +88,7 @@ def dedupe(items, limit=100):
     return list(unique.values())
 
 
-def normalize_pansou(payload, limit=100):
+def normalize_pansou(payload, limit=100, allowed_clouds=None):
     if not isinstance(payload, dict):
         raise ProviderError("PanSou 返回格式不正确")
     if isinstance(payload.get("data"), dict):
@@ -132,6 +132,8 @@ def normalize_pansou(payload, limit=100):
             if url.startswith("ed2k:")
             else cloud
         )
+        if allowed_clouds is not None and cloud not in allowed_clouds:
+            continue
         title = str(
             row.get("note") or row.get("title") or row.get("work_title") or "未命名资源"
         ).strip()[:500]
@@ -247,8 +249,13 @@ class PanSouClient:
                     raise ProviderError("PanSou 登录未返回访问令牌")
             if token:
                 headers["Authorization"] = "Bearer " + token
-            body = {"kw": keyword, "res": "merge", "src": "all"}
-            for field in ("plugins", "cloud_types", "channels"):
+            body = {
+                "kw": keyword,
+                "res": "merge",
+                "src": "all",
+                "cloud_types": ["115", "magnet"],
+            }
+            for field in ("plugins", "channels"):
                 raw = self.config.get(field)
                 values = (
                     raw
@@ -268,7 +275,9 @@ class PanSouClient:
                     json=body,
                 )
             )
-        return normalize_pansou(data, int(self.config.get("limit", 100)))
+        return normalize_pansou(
+            data, int(self.config.get("limit", 100)), {"115", "magnet"}
+        )
 
 
 def bt4g_search_url(base, keyword, page=0):

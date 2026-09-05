@@ -113,7 +113,7 @@ function aggregateTorrent(site_name = 'PanSou聚合搜索', id = 'a'.repeat(32))
     page_url:`/api/v1/plugin/PanSouAggregate/resource/${id}?${query}#mp-pansou=${new URLSearchParams({url:target})}`};
 }
 test('PanSou and BT4G native clicks open scoped browser routes without downloader', () => {
-  for (const name of ['PanSou聚合搜索', 'BT4G网页搜索']) {
+  for (const name of ['PanSou聚合搜索', 'BT4G网页搜索', '聚合网页搜索']) {
     const env=environment(), item=aggregateTorrent(name);
     env.source.emit({torrent_info:item});
     assert.equal(env.click(item).stopped,true);

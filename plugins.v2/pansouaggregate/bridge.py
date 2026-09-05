@@ -137,5 +137,10 @@ class SearchBridge:
                     if owned:
                         setattr(cls, name, original)
                     else:
-                        delattr(cls, name)
+                        try:
+                            delattr(cls, name)
+                        except AttributeError:
+                            # Synology builds protect inherited SitesHelper methods
+                            # through their metaclass. Restore via its supported setter.
+                            setattr(cls, name, original)
             self.patches.clear()

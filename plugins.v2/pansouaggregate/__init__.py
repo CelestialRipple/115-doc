@@ -26,13 +26,14 @@ from .downloads import DownloadService, download_response, library_plugin, share
 from .engine import SearchEngine
 from .providers import bt4g_search_url
 from .ui import SEARCH_HTML
+from .shortcuts import DEFAULT_WEB_SEARCHES
 
 
 class PanSouAggregate(_PluginBase):
     plugin_name = "PanSou聚合搜索"
-    plugin_desc = "原生搜索聚合 PanSou，支持浏览器下载、115媒体库保存和 BT4G 网页搜索"
+    plugin_desc = "原生聚合115和磁力，支持浏览器下载、按类型保存影视库及自定义网页入口"
     plugin_icon = "https://raw.githubusercontent.com/CelestialRipple/115-doc/main/docs/pansouaggregate/icon.svg"
-    plugin_version = "0.2.0"
+    plugin_version = "0.3.0"
     plugin_author = "CelestialRipple"
     author_url = "https://github.com/CelestialRipple"
     plugin_config_prefix = "pansouaggregate_"
@@ -44,6 +45,7 @@ class PanSouAggregate(_PluginBase):
         defaults = {
             "enabled": False,
             "pansou_enabled": True,
+            "web_searches": DEFAULT_WEB_SEARCHES,
             "bt4g_enabled": True,
             "pansou_url": "",
             "bt4g_url": "https://bt4gprx.com",
@@ -129,13 +131,19 @@ class PanSouAggregate(_PluginBase):
             logger.warning(f"PanSou聚合搜索 {name}：{message}")
         return [
             TorrentInfo(
-                site_name="BT4G网页搜索" if item.cloud == "bt4g" else "PanSou聚合搜索",
+                site_name=(
+                    "BT4G网页搜索"
+                    if item.cloud == "bt4g"
+                    else "聚合网页搜索"
+                    if item.cloud == "web"
+                    else "PanSou聚合搜索"
+                ),
                 site_order=0,
                 title=item.title,
                 description=f"{item.source} · {item.cloud} · "
                 + (
                     "点击打开网页搜索"
-                    if item.cloud == "bt4g"
+                    if item.cloud in {"bt4g", "web"}
                     else "点击下载 · ⓘ保存影视库"
                 ),
                 enclosure="pansou://" + item.id,
@@ -226,7 +234,7 @@ class PanSouAggregate(_PluginBase):
 
     async def resource_page(self, rid: str, request: Request):
         item = self._resource(rid, request)
-        if item.cloud == "bt4g":
+        if item.cloud in {"bt4g", "web"}:
             from starlette.responses import RedirectResponse
 
             return RedirectResponse(item.url, status_code=302, headers=self._headers())
@@ -239,12 +247,12 @@ class PanSouAggregate(_PluginBase):
         )
         supported = item.cloud in {"115", "magnet", "ed2k"}
         form = (
-            '<form method="post"><label>直属文件夹 <input name="group" value="聚合搜索" maxlength="60"></label><button>保存影视库</button><p>此操作提交后台导入和刮削；磁力或 ED2K 首次播放时才进行115离线。</p></form>'
+            '<form method="post"><label>直属文件夹 <input name="group" value="聚合搜索" maxlength="60"></label><label>类型 <select name="media_mode"><option value="mixed" selected>混合（自动识别）</option><option value="movie">电影</option><option value="tv">电视剧</option></select></label><button>保存影视库</button><p>此操作提交后台导入和刮削；磁力或 ED2K 首次播放时才进行115离线。</p></form>'
             if supported
             else ""
         )
         # POST is same URL with its short, resource-scoped signature. No global key.
-        content = f'<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>{escape(item.title)}</title><style>body{{font:17px system-ui;max-width:800px;margin:3em auto;padding:1em;line-height:1.7}}input,button{{font:inherit;padding:.5em;margin:.5em}}textarea{{width:100%;height:100px}}</style><h1>{escape(item.title)}</h1><p>{escape(item.source)} · {escape(item.cloud)}</p><p>提取码：{escape(item.password or "无")}</p><p><a href="{escape(item.url, quote=True)}" target="_blank" rel="noopener noreferrer">打开原始资源</a></p><textarea readonly>{escape(item.url)}</textarea>{form}<p><a href="{download}" target="_blank" rel="noopener noreferrer">浏览器下载 / 打开网盘</a></p><p>115 分享可选视频文件后下载；磁力和 ED2K 通过115离线解析后下载。其他网盘打开原始分享页。</p>'
+        content = f'<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>{escape(item.title)}</title><style>body{{font:17px system-ui;max-width:800px;margin:3em auto;padding:1em;line-height:1.7}}input,select,button{{font:inherit;padding:.5em;margin:.5em}}textarea{{width:100%;height:100px}}</style><h1>{escape(item.title)}</h1><p>{escape(item.source)} · {escape(item.cloud)}</p><p>提取码：{escape(item.password or "无")}</p><p><a href="{escape(item.url, quote=True)}" target="_blank" rel="noopener noreferrer">打开原始资源</a></p><textarea readonly>{escape(item.url)}</textarea>{form}<p><a href="{download}" target="_blank" rel="noopener noreferrer">浏览器下载 / 打开网盘</a></p><p>115 分享可选视频文件后下载；磁力和 ED2K 通过115离线解析后下载。其他网盘打开原始分享页。</p>'
         return HTMLResponse(content, headers=self._headers())
 
     async def download(self, rid: str, request: Request):
@@ -262,11 +270,11 @@ class PanSouAggregate(_PluginBase):
             body.extend(chunk)
             if len(body) > 4096:
                 raise HTTPException(413, "表单过大")
-        group = (
-            parse_qs(body.decode(errors="replace"))
-            .get("group", ["聚合搜索"])[0]
-            .strip()
-        )
+        form = parse_qs(body.decode(errors="replace"))
+        group = form.get("group", ["聚合搜索"])[0].strip()
+        mode = form.get("media_mode", ["mixed"])[0]
+        if mode not in {"movie", "tv", "mixed"}:
+            raise HTTPException(400, "类型须选择电影、电视剧或混合")
         if (
             not group
             or len(group) > 60
@@ -283,7 +291,7 @@ class PanSouAggregate(_PluginBase):
             result = await asyncio.to_thread(
                 target.import_manual_resources,
                 SimpleNamespace(
-                    links=f"{title}|{url}", group_name=group, media_mode="mixed"
+                    links=f"{title}|{url}", group_name=group, media_mode=mode
                 ),
             )
             return HTMLResponse(
@@ -353,7 +361,7 @@ class PanSouAggregate(_PluginBase):
             {
                 "component": "VAlert",
                 "props": {"type": "info", "variant": "tonal"},
-                "text": f"搜索入口：{getattr(self, '_bridge_status', '未初始化')}。原生结果点击下载，右下角ⓘ保存影视库；BT4G 点击后在新标签页搜索。",
+                "text": f"搜索入口：{getattr(self, '_bridge_status', '未初始化')}。PanSou 仅显示115和磁力。原生结果点击下载，ⓘ中选择电影／电视剧／混合后保存；网页入口点击后在新标签页打开。",
             },
             {
                 "component": "VBtn",
@@ -381,15 +389,15 @@ class PanSouAggregate(_PluginBase):
                 {"type": "password"},
             ),
             ("plugins", "PanSou 搜索插件（逗号分隔，留空全部）", "VTextField", {}),
-            (
-                "cloud_types",
-                "网盘类型（如 115,magnet,ed2k，留空全部）",
-                "VTextField",
-                {},
-            ),
             ("channels", "TG 频道（逗号分隔，留空使用服务默认）", "VTextField", {}),
             ("bt4g_enabled", "显示 BT4G 网页搜索入口", "VSwitch", {}),
             ("bt4g_url", "BT4G 地址", "VTextField", {}),
+            (
+                "web_searches",
+                "网页入口（每行：名称|网址，{keyword} 替换为搜索词；清空则不显示）",
+                "VTextarea",
+                {"rows": 5},
+            ),
             ("timeout", "单来源请求超时秒数（5–45）", "VTextField", {"type": "number"}),
             ("limit", "每次最多结果数（1–200）", "VTextField", {"type": "number"}),
             (
@@ -413,6 +421,7 @@ class PanSouAggregate(_PluginBase):
         ], {
             "enabled": False,
             "pansou_enabled": True,
+            "web_searches": DEFAULT_WEB_SEARCHES,
             "bt4g_enabled": True,
             "bt4g_url": "https://bt4gprx.com",
             "timeout": 20,

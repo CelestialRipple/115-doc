@@ -3,7 +3,7 @@ export function openPluginBrowserDownload(torrent?: {
   site_name?: string; enclosure?: string; page_url?: string;
 }): boolean {
   try {
-    if (['PanSou聚合搜索', 'BT4G网页搜索'].includes(torrent?.site_name || '')) {
+    if (['PanSou聚合搜索', 'BT4G网页搜索', '聚合网页搜索'].includes(torrent?.site_name || '')) {
       const id = /^pansou:\/\/([a-f0-9]{32})$/.exec(torrent?.enclosure || '')?.[1]
       const detail = new URL(torrent?.page_url || '', location.origin)
       if (!id || detail.origin !== location.origin || detail.pathname !== '/api/v1/plugin/PanSouAggregate/resource/' + id

@@ -12,6 +12,8 @@ from .providers import (
     http_url,
 )
 
+from .shortcuts import website_shortcuts
+
 
 class SearchEngine:
     def __init__(self, config):
@@ -77,7 +79,10 @@ class SearchEngine:
                 errors["PanSou"] = str(error)
             except Exception:
                 errors["PanSou"] = "请求失败，请检查网络、服务地址和认证配置"
-        items = dedupe(items, self.config["limit"])
+        items = dedupe(
+            [item for item in items if item.cloud in {"115", "magnet"}],
+            self.config["limit"],
+        )
         if self.config.get("bt4g_enabled"):
             base = http_url(self.config.get("bt4g_url", ""))
             if base:
@@ -91,6 +96,11 @@ class SearchEngine:
                 )
             else:
                 errors["BT4G"] = "请配置有效的 BT4G 地址"
+        shortcuts, shortcut_errors = website_shortcuts(
+            self.config.get("web_searches"), keyword
+        )
+        items.extend(shortcuts)
+        errors.update(shortcut_errors)
         with self.lock:
             if self.stopped:
                 return [], {}

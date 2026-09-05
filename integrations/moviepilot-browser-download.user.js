@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MoviePilot 聚合资源浏览器下载
 // @namespace    https://github.com/CelestialRipple/115-doc
-// @version      0.14.0
+// @version      0.15.0
 // @description  点击腾讯文档115搜索结果后使用浏览器直链下载，不创建下载器任务
 // @match        http://*/*
 // @match        https://*/*
@@ -15,13 +15,13 @@
   // 只读取同源搜索响应，不读取登录 Token，不发送额外网络请求。
   if (window.__mpAggregateBrowserAdapter) return;
   window.__mpAggregateBrowserAdapter = true;
-  const pluginNames = ['腾讯文档115媒体库', 'PanSou聚合搜索', 'BT4G网页搜索'];
+  const pluginNames = ['腾讯文档115媒体库', 'PanSou聚合搜索', 'BT4G网页搜索', '聚合网页搜索'];
   const pluginName = '腾讯文档115媒体库';
   const prefix = '/api/v1/plugin/TencentDoc115Library/resources/browser/';
   const records = new Map();
   function browserUrl(torrent, origin = location.origin) {
     try {
-      if (['PanSou聚合搜索', 'BT4G网页搜索'].includes(torrent?.site_name)) {
+      if (['PanSou聚合搜索', 'BT4G网页搜索', '聚合网页搜索'].includes(torrent?.site_name)) {
         const marker = /^pansou:\/\/([a-f0-9]{32})$/.exec(torrent.enclosure || '');
         if (!marker) return '';
         const detail = new URL(torrent.page_url, origin);
