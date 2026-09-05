@@ -244,18 +244,35 @@ class CatalogParser:
         links: List[Dict[str, Any]] = []
         for candidate in candidates:
             links.extend(extract_source_links(str(candidate or "")))
+        usable_links: List[Dict[str, Any]] = []
+        parsed_http_paths: Dict[int, str] = {}
         for link in links:
+            if link["kind"] != "http":
+                usable_links.append(link)
+                continue
+            try:
+                parsed = urlsplit(str(link["url"]))
+            except ValueError:
+                # 智能表的 URL 字段有时会把资源描述错误包装为
+                # https://1080P蓝光原盘[... ]。方括号会被 urlsplit 当作
+                # IPv6 主机语法；忽略这类伪链接，继续查找同一行的磁力或 ED2K。
+                continue
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                continue
+            parsed_http_paths[id(link)] = parsed.path
+            usable_links.append(link)
+        for link in usable_links:
             url = str(link["url"])
             if link["kind"] == "http" and re.search(
                 r"/(?:s|share)/[^/?#&]+",
-                urlsplit(url).path,
+                parsed_http_paths.get(id(link), ""),
                 re.IGNORECASE,
             ):
                 return url
-        for link in links:
+        for link in usable_links:
             if link["kind"] in {"magnet", "ed2k"}:
                 return str(link["url"])
-        return str(links[0]["url"]) if links else ""
+        return str(usable_links[0]["url"]) if usable_links else ""
 
     @staticmethod
     def _resource_id(sheet_id: str, title: str, version: str, share_url: str) -> str:

@@ -224,6 +224,29 @@ def test_controlled_fuzzy_headers_accept_media_names_but_not_unrelated_names() -
     assert mapping["share_url"] == 2
 
 
+def test_smart_row_ignores_description_miswrapped_as_http_before_magnet() -> None:
+    headers = ["动漫名称", "资源描述", "网盘链接", "磁力链接"]
+    resource = CatalogParser.parse_row(
+        sheet_id="smart-anime",
+        sheet_title="文档2（动漫区）",
+        group_name="动漫",
+        row_number=220,
+        row=[
+            "百米。",
+            "1080P蓝光原盘",
+            "https://1080P蓝光原盘[日版原盘 DIY 台译简繁字幕][33.78G]",
+            "https://magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+        ],
+        header_map=CatalogParser.identify_headers(headers),
+        media_mode="mixed",
+    )
+
+    assert resource is not None
+    assert resource["share_url"] == (
+        "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+    )
+
+
 def test_parser_prioritizes_share_path_across_alternate_domains() -> None:
     resource = CatalogParser.parse_row(
         sheet_id="sheet-a",
