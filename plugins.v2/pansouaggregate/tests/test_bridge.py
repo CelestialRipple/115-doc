@@ -16,9 +16,11 @@ def test_legacy_virtual_site_coexists_with_115_and_restores_methods(monkeypatch)
     class SearchChain(ChainBase):
         pass
 
+    document_entries = [{"id": -115000001, "tencentdoc115library_local_indexer": True}]
+
     class SitesHelper:
         def get_indexers(self):
-            return [{"id": -115000001, "tencentdoc115library_local_indexer": True}]
+            return list(document_entries)
 
         async def async_get_indexers(self):
             return self.get_indexers()
@@ -56,6 +58,18 @@ def test_legacy_virtual_site_coexists_with_115_and_restores_methods(monkeypatch)
             SearchChain().async_search_torrents(entries[1], "Movie")
         ) == ["pansou-result"]
         assert len(asyncio.run(SitesHelper().async_get_indexers())) == 2
+        # A protected/nested host helper may suppress the document fallback.
+        # Aggregation must preserve it without reinitializing the running library.
+        document_entries.clear()
+        monkeypatch.setattr(
+            "pansouaggregate.bridge.document_fallback_indexer",
+            lambda: {"id": -115000001, "tencentdoc115library_local_indexer": True},
+        )
+        repaired = asyncio.run(SitesHelper().async_get_indexers())
+        assert len(repaired) == 2 and repaired[0]["id"] == -115000001
+        document_entries.append(
+            {"id": -115000001, "tencentdoc115library_local_indexer": True}
+        )
         monkeypatch.setattr("pansouaggregate.bridge.called_from_search", lambda: False)
         assert len(SitesHelper().get_indexers()) == 1
     finally:

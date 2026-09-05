@@ -21,6 +21,24 @@ def called_from_search():
         del frame
 
 
+def document_fallback_indexer():
+    """Preserve the 115 empty-site fallback when nested host wrappers hide its caller."""
+    try:
+        from .downloads import library_plugin
+
+        target = library_plugin()
+        if target.get_state() and target.get_module().get("search_torrents"):
+            bridge = getattr(target, "_search_bridge", None)
+            if bridge is not None:
+                return bridge.local_indexer()
+    except (ImportError, AttributeError):
+        pass
+    except Exception:
+        # The document plugin is optional and may be temporarily unavailable.
+        pass
+    return None
+
+
 class SearchBridge:
     lock = Lock()
 
@@ -49,6 +67,14 @@ class SearchBridge:
 
                 def add_indexer(items):
                     items = list(items or [])
+                    if self.active and self.plugin.get_state() and called_from_search():
+                        # Existing PT/document sources retain their own fan-out.
+                        # Only repair the empty-source case (possibly containing
+                        # our entry from an inner async->sync wrapper already).
+                        if not any(not item.get(MARKER) for item in items):
+                            document = document_fallback_indexer()
+                            if document:
+                                items.insert(0, document)
                     if (
                         self.active
                         and self.plugin.get_state()

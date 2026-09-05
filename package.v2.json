@@ -76,11 +76,12 @@
         "name": "PanSou聚合搜索",
         "description": "原生聚合115和磁力，支持浏览器下载、按类型保存影视库和自定义网页搜索入口",
         "labels": "聚合搜索,PanSou,BT4G,网盘,磁力",
-        "version": "0.3.0",
+        "version": "0.3.1",
         "icon": "https://raw.githubusercontent.com/CelestialRipple/115-doc/main/docs/pansouaggregate/icon.svg",
         "author": "CelestialRipple",
         "level": 1,
         "history": {
+            "v0.3.1": "修复群晖保护方法导致的配置重载失败，以及重载后腾讯文档搜索入口丢失，保留原有站点结果",
             "v0.3.0": "PanSou仅保留115和磁力；保存影视库可选电影、电视剧或混合；新增RB4K、RE0、癫影和可配置网页入口",
             "v0.2.0": "原生结果使用唯一资源标记；复用115解析与影视库导入；BT4G简化为新标签页搜索入口，移除验证回填",
             "v0.1.0": "接入PanSou搜索API和BT4G公开页面；兼容原生与旧版搜索入口；浏览器手动完成CF验证后带回资源，支持真实详情页磁力解析、去重、超时隔离和115媒体库导入"
