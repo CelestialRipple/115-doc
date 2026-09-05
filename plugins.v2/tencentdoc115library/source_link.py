@@ -37,6 +37,10 @@ def supported_link(value: str) -> bool:
 def extract_source_links(value: str) -> List[Dict[str, Any]]:
     """按文本位置提取 HTTP、磁力和 ED2K 链接。"""
     text = str(value or "").replace("｜", "|")
+    # 腾讯智能表的 URL 字段会把磁力链接包装成 https://magnet:?xt=...。
+    # 这不是可访问网页，读取目录时恢复成原始协议，避免误当 HTTP 资源。
+    text = re.sub(r"https?://(?=magnet:\?)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"https?://(?=ed2k://)", "", text, flags=re.IGNORECASE)
     matches: List[Dict[str, Any]] = []
     for kind, pattern in (
         ("ed2k", ED2K_PATTERN),

@@ -37,7 +37,7 @@ from .catalog import (
     default_media_mode_for_title,
     sheet_config_key,
 )
-from .client import TencentDocumentClient
+from .client import TencentDocumentClient, TencentDocumentMcpClient
 from .downloader import (
     DIRECT_DOWNLOADER_NAME,
     DirectDownloadManager,
@@ -78,6 +78,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "openid": "",
     "access_token": "",
     "refresh_token": "",
+    "mcp_token": "",
     "page_rows": 1000,
     "pages_per_run": 5,
     "max_columns": 10,
@@ -125,9 +126,9 @@ class TencentDoc115Library(_PluginBase):
     """将腾讯文档中的 115 分享资源构建为可按需播放的媒体库。"""
 
     plugin_name = "腾讯文档115媒体库"
-    plugin_desc = "同步115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
+    plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.11.1"
+    plugin_version = "0.12.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -231,6 +232,11 @@ class TencentDoc115Library(_PluginBase):
             config_updater=self._replace_config,
             stop_event=self._stop_event,
             pause_event=self._pause_event,
+            mcp_client_factory=(
+                self._create_mcp_client
+                if str(self._config.get("mcp_token") or "").strip()
+                else None
+            ),
         )
         self._builder = LibraryBuilder(
             store=self._store,
@@ -305,6 +311,14 @@ class TencentDoc115Library(_PluginBase):
             access_token_expires_at=float(config.get("access_token_expires_at") or 0),
             retry_count=int(config.get("request_retries") or 4),
             on_token_refresh=self._save_tokens,
+        )
+
+    def _create_mcp_client(self) -> TencentDocumentMcpClient:
+        """按当前配置创建智能表格 MCP 客户端。"""
+        config = self._current_config()
+        return TencentDocumentMcpClient(
+            token=str(config.get("mcp_token") or ""),
+            retry_count=int(config.get("request_retries") or 4),
         )
 
     def _submit(
@@ -772,9 +786,15 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             return Response(success=False, message="插件尚未初始化")
         try:
             sheets = self._synchronizer.discover_sheets()
+            smart_count = sum(
+                1 for sheet in sheets if sheet.get("source_kind") == "smartsheet"
+            )
             return Response(
                 success=True,
-                message=f"发现 {len(sheets)} 个工作表；请保存需要同步的分组",
+                message=(
+                    f"发现 {len(sheets)} 个工作表"
+                    f"（智能表 {smart_count} 个）；请保存需要同步的分组"
+                ),
                 data={"sheets": sheets},
             )
         except Exception as error:
@@ -1665,6 +1685,11 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         sheet_rows: List[Dict[str, Any]] = []
         for sheet in sheets:
             key = sheet_config_key(sheet["sheet_id"])
+            source_label = (
+                " [智能表]"
+                if str(sheet.get("source_kind") or "") == "smartsheet"
+                else ""
+            )
             sheet_rows.append(
                 {
                     "component": "VRow",
@@ -1677,7 +1702,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                                     "component": "VSwitch",
                                     "props": {
                                         "model": f"sheet_{key}_enabled",
-                                        "label": str(sheet["title"]),
+                                        "label": f"{sheet['title']}{source_label}",
                                     },
                                 }
                             ],
@@ -1852,6 +1877,16 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                                 hint="第三方应用审核通过后获得；仅手动 Access Token 测试可留空",
                             ),
                             self._text_field("access_token", "Access Token", 6, True),
+                            self._text_field(
+                                "mcp_token",
+                                "MCP 个人 Token（智能表格）",
+                                6,
+                                True,
+                                hint=(
+                                    "读取智能表格必填；普通工作表仍使用上方 Open API 凭据。"
+                                    "Token 只保存在插件配置中。"
+                                ),
+                            ),
                             self._text_field(
                                 "refresh_token",
                                 "Refresh Token（可选）",
@@ -2298,12 +2333,18 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                 continue
             total = int(sheet.get("used_row_count") or sheet.get("row_count") or 0)
             checkpoint = max(int(sheet.get("checkpoint_row") or 1) - 1, 0)
+            source_kind = (
+                "智能表"
+                if str(sheet.get("source_kind") or "") == "smartsheet"
+                else "普通表"
+            )
             sheet_items.append(
                 {
                     "component": "VListItem",
                     "props": {
                         "title": str(sheet.get("title") or ""),
                         "subtitle": (
+                            f"来源：{source_kind} · "
                             f"分组：{sheet.get('group_name') or '未设置'} · "
                             f"类型：{media_mode_labels.get(str(sheet.get('media_mode')), '电影')} · "
                             f"状态：{sheet.get('scan_status')} · "

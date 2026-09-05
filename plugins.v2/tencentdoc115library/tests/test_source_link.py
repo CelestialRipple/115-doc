@@ -41,3 +41,18 @@ def test_extract_links_keeps_ed2k_spaces_until_terminator() -> None:
             "end": value.index("ed2k://") + len(ED2K),
         }
     ]
+
+
+def test_extract_links_unwraps_smart_sheet_magnet_url() -> None:
+    wrapped = "https://magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+
+    links = extract_source_links(wrapped)
+
+    assert links == [
+        {
+            "kind": "magnet",
+            "url": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "start": 0,
+            "end": len(wrapped) - len("https://"),
+        }
+    ]

@@ -8,7 +8,10 @@ from tencentdoc115library.catalog import (
     document_sources,
     namespaced_sheet_id,
 )
-from tencentdoc115library.client import TencentDocumentClient
+from tencentdoc115library.client import (
+    TencentDocumentClient,
+    TencentDocumentMcpClient,
+)
 from tencentdoc115library.store import CatalogStore
 
 
@@ -89,6 +92,70 @@ def test_discover_namespaces_same_sheet_id_across_documents(tmp_path) -> None:
     }
     assert len({sheet["sheet_id"] for sheet in sheets}) == 2
     assert {sheet["remote_sheet_id"] for sheet in sheets} == {"000001"}
+
+
+def test_discover_combines_regular_and_smart_sheets(tmp_path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+
+    class FakeClient:
+        @staticmethod
+        def convert_file_id(url):
+            return "open-file-id"
+
+        @staticmethod
+        def get_sheets(file_id):
+            return [
+                {
+                    "sheet_id": "BB08J2",
+                    "title": "首页导航",
+                    "row_count": 20,
+                    "column_count": 6,
+                    "used_row_count": 20,
+                    "used_column_count": 6,
+                }
+            ]
+
+    class FakeMcpClient:
+        @staticmethod
+        def get_sheet_info(file_id):
+            assert file_id == "DUG5mV2p1SUh2bHhT"
+            return [
+                {
+                    "sheet_id": "BB08J2",
+                    "title": "首页导航",
+                    "sheet_type": "worksheet",
+                },
+                {
+                    "sheet_id": "ss_nvtytt",
+                    "title": "电影区（新）",
+                    "sheet_type": "smartsheet",
+                },
+            ]
+
+    config = {
+        "document_urls": (
+            "混合文档|https://docs.qq.com/sheet/DUG5mV2p1SUh2bHhT"
+            "?tab=ss_nvtytt&viewId=vvYzbT"
+        )
+    }
+    synchronizer = CatalogSynchronizer(
+        store=store,
+        client_factory=FakeClient,
+        mcp_client_factory=FakeMcpClient,
+        config_provider=lambda: dict(config),
+        config_updater=lambda updated: config.update(updated),
+        stop_event=Event(),
+    )
+
+    sheets = synchronizer.discover_sheets()
+
+    assert len(sheets) == 2
+    smart = next(sheet for sheet in sheets if sheet["source_kind"] == "smartsheet")
+    regular = next(sheet for sheet in sheets if sheet["source_kind"] == "worksheet")
+    assert smart["remote_sheet_id"] == "ss_nvtytt"
+    assert smart["mcp_file_id"] == "DUG5mV2p1SUh2bHhT"
+    assert smart["view_id"] == "vvYzbT"
+    assert regular["row_count"] == 20
 
 
 def test_parser_recognizes_headers_and_share_link() -> None:
@@ -245,6 +312,138 @@ def test_tencent_range_limits_never_exceed_cell_limit() -> None:
 def test_cell_scalar_prefers_hyperlink_url() -> None:
     value = {"text": "115资源", "url": "https://115.com/s/example"}
     assert TencentDocumentClient._extract_scalar(value) == "https://115.com/s/example"
+
+
+def test_smart_record_values_support_text_url_options_and_numbers() -> None:
+    values = TencentDocumentMcpClient.record_values(
+        {
+            "field_values": [
+                {
+                    "field": "电影名称",
+                    "text_value": {"items": [{"text": "血爱杀手", "type": "text"}]},
+                },
+                {
+                    "field": "磁力链接",
+                    "url_value": {
+                        "items": [
+                            {
+                                "link": "https://magnet:?xt=urn:btih:abc",
+                                "text": "magnet:?xt=urn:btih:abc",
+                            }
+                        ]
+                    },
+                },
+                {
+                    "field": "电影类型",
+                    "option_value": {"items": [{"text": "动作"}]},
+                },
+                {"field": "上映年份", "number_value": 2026},
+            ]
+        }
+    )
+
+    assert values == {
+        "电影名称": "血爱杀手",
+        "磁力链接": "magnet:?xt=urn:btih:abc",
+        "电影类型": "动作",
+        "上映年份": "2026",
+    }
+
+
+def test_smart_sheet_sync_uses_offset_checkpoint_and_normalizes_links(tmp_path) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    store.upsert_sheets(
+        [
+            {
+                "sheet_id": "smart-sheet",
+                "title": "文档（电影区）",
+                "remote_sheet_id": "ss_movies",
+                "source_kind": "smartsheet",
+                "mcp_file_id": "encoded-file",
+                "view_id": "view-1",
+            }
+        ]
+    )
+
+    class FakeClient:
+        pass
+
+    class FakeMcpClient:
+        @staticmethod
+        def get_fields(file_id, sheet_id, view_id=""):
+            return [
+                "电影名称",
+                "资源描述",
+                "网盘链接/115离线下载",
+                "磁力链接",
+                "电影类型",
+                "上映年份",
+            ]
+
+        @staticmethod
+        def record_values(record):
+            return TencentDocumentMcpClient.record_values(record)
+
+        @staticmethod
+        def get_records(file_id, sheet_id, offset, limit, view_id=""):
+            records = [
+                {
+                    "field_values": [
+                        {"field": "电影名称", "text_value": {"items": [{"text": "电影甲"}]}},
+                        {"field": "资源描述", "text_value": {"items": [{"text": "4K"}]}},
+                        {"field": "网盘链接/115离线下载", "url_value": {"items": [{"link": "https://115cdn.com/s/example"}]}},
+                        {"field": "电影类型", "option_value": {"items": [{"text": "动作"}]}},
+                        {"field": "上映年份", "number_value": 2025},
+                    ]
+                },
+                {
+                    "field_values": [
+                        {"field": "电影名称", "text_value": {"items": [{"text": "电影乙"}]}},
+                        {"field": "磁力链接", "url_value": {"items": [{"link": "https://magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", "text": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"}]}},
+                    ]
+                },
+            ]
+            record = records[offset : offset + 1]
+            next_offset = offset + len(record)
+            return {
+                "records": record,
+                "total": 2,
+                "next": next_offset,
+                "has_more": next_offset < 2,
+                "requested_rows": 1,
+            }
+
+    config = {
+        "pages_per_run": 1,
+        "page_rows": 1,
+        "sheet_smart_sheet_enabled": True,
+        "sheet_smart_sheet_group": "智能电影",
+        "sheet_smart_sheet_media_mode": "movie",
+    }
+    synchronizer = CatalogSynchronizer(
+        store=store,
+        client_factory=FakeClient,
+        mcp_client_factory=FakeMcpClient,
+        config_provider=lambda: dict(config),
+        config_updater=lambda updated: config.update(updated),
+        stop_event=Event(),
+    )
+
+    assert synchronizer.sync()["status"] == "paused"
+    assert store.get_sheet("smart-sheet")["checkpoint_row"] == 2
+    assert synchronizer.sync()["status"] == "completed"
+    with store.connection() as connection:
+        resources = [dict(row) for row in connection.execute(
+            "SELECT title, share_url FROM resource ORDER BY row_number"
+        ).fetchall()]
+    assert resources == [
+        {"title": "电影甲", "share_url": "https://115cdn.com/s/example"},
+        {
+            "title": "电影乙",
+            "share_url": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+        },
+    ]
+    assert store.get_sheet("smart-sheet")["row_count"] == 2
 
 
 def test_sync_continues_next_incomplete_sheet_before_new_round(tmp_path) -> None:

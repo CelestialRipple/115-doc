@@ -8,7 +8,7 @@ from threading import RLock
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 def utc_now() -> str:
@@ -68,6 +68,9 @@ class CatalogStore:
                     document_title TEXT,
                     file_id TEXT,
                     remote_sheet_id TEXT,
+                    source_kind TEXT NOT NULL DEFAULT 'worksheet',
+                    mcp_file_id TEXT,
+                    view_id TEXT,
                     row_count INTEGER NOT NULL DEFAULT 0,
                     column_count INTEGER NOT NULL DEFAULT 0,
                     used_row_count INTEGER NOT NULL DEFAULT 0,
@@ -224,11 +227,18 @@ class CatalogStore:
                 "document_title",
                 "file_id",
                 "remote_sheet_id",
+                "mcp_file_id",
+                "view_id",
             ):
                 if column_name not in sheet_columns:
                     connection.execute(
                         f"ALTER TABLE sheet_state ADD COLUMN {column_name} TEXT"
                     )
+            if "source_kind" not in sheet_columns:
+                connection.execute(
+                    "ALTER TABLE sheet_state ADD COLUMN source_kind "
+                    "TEXT NOT NULL DEFAULT 'worksheet'"
+                )
             if "media_mode" not in sheet_columns:
                 connection.execute(
                     "ALTER TABLE sheet_state ADD COLUMN media_mode "
@@ -339,19 +349,27 @@ class CatalogStore:
                     """
                     INSERT INTO sheet_state (
                         sheet_id, title, source_title, document_title,
-                        file_id, remote_sheet_id, row_count, column_count,
-                        used_row_count, used_column_count, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        file_id, remote_sheet_id, source_kind, mcp_file_id,
+                        view_id, row_count, column_count, used_row_count,
+                        used_column_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(sheet_id) DO UPDATE SET
                         title = excluded.title,
                         source_title = excluded.source_title,
                         document_title = excluded.document_title,
                         file_id = excluded.file_id,
                         remote_sheet_id = excluded.remote_sheet_id,
-                        row_count = excluded.row_count,
-                        column_count = excluded.column_count,
-                        used_row_count = excluded.used_row_count,
-                        used_column_count = excluded.used_column_count,
+                        source_kind = excluded.source_kind,
+                        mcp_file_id = excluded.mcp_file_id,
+                        view_id = excluded.view_id,
+                        row_count = CASE WHEN excluded.row_count > 0
+                            THEN excluded.row_count ELSE sheet_state.row_count END,
+                        column_count = CASE WHEN excluded.column_count > 0
+                            THEN excluded.column_count ELSE sheet_state.column_count END,
+                        used_row_count = CASE WHEN excluded.used_row_count > 0
+                            THEN excluded.used_row_count ELSE sheet_state.used_row_count END,
+                        used_column_count = CASE WHEN excluded.used_column_count > 0
+                            THEN excluded.used_column_count ELSE sheet_state.used_column_count END,
                         updated_at = excluded.updated_at
                     """,
                     (
@@ -361,6 +379,9 @@ class CatalogStore:
                         sheet.get("document_title"),
                         sheet.get("file_id"),
                         sheet.get("remote_sheet_id") or sheet["sheet_id"],
+                        sheet.get("source_kind") or "worksheet",
+                        sheet.get("mcp_file_id"),
+                        sheet.get("view_id"),
                         int(sheet.get("row_count") or 0),
                         int(sheet.get("column_count") or 0),
                         int(sheet.get("used_row_count") or 0),
@@ -368,6 +389,28 @@ class CatalogStore:
                         now,
                     ),
                 )
+
+    def update_sheet_dimensions(
+        self,
+        sheet_id: str,
+        row_count: int,
+        column_count: int,
+    ) -> None:
+        """智能表首次分页后保存服务端返回的总行数和字段数。"""
+        with self._lock, self.connection() as connection:
+            connection.execute(
+                "UPDATE sheet_state SET row_count = ?, used_row_count = ?, "
+                "column_count = ?, used_column_count = ?, updated_at = ? "
+                "WHERE sheet_id = ?",
+                (
+                    max(int(row_count or 0), 0),
+                    max(int(row_count or 0), 0),
+                    max(int(column_count or 0), 0),
+                    max(int(column_count or 0), 0),
+                    utc_now(),
+                    sheet_id,
+                ),
+            )
 
     def disable_missing_sheets(self, present_sheet_ids: set[str]) -> None:
         """停用已不在当前文档配置中的工作表，但保留其资源和历史。"""

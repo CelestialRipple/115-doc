@@ -1,7 +1,9 @@
+import json
 import re
+from threading import Lock
 from time import sleep, time
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 try:
     from app.sdk.config import settings
@@ -14,6 +16,7 @@ except ImportError:
 
 
 TENCENT_DOCS_BASE_URL = "https://docs.qq.com"
+TENCENT_DOCS_MCP_URL = "https://docs.qq.com/openapi/mcp"
 MAX_RANGE_ROWS = 1000
 MAX_RANGE_CELLS = 10000
 MAX_RANGE_COLUMNS = 200
@@ -456,6 +459,363 @@ class TencentDocumentClient:
             "start_row": int(grid_data.get("startRow") or start_row - 1) + 1,
             "requested_rows": safe_rows,
             "raw_row_count": len(raw_rows),
+        }
+
+
+class TencentDocumentMcpClient:
+    """腾讯文档 MCP 客户端，用于发现和分页读取智能表格。"""
+
+    def __init__(
+        self,
+        token: str,
+        timeout: int = 30,
+        retry_count: int = 3,
+    ):
+        self.token = str(token or "").strip()
+        self.retry_count = max(int(retry_count or 0), 0)
+        self._request = RequestUtils(
+            proxies=settings.PROXY,
+            timeout=max(int(timeout or 30), 5),
+        )
+        self._request_id = 0
+        self._lock = Lock()
+
+    @staticmethod
+    def document_context(document_url: str) -> Dict[str, str]:
+        """提取 encodedID，以及链接中仅对当前子表有效的 tab/viewId。"""
+        value = str(document_url or "").strip()
+        encoded_id = TencentDocumentClient.extract_encoded_id(value)
+        query = parse_qs(urlsplit(value).query) if "/" in value else {}
+        return {
+            "file_id": encoded_id,
+            "sheet_id": str((query.get("tab") or [""])[0]).strip(),
+            "view_id": str((query.get("viewId") or [""])[0]).strip(),
+        }
+
+    def _ensure_configured(self) -> None:
+        if not self.token:
+            raise TencentDocumentError("未配置腾讯文档 MCP 个人 Token")
+
+    @staticmethod
+    def _result_data(result: Dict[str, Any]) -> Dict[str, Any]:
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured
+        for item in result.get("content") or []:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                value = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                return value
+        return result
+
+    def _rpc(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        self._ensure_configured()
+        with self._lock:
+            self._request_id += 1
+            request_id = self._request_id
+        last_error = "腾讯文档 MCP 请求失败"
+        for attempt in range(self.retry_count + 1):
+            response = self._request.post_res(
+                url=TENCENT_DOCS_MCP_URL,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+                headers={
+                    "Authorization": self.token,
+                    "Accept": "application/json, text/event-stream",
+                    "Content-Type": "application/json",
+                },
+            )
+            if not response:
+                last_error = "腾讯文档 MCP 无响应"
+            else:
+                try:
+                    status_code = int(response.status_code)
+                    try:
+                        payload = response.json()
+                    except ValueError as error:
+                        payload = None
+                        for line in str(response.text or "").splitlines():
+                            if not line.startswith("data:"):
+                                continue
+                            try:
+                                candidate = json.loads(line[5:].strip())
+                            except ValueError:
+                                continue
+                            if isinstance(candidate, dict):
+                                payload = candidate
+                                break
+                        if payload is None:
+                            raise TencentDocumentError(
+                                f"腾讯文档 MCP 返回了无效 JSON：HTTP {status_code}"
+                            ) from error
+                finally:
+                    response.close()
+                if status_code in {429, 500, 502, 503, 504}:
+                    last_error = f"腾讯文档 MCP 临时异常：HTTP {status_code}"
+                elif status_code != 200:
+                    raise TencentDocumentError(
+                        f"腾讯文档 MCP 请求失败：HTTP {status_code}"
+                    )
+                elif isinstance(payload.get("error"), dict):
+                    error = payload["error"]
+                    raise TencentDocumentError(
+                        str(error.get("message") or error.get("code") or "MCP 调用失败")
+                    )
+                else:
+                    result = payload.get("result")
+                    if not isinstance(result, dict):
+                        raise TencentDocumentError("腾讯文档 MCP 响应缺少 result")
+                    if result.get("isError"):
+                        data = self._result_data(result)
+                        raise TencentDocumentError(
+                            str(data.get("message") or data.get("error") or "MCP 工具调用失败")
+                        )
+                    return self._result_data(result)
+            if attempt < self.retry_count:
+                sleep(min(2 ** attempt, 8))
+        raise TencentDocumentError(last_error)
+
+    def _tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        return self._rpc(
+            "tools/call",
+            {"name": name, "arguments": arguments},
+        )
+
+    @staticmethod
+    def _find_list(data: Any, *keys: str) -> List[Dict[str, Any]]:
+        if isinstance(data, dict):
+            for key in keys:
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+            for value in data.values():
+                found = TencentDocumentMcpClient._find_list(value, *keys)
+                if found:
+                    return found
+        return []
+
+    @staticmethod
+    def _find_value(data: Any, *keys: str, default: Any = None) -> Any:
+        if isinstance(data, dict):
+            for key in keys:
+                if key in data:
+                    return data[key]
+            for value in data.values():
+                found = TencentDocumentMcpClient._find_value(
+                    value, *keys, default=None
+                )
+                if found is not None:
+                    return found
+        return default
+
+    def get_sheet_info(self, file_id: str) -> List[Dict[str, Any]]:
+        """返回文档内普通子表和智能子表的统一清单。"""
+        data = self._tool("sheet.get_sheet_info", {"file_id": file_id})
+        raw_sheets = self._find_list(
+            data,
+            "sheets",
+            "sheet_list",
+            "sheetList",
+            "properties",
+        )
+        sheets: List[Dict[str, Any]] = []
+        for item in raw_sheets:
+            sheet_id = str(
+                item.get("sheet_id")
+                or item.get("sheetId")
+                or item.get("id")
+                or ""
+            ).strip()
+            title = str(
+                item.get("sheet_name")
+                or item.get("title")
+                or item.get("name")
+                or ""
+            ).strip()
+            if not sheet_id or not title:
+                continue
+            sheet_type = str(
+                item.get("sheet_type") or item.get("sheetType") or "worksheet"
+            ).strip().lower()
+            sheets.append(
+                {
+                    "sheet_id": sheet_id,
+                    "title": title,
+                    "sheet_type": (
+                        "smartsheet" if sheet_type == "smartsheet" else "worksheet"
+                    ),
+                    "row_count": TencentDocumentClient._property_int(
+                        item, "row_count", "rowCount", "rowTotal"
+                    ),
+                    "column_count": TencentDocumentClient._property_int(
+                        item, "column_count", "columnCount", "columnTotal"
+                    ),
+                }
+            )
+        if not sheets:
+            raise TencentDocumentError("腾讯文档 MCP 响应中没有可用工作表")
+        return sheets
+
+    def get_fields(
+        self,
+        file_id: str,
+        sheet_id: str,
+        view_id: str = "",
+    ) -> List[str]:
+        """取得智能表字段标题；字段只用于表头适配，不读取附件正文。"""
+        offset = 0
+        titles: List[str] = []
+        while True:
+            arguments: Dict[str, Any] = {
+                "file_id": file_id,
+                "sheet_id": sheet_id,
+                "offset": offset,
+                "limit": 100,
+            }
+            if view_id:
+                arguments["view_id"] = view_id
+            data = self._tool("smartsheet.list_fields", arguments)
+            fields = self._find_list(data, "fields", "field_list", "fieldList")
+            for field in fields:
+                title = str(
+                    field.get("field_title")
+                    or field.get("title")
+                    or field.get("name")
+                    or field.get("field")
+                    or ""
+                ).strip()
+                if title and title not in titles:
+                    titles.append(title)
+            has_more = bool(self._find_value(data, "has_more", "hasMore", default=False))
+            next_offset = self._find_value(data, "next", "next_offset", "nextOffset")
+            if not has_more or not fields:
+                break
+            try:
+                offset = int(next_offset)
+            except (TypeError, ValueError):
+                offset += len(fields)
+        if not titles:
+            raise TencentDocumentError(f"智能表 {sheet_id} 没有可读取字段")
+        return titles
+
+    @classmethod
+    def _value_text(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float, str)):
+            return str(value).strip()
+        if isinstance(value, list):
+            parts = [cls._value_text(item) for item in value]
+            return "\n".join(dict.fromkeys(part for part in parts if part))
+        if isinstance(value, dict):
+            link = cls._value_text(value.get("link"))
+            text = cls._value_text(value.get("text"))
+            if text.lower().startswith(("magnet:?", "ed2k://")):
+                return text
+            if link:
+                return link
+            for key in (
+                "items",
+                "value",
+                "formatted_value",
+                "formattedValue",
+                "title",
+                "name",
+            ):
+                if key in value:
+                    parsed = cls._value_text(value[key])
+                    if parsed:
+                        return parsed
+            parts = [
+                cls._value_text(item)
+                for key, item in value.items()
+                if key not in {"type", "id", "field_id", "color", "status"}
+            ]
+            return "\n".join(dict.fromkeys(part for part in parts if part))
+        return ""
+
+    @classmethod
+    def record_values(cls, record: Dict[str, Any]) -> Dict[str, str]:
+        """把智能表多种字段值结构压平成“字段名 → 文本”。"""
+        values: Dict[str, str] = {}
+        raw_values = record.get("field_values") or record.get("fieldValues") or []
+        if isinstance(raw_values, dict):
+            raw_values = [
+                {"field": field, "value": value}
+                for field, value in raw_values.items()
+            ]
+        for item in raw_values:
+            if not isinstance(item, dict):
+                continue
+            field = str(
+                item.get("field")
+                or item.get("field_title")
+                or item.get("title")
+                or item.get("name")
+                or ""
+            ).strip()
+            if not field:
+                continue
+            candidates = [
+                value
+                for key, value in item.items()
+                if key not in {"field", "field_title", "title", "name", "field_id"}
+            ]
+            text = cls._value_text(candidates)
+            if text:
+                values[field] = text
+        return values
+
+    def get_records(
+        self,
+        file_id: str,
+        sheet_id: str,
+        offset: int,
+        limit: int,
+        view_id: str = "",
+    ) -> Dict[str, Any]:
+        """按 offset 分页读取智能表记录，单次最多 100 条。"""
+        safe_limit = min(max(int(limit or 1), 1), 100)
+        arguments: Dict[str, Any] = {
+            "file_id": file_id,
+            "sheet_id": sheet_id,
+            "offset": max(int(offset or 0), 0),
+            "limit": safe_limit,
+        }
+        if view_id:
+            arguments["view_id"] = view_id
+        data = self._tool("smartsheet.list_records", arguments)
+        records = self._find_list(data, "records", "record_list", "recordList")
+        total = self._find_value(data, "total", "total_count", "totalCount", default=0)
+        next_offset = self._find_value(data, "next", "next_offset", "nextOffset")
+        has_more = bool(self._find_value(data, "has_more", "hasMore", default=False))
+        try:
+            total = int(total or 0)
+        except (TypeError, ValueError):
+            total = 0
+        try:
+            next_offset = int(next_offset)
+        except (TypeError, ValueError):
+            next_offset = int(offset or 0) + len(records)
+        return {
+            "records": records,
+            "total": total,
+            "next": next_offset,
+            "has_more": has_more,
+            "requested_rows": safe_limit,
         }
 
 

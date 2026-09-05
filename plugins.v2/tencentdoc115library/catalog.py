@@ -10,15 +10,28 @@ try:
 except ImportError:
     from app.log import logger
 
-from .client import TencentDocumentClient, TencentDocumentError
+from .client import (
+    TencentDocumentClient,
+    TencentDocumentError,
+    TencentDocumentMcpClient,
+)
 from .source_link import extract_source_links, supported_link
 from .store import CatalogStore
 
 HEADER_ALIASES = {
     "title": {"影片名称", "电影名称", "影视名称", "名称", "片名", "标题"},
-    "version": {"资源版本", "版本", "画质", "规格"},
-    "share_url": {"资源链接", "分享链接", "115链接", "链接", "地址"},
-    "media_type": {"类型", "资源类型", "影视类型", "分类"},
+    "version": {"资源版本", "资源描述", "版本", "画质", "规格"},
+    "share_url": {
+        "资源链接",
+        "分享链接",
+        "115链接",
+        "网盘链接",
+        "网盘链接/115离线下载",
+        "磁力链接",
+        "链接",
+        "地址",
+    },
+    "media_type": {"类型", "资源类型", "影视类型", "电影类型", "分类"},
     "rating": {"豆瓣评分", "评分", "豆瓣"},
     "year": {"年份", "年代", "上映年份"},
 }
@@ -152,7 +165,7 @@ class CatalogParser:
 
         :return str: 移除空白和标点后的表头
         """
-        return re.sub(r"[\s:：()（）_\-]", "", str(value or "")).lower()
+        return re.sub(r"[\s:：()（）_\-/／]", "", str(value or "")).lower()
 
     @classmethod
     def identify_headers(cls, row: List[str]) -> Dict[str, int]:
@@ -316,6 +329,7 @@ class CatalogSynchronizer:
         config_updater: Callable[[Dict[str, Any]], None],
         stop_event: Event,
         pause_event: Optional[Event] = None,
+        mcp_client_factory: Optional[Callable[[], TencentDocumentMcpClient]] = None,
     ):
         """
         初始化目录同步器
@@ -332,6 +346,7 @@ class CatalogSynchronizer:
         self.config_updater = config_updater
         self.stop_event = stop_event
         self.pause_event = pause_event or Event()
+        self.mcp_client_factory = mcp_client_factory
         self._run_lock = Lock()
 
     @staticmethod
@@ -363,6 +378,7 @@ class CatalogSynchronizer:
         """
         config = dict(self.config_provider())
         client = self.client_factory()
+        mcp_client = self.mcp_client_factory() if self.mcp_client_factory else None
         sources = document_sources(config)
         if not sources:
             raise TencentDocumentError("尚未配置腾讯文档链接")
@@ -370,20 +386,84 @@ class CatalogSynchronizer:
         legacy_file_id = str(config.get("file_id") or "").strip()
         legacy_url = str(config.get("document_url") or "").strip()
         for source in sources:
-            file_id = (
-                legacy_file_id
-                if len(sources) == 1 and source["url"] == legacy_url and legacy_file_id
-                else client.convert_file_id(source["url"])
-            )
-            for remote_sheet in client.get_sheets(file_id):
+            context = TencentDocumentMcpClient.document_context(source["url"])
+            encoded_id = context["file_id"]
+            file_id = ""
+            standard_sheets: List[Dict[str, Any]] = []
+            standard_error: Optional[Exception] = None
+            try:
+                file_id = (
+                    legacy_file_id
+                    if len(sources) == 1
+                    and source["url"] == legacy_url
+                    and legacy_file_id
+                    else client.convert_file_id(source["url"])
+                )
+                standard_sheets = client.get_sheets(file_id)
+            except Exception as error:
+                standard_error = error
+
+            mcp_sheets: List[Dict[str, Any]] = []
+            mcp_error: Optional[Exception] = None
+            if mcp_client:
+                try:
+                    mcp_sheets = mcp_client.get_sheet_info(encoded_id)
+                except Exception as error:
+                    mcp_error = error
+                    logger.warning(
+                        f"腾讯文档 MCP 发现失败，将保留普通表结果：{source['name']} - {error}"
+                    )
+
+            if not standard_sheets and not mcp_sheets:
+                raise TencentDocumentError(
+                    str(mcp_error or standard_error or "腾讯文档中没有可用工作表")
+                )
+            if context["sheet_id"].startswith("ss_") and not mcp_sheets:
+                raise TencentDocumentError(
+                    f"链接指向智能表 {context['sheet_id']}，但 MCP 读取失败："
+                    f"{mcp_error or '请配置 MCP 个人 Token'}"
+                )
+
+            standard_by_id = {
+                str(sheet["sheet_id"]): sheet for sheet in standard_sheets
+            }
+            remote_sheets: List[Dict[str, Any]] = []
+            seen_remote_ids = set()
+            for mcp_sheet in mcp_sheets:
+                remote_sheet_id = str(mcp_sheet["sheet_id"])
+                source_kind = str(mcp_sheet.get("sheet_type") or "worksheet")
+                remote_sheet = (
+                    dict(standard_by_id[remote_sheet_id])
+                    if source_kind == "worksheet" and remote_sheet_id in standard_by_id
+                    else dict(mcp_sheet)
+                )
+                remote_sheet["source_kind"] = source_kind
+                remote_sheets.append(remote_sheet)
+                seen_remote_ids.add(remote_sheet_id)
+            for standard_sheet in standard_sheets:
+                if str(standard_sheet["sheet_id"]) in seen_remote_ids:
+                    continue
+                remote_sheets.append({**standard_sheet, "source_kind": "worksheet"})
+
+            namespace_id = file_id or encoded_id
+            for remote_sheet in remote_sheets:
                 remote_sheet_id = str(remote_sheet["sheet_id"])
                 source_title = str(remote_sheet["title"])
+                source_kind = str(remote_sheet.get("source_kind") or "worksheet")
                 sheets.append(
                     {
                         **remote_sheet,
-                        "sheet_id": namespaced_sheet_id(file_id, remote_sheet_id),
+                        "sheet_id": namespaced_sheet_id(namespace_id, remote_sheet_id),
                         "remote_sheet_id": remote_sheet_id,
                         "file_id": file_id,
+                        "source_kind": source_kind,
+                        "mcp_file_id": encoded_id if source_kind == "smartsheet" else None,
+                        "view_id": (
+                            context["view_id"]
+                            if source_kind == "smartsheet"
+                            and context["sheet_id"] == remote_sheet_id
+                            else ""
+                        ),
                         "document_title": source["name"],
                         "source_title": source_title,
                         "title": f"{source['name']}（{source_title}）",
@@ -459,6 +539,7 @@ class CatalogSynchronizer:
                     sheet for sheet in sheets if sheet.get("scan_status") != "completed"
                 ]
             client = self.client_factory()
+            mcp_client = self.mcp_client_factory() if self.mcp_client_factory else None
             page_limit = max_pages or int(config.get("pages_per_run") or 5)
             page_limit = min(max(page_limit, 1), 100)
             requested_rows = int(config.get("page_rows") or 1000)
@@ -476,6 +557,27 @@ class CatalogSynchronizer:
                     sheet.get("used_column_count") or sheet.get("column_count") or 6
                 )
                 column_count = min(max(column_count, 1), max_columns)
+                source_kind = str(sheet.get("source_kind") or "worksheet")
+                smart_headers: List[str] = []
+                if source_kind == "smartsheet":
+                    if not mcp_client:
+                        raise TencentDocumentError(
+                            f"智能表 {sheet['title']} 需要配置腾讯文档 MCP 个人 Token"
+                        )
+                    smart_headers = mcp_client.get_fields(
+                        file_id=str(sheet.get("mcp_file_id") or ""),
+                        sheet_id=str(sheet.get("remote_sheet_id") or ""),
+                        view_id=str(sheet.get("view_id") or ""),
+                    )
+                    header_map = CatalogParser.identify_headers(smart_headers)
+                    missing_headers = {
+                        field for field in ("title", "share_url") if field not in header_map
+                    }
+                    if missing_headers:
+                        raise TencentDocumentError(
+                            f"智能表 {sheet['title']} 无法识别标题或资源链接字段；"
+                            f"当前字段：{', '.join(smart_headers)}"
+                        )
                 while not self.stop_event.is_set() and not self.pause_event.is_set():
                     if processed_pages >= page_limit:
                         self.store.pause_sheet_scan(current_sheet_id)
@@ -486,24 +588,50 @@ class CatalogSynchronizer:
                             "processed_pages": processed_pages,
                             "processed_rows": processed_rows,
                         }
-                    page = client.get_range(
-                        file_id=str(
-                            sheet.get("file_id") or config.get("file_id") or ""
-                        ),
-                        sheet_id=str(sheet.get("remote_sheet_id") or current_sheet_id),
-                        start_row=current_row,
-                        row_count=requested_rows,
-                        column_count=column_count,
-                    )
-                    rows = page["rows"]
-                    if current_row == 1 and rows:
+                    if source_kind == "smartsheet":
+                        smart_page = mcp_client.get_records(
+                            file_id=str(sheet.get("mcp_file_id") or ""),
+                            sheet_id=str(sheet.get("remote_sheet_id") or ""),
+                            offset=max(current_row - 1, 0),
+                            limit=min(requested_rows, 100),
+                            view_id=str(sheet.get("view_id") or ""),
+                        )
+                        rows = []
+                        for record in smart_page["records"]:
+                            values = mcp_client.record_values(record)
+                            rows.append([values.get(title, "") for title in smart_headers])
+                        page = {
+                            "rows": rows,
+                            "requested_rows": smart_page["requested_rows"],
+                            "next": smart_page["next"],
+                            "has_more": smart_page["has_more"],
+                            "total": smart_page["total"],
+                        }
+                        total_rows = int(smart_page["total"] or total_rows)
+                        self.store.update_sheet_dimensions(
+                            current_sheet_id,
+                            total_rows,
+                            len(smart_headers),
+                        )
+                    else:
+                        page = client.get_range(
+                            file_id=str(
+                                sheet.get("file_id") or config.get("file_id") or ""
+                            ),
+                            sheet_id=str(sheet.get("remote_sheet_id") or current_sheet_id),
+                            start_row=current_row,
+                            row_count=requested_rows,
+                            column_count=column_count,
+                        )
+                        rows = page["rows"]
+                    if source_kind != "smartsheet" and current_row == 1 and rows:
                         identified_headers = CatalogParser.identify_headers(rows[0])
                         if identified_headers:
                             header_map = identified_headers
                     resources = []
                     for offset, row in enumerate(rows):
                         row_number = current_row + offset
-                        if row_number == 1:
+                        if source_kind != "smartsheet" and row_number == 1:
                             continue
                         resource = CatalogParser.parse_row(
                             sheet_id=current_sheet_id,
@@ -516,10 +644,14 @@ class CatalogSynchronizer:
                         )
                         if resource:
                             resources.append(resource)
-                    next_row = current_row + int(page["requested_rows"])
-                    source_row_count = max(
-                        len(rows) - (1 if current_row == 1 else 0), 0
-                    )
+                    if source_kind == "smartsheet":
+                        next_row = int(page["next"]) + 1
+                        source_row_count = len(rows)
+                    else:
+                        next_row = current_row + int(page["requested_rows"])
+                        source_row_count = max(
+                            len(rows) - (1 if current_row == 1 else 0), 0
+                        )
                     self.store.save_page(
                         sheet_id=current_sheet_id,
                         scan_id=scan_id,
@@ -542,6 +674,13 @@ class CatalogSynchronizer:
                     )
                     reached_known_end = bool(total_rows and next_row > total_rows)
                     reached_short_page = len(rows) < int(page["requested_rows"])
+                    if source_kind == "smartsheet":
+                        reached_known_end = bool(
+                            not page.get("has_more")
+                            or not rows
+                            or (total_rows and next_row > total_rows)
+                        )
+                        reached_short_page = False
                     if reached_known_end or reached_short_page or not rows:
                         self.store.complete_sheet_scan(current_sheet_id, scan_id)
                         break
