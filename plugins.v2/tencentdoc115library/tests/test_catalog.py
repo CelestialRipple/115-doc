@@ -182,6 +182,48 @@ def test_parser_recognizes_headers_and_share_link() -> None:
     assert resource["group_name"] == "电影合集"
 
 
+def test_smart_media_title_aliases_and_link_columns_are_recognized() -> None:
+    for title_header in ("剧集名称", "动漫名称", "动画名称", "纪录片名称"):
+        headers = [
+            title_header,
+            "资源描述",
+            "网盘链接/115离线下载",
+            "磁力链接",
+            "上映年份",
+        ]
+        mapping = CatalogParser.identify_headers(headers)
+        resource = CatalogParser.parse_row(
+            sheet_id="smart",
+            sheet_title="智能表",
+            group_name="自选",
+            row_number=1,
+            row=[
+                "示例资源",
+                "4K",
+                "",
+                "https://magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                "2026",
+            ],
+            header_map=mapping,
+            media_mode="mixed",
+        )
+
+        assert mapping["title"] == 0
+        assert mapping["share_url"] == 2
+        assert resource is not None
+        assert resource["title"] == "示例资源"
+        assert resource["share_url"].startswith("magnet:?")
+
+
+def test_controlled_fuzzy_headers_accept_media_names_but_not_unrelated_names() -> None:
+    mapping = CatalogParser.identify_headers(
+        ["蓝光影片名称", "购买会员找我", "离线下载链接"]
+    )
+
+    assert mapping["title"] == 0
+    assert mapping["share_url"] == 2
+
+
 def test_parser_prioritizes_share_path_across_alternate_domains() -> None:
     resource = CatalogParser.parse_row(
         sheet_id="sheet-a",

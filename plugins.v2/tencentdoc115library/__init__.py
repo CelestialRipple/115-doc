@@ -129,7 +129,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.12.1"
+    plugin_version = "0.12.2"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"

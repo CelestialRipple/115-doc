@@ -19,7 +19,22 @@ from .source_link import extract_source_links, supported_link
 from .store import CatalogStore
 
 HEADER_ALIASES = {
-    "title": {"影片名称", "电影名称", "影视名称", "名称", "片名", "标题"},
+    "title": {
+        "影片名称",
+        "电影名称",
+        "剧集名称",
+        "动漫名称",
+        "动画名称",
+        "纪录片名称",
+        "演唱会名称",
+        "影视名称",
+        "资源名称",
+        "节目名称",
+        "剧名",
+        "名称",
+        "片名",
+        "标题",
+    },
     "version": {"资源版本", "资源描述", "版本", "画质", "规格"},
     "share_url": {
         "资源链接",
@@ -186,6 +201,34 @@ class CatalogParser:
             for field, aliases in normalized_aliases.items():
                 if normalized in aliases and field not in result:
                     result[field] = index
+            if "title" not in result and (
+                normalized.endswith("名称")
+                and any(
+                    keyword in normalized
+                    for keyword in (
+                        "电影",
+                        "影片",
+                        "影视",
+                        "剧集",
+                        "电视剧",
+                        "动漫",
+                        "动画",
+                        "纪录片",
+                        "演唱会",
+                        "节目",
+                        "资源",
+                    )
+                )
+            ):
+                result["title"] = index
+            if "share_url" not in result and (
+                "链接" in normalized
+                and any(
+                    keyword in normalized
+                    for keyword in ("网盘", "分享", "115", "磁力", "下载", "资源")
+                )
+            ):
+                result["share_url"] = index
         return result
 
     @staticmethod

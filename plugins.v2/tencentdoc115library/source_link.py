@@ -10,6 +10,10 @@ HTTP_PATTERN = re.compile(r"https?://[^\s\]）)}>，]+", re.IGNORECASE)
 MAGNET_PATTERN = re.compile(r"magnet:\?[^\s\]）)}>，]+", re.IGNORECASE)
 ED2K_PATTERN = re.compile(r"ed2k://\|file\|.*?\|/", re.IGNORECASE)
 YEAR_PATTERN = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+ENCODED_OFFLINE_WRAPPER = re.compile(
+    r"https?://((?:magnet%3A%3F|ed2k%3A%2F%2F)[^\s\]）)}>，]+)",
+    re.IGNORECASE,
+)
 
 
 def link_kind(value: str) -> str:
@@ -41,6 +45,10 @@ def extract_source_links(value: str) -> List[Dict[str, Any]]:
     # 这不是可访问网页，读取目录时恢复成原始协议，避免误当 HTTP 资源。
     text = re.sub(r"https?://(?=magnet:\?)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"https?://(?=ed2k://)", "", text, flags=re.IGNORECASE)
+    text = ENCODED_OFFLINE_WRAPPER.sub(
+        lambda match: unquote(match.group(1)),
+        text,
+    )
     matches: List[Dict[str, Any]] = []
     for kind, pattern in (
         ("ed2k", ED2K_PATTERN),

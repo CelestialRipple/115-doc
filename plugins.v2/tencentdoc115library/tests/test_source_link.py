@@ -56,3 +56,25 @@ def test_extract_links_unwraps_smart_sheet_magnet_url() -> None:
             "end": len(wrapped) - len("https://"),
         }
     ]
+
+
+def test_extract_links_unwraps_percent_encoded_offline_urls() -> None:
+    wrapped_magnet = (
+        "https://magnet%3A%3Fxt%3Durn%3Abtih%3A"
+        "0123456789abcdef0123456789abcdef01234567"
+    )
+    wrapped_ed2k = (
+        "https://ed2k%3A%2F%2F%7Cfile%7CExample.Movie.iso%7C1024%7C"
+        "19B8C66BBDCE9D7B920015F96FDC113C%7C%2F"
+    )
+
+    magnet = extract_source_links(wrapped_magnet)
+    ed2k = extract_source_links(wrapped_ed2k)
+
+    assert magnet[0]["kind"] == "magnet"
+    assert magnet[0]["url"].startswith("magnet:?")
+    assert ed2k[0]["kind"] == "ed2k"
+    assert ed2k[0]["url"] == (
+        "ed2k://|file|Example.Movie.iso|1024|"
+        "19B8C66BBDCE9D7B920015F96FDC113C|/"
+    )
