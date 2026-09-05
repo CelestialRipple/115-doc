@@ -1,7 +1,10 @@
+import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -40,6 +43,7 @@ class Re0BrowserClient:
 
     BASE_URL = "https://re0.me"
     OPERATION_TIMEOUT = 90
+    _environment_lock = threading.RLock()
 
     def __init__(self) -> None:
         """初始化串行浏览器执行器"""
@@ -152,16 +156,52 @@ class Re0BrowserClient:
                 raise RuntimeError(
                     "当前 MoviePilot 未提供可用的 CloakBrowser 启动入口"
                 )
-            self._context = _launch_browser_context(
-                headless=self._headless,
-                **launch_kwargs,
-            )
+            with self._playwright_temp_environment():
+                self._context = _launch_browser_context(
+                    headless=self._headless,
+                    **launch_kwargs,
+                )
             self._page = self._context.new_page()
             self._page.set_default_timeout(30000)
             return self._page
         except Exception as error:
             self._close_worker()
             raise Re0BrowserError(f"无法启动 MoviePilot 内置浏览器：{error}") from error
+
+    @classmethod
+    @contextmanager
+    def _playwright_temp_environment(cls) -> Any:
+        """启动浏览器时临时使用 MoviePilot 可写目录"""
+        configured_path = getattr(settings, "TEMP_PATH", None)
+        candidates = [configured_path, "/tmp"]
+        temp_path: Optional[Path] = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                current = Path(str(candidate)).expanduser() / "re0search"
+                current.mkdir(parents=True, exist_ok=True)
+                if current.is_dir() and os.access(current, os.W_OK | os.X_OK):
+                    temp_path = current
+                    break
+            except OSError:
+                continue
+        if temp_path is None:
+            raise RuntimeError("MoviePilot 没有可写的浏览器临时目录")
+
+        variable_names = ("TMPDIR", "TMP", "TEMP")
+        with cls._environment_lock:
+            previous = {name: os.environ.get(name) for name in variable_names}
+            try:
+                for name in variable_names:
+                    os.environ[name] = str(temp_path)
+                yield
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
 
     def _ensure_login(self) -> Any:
         """确保当前持久上下文已登录 RE0"""

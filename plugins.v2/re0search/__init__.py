@@ -23,7 +23,7 @@ class Re0Search(_PluginBase):
     plugin_name = "RE0资源搜索"
     plugin_desc = "在独立页面中搜索、确认解锁并获取 RE0 资源链接"
     plugin_icon = "https://re0.me/favicon.ico"
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
     plugin_author = "CelestialRipple"
     author_url = "https://github.com/CelestialRipple"
     plugin_config_prefix = "re0search_"
