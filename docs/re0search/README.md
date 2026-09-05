@@ -1,5 +1,7 @@
 # RE0 资源搜索 MoviePilot 插件
 
+> 0.1.1 起同时兼容 MoviePilot 新版容器和群晖套件的模块布局
+
 这是一个与腾讯文档影视库完全独立的 MoviePilot V2 插件原型
 
 ## 功能

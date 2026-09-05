@@ -23,7 +23,7 @@ class Re0Search(_PluginBase):
     plugin_name = "RE0资源搜索"
     plugin_desc = "在独立页面中搜索、确认解锁并获取 RE0 资源链接"
     plugin_icon = "https://re0.me/favicon.ico"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "CelestialRipple"
     author_url = "https://github.com/CelestialRipple"
     plugin_config_prefix = "re0search_"
@@ -218,7 +218,10 @@ class Re0Search(_PluginBase):
         prefix = f"{title}|{year}" if year else title
         import_text = "\n".join(f"{prefix}|{link}" for link in links)
         try:
-            from app.runtime.extensions.plugin_manager import PluginManager
+            try:
+                from app.runtime.extensions.plugin_manager import PluginManager
+            except ImportError:
+                from app.core.plugin import PluginManager
 
             target = PluginManager().running_plugins.get("TencentDoc115Library")
             if target is None or not hasattr(target, "import_manual_resources"):

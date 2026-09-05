@@ -5,8 +5,20 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from app.adapters.network.browser import launch_browser_context
 from app.core.config import settings
+
+try:
+    from app.adapters.network.browser import (
+        launch_browser_context as _launch_browser_context,
+    )
+except ImportError:
+    try:
+        from app.sdk.browser import launch_browser_context as _launch_browser_context
+    except ImportError:
+        try:
+            from cloakbrowser import launch_context as _launch_browser_context
+        except ImportError:
+            _launch_browser_context = None
 
 from .link_parser import (
     extract_resource_links,
@@ -136,7 +148,11 @@ class Re0BrowserClient:
         if self._proxy:
             launch_kwargs["proxy"] = self._proxy
         try:
-            self._context = launch_browser_context(
+            if _launch_browser_context is None:
+                raise RuntimeError(
+                    "当前 MoviePilot 未提供可用的 CloakBrowser 启动入口"
+                )
+            self._context = _launch_browser_context(
                 headless=self._headless,
                 **launch_kwargs,
             )

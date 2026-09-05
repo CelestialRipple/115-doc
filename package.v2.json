@@ -60,12 +60,13 @@
         "name": "RE0资源搜索",
         "description": "使用MoviePilot内置浏览器登录RE0，按TMDB搜索、确认解锁并可保存到媒体库",
         "labels": "资源搜索,115网盘,磁力,ED2K",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "icon": "https://re0.me/apple-touch-icon.png",
         "author": "CelestialRipple",
         "level": 1,
         "system_version": ">=2.13.14",
         "history": {
+            "v0.1.1": "兼容群晖 MoviePilot 套件和新版容器的浏览器、插件管理器模块布局",
             "v0.1.0": "独立RE0登录会话、MoviePilot媒体识别、资源搜索、积分确认解锁、可选媒体库导入和每日签到"
         }
     }
