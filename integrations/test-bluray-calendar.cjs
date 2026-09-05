@@ -20,3 +20,9 @@ test('subscription entry follows navigation and never duplicates', () => {
   context.location.pathname='/resource'; observer(); assert.equal(current,null);
   context.location.pathname='/subscribe/tv'; observer(); assert.ok(current);
 });
+
+test('calendar embedded browser code compiles', () => {
+  const html = fs.readFileSync(__dirname+'/../plugins.v2/blurayreleasecalendar/ui.py','utf8');
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  assert.doesNotThrow(() => new vm.Script(script));
+});

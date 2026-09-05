@@ -92,11 +92,12 @@
         "name": "近期蓝光发行",
         "description": "浏览近期美国蓝光与4K发行日历，匹配TMDB中文名、海报和简介，不自动订阅或下载",
         "labels": "蓝光,4K,发行日历,TMDB",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "icon": "https://raw.githubusercontent.com/CelestialRipple/115-doc/main/docs/blurayreleasecalendar/icon.svg",
         "author": "CelestialRipple",
         "level": 1,
         "history": {
+            "v0.1.1": "修复日历页面脚本加载，增加浏览器脚本语法回归；固定美国发行来源并显示登录和启用提示",
             "v0.1.0": "新增只读蓝光发行日历，按月份、格式与发行状态筛选；保守匹配TMDB元数据并缓存，提供订阅页入口"
         }
     }
