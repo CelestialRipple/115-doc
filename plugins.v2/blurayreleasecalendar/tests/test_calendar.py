@@ -97,3 +97,27 @@ def test_filter_and_metadata_cache_use_film_identity(plugin, client):
     engine.cache.set(engine.meta_key(rows[0]), {"state": "matched", "title": "电影"})
     r = client.get("/api/v1/plugin/BlurayReleaseCalendar/releases?format=bluray").json()
     assert r["total"] == 1 and r["items"][0]["metadata"]["title"] == "电影"
+
+
+def test_tmdb_empty_response_is_retryable_not_cached_as_unmatched(plugin, monkeypatch):
+    import sys
+    from types import ModuleType
+    from blurayreleasecalendar.metadata import match_metadata
+
+    sdk = ModuleType("app.modules.themoviedb.tmdbv3api")
+
+    class Search:
+        def __init__(self, **kwargs):
+            pass
+
+        def movies(self, **kwargs):
+            return None
+
+    sdk.Search = Search
+    sdk.Movie = Search
+    monkeypatch.setitem(sys.modules, sdk.__name__, sdk)
+    item = {"id": "1", "title": "Movie", "year": "2000"}
+    with pytest.raises(RuntimeError):
+        match_metadata(item)
+    assert plugin._engine.match_one(item)["state"] == "error"
+    assert plugin._engine.metadata(item)["state"] == "pending"

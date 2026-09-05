@@ -19,7 +19,7 @@ class BlurayReleaseCalendar(_PluginBase):
     plugin_name = "近期蓝光发行"
     plugin_desc = "浏览近期美国蓝光和4K光盘发行，匹配TMDB海报与简介；不自动订阅或下载"
     plugin_icon = "https://raw.githubusercontent.com/CelestialRipple/115-doc/main/docs/blurayreleasecalendar/icon.svg"
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
     plugin_author = "CelestialRipple"
     author_url = "https://github.com/CelestialRipple"
     plugin_config_prefix = "blurayreleasecalendar_"

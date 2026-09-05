@@ -91,7 +91,6 @@ def fetch_calendar(month, proxy=""):
     year, number = month.split("-")
     with requests.Session() as session:
         session.trust_env = False
-        session.cookies.set("country", "us", domain=".blu-ray.com")
         if proxy:
             session.proxies = {"http": proxy, "https": proxy}
         with session.get(

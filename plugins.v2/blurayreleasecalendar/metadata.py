@@ -50,13 +50,17 @@ def match_metadata(item):
     from app.modules.themoviedb.tmdbv3api import Search, Movie
 
     title = query_title(item)
-    candidates = (
-        Search(language="en-US").movies(term=title, year=item.get("year") or None) or []
+    candidates = Search(language="en-US").movies(
+        term=title, year=item.get("year") or None
     )
+    if candidates is None:
+        raise RuntimeError("TMDB search unavailable")
     match = select_match(item, candidates)
     if not match:
         return {"state": "unmatched", "message": "未可靠匹配，保留原始发行名称"}
-    detail = Movie(language="zh-CN").details(int(match["id"])) or match
+    detail = Movie(language="zh-CN").details(int(match["id"]), append_to_response="")
+    if not detail:
+        raise RuntimeError("TMDB details unavailable")
     poster = str(detail.get("poster_path") or "")
     return {
         "state": "matched",
