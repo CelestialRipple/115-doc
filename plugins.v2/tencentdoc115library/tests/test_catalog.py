@@ -283,7 +283,10 @@ def test_parser_accepts_ed2k_and_magnet_rows() -> None:
         sheet_title="混合资源",
         group_name="离线",
         row_number=3,
-        row=["示例电影2", "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"],
+        row=[
+            "示例电影2",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+        ],
         header_map={"title": 0, "share_url": 1},
         media_mode="movie",
     )
@@ -454,17 +457,44 @@ def test_smart_sheet_sync_uses_offset_checkpoint_and_normalizes_links(tmp_path) 
             records = [
                 {
                     "field_values": [
-                        {"field": "电影名称", "text_value": {"items": [{"text": "电影甲"}]}},
-                        {"field": "资源描述", "text_value": {"items": [{"text": "4K"}]}},
-                        {"field": "网盘链接/115离线下载", "url_value": {"items": [{"link": "https://115cdn.com/s/example"}]}},
-                        {"field": "电影类型", "option_value": {"items": [{"text": "动作"}]}},
+                        {
+                            "field": "电影名称",
+                            "text_value": {"items": [{"text": "电影甲"}]},
+                        },
+                        {
+                            "field": "资源描述",
+                            "text_value": {"items": [{"text": "4K"}]},
+                        },
+                        {
+                            "field": "网盘链接/115离线下载",
+                            "url_value": {
+                                "items": [{"link": "https://115cdn.com/s/example"}]
+                            },
+                        },
+                        {
+                            "field": "电影类型",
+                            "option_value": {"items": [{"text": "动作"}]},
+                        },
                         {"field": "上映年份", "number_value": 2025},
                     ]
                 },
                 {
                     "field_values": [
-                        {"field": "电影名称", "text_value": {"items": [{"text": "电影乙"}]}},
-                        {"field": "磁力链接", "url_value": {"items": [{"link": "https://magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", "text": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"}]}},
+                        {
+                            "field": "电影名称",
+                            "text_value": {"items": [{"text": "电影乙"}]},
+                        },
+                        {
+                            "field": "磁力链接",
+                            "url_value": {
+                                "items": [
+                                    {
+                                        "link": "https://magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                                        "text": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                                    }
+                                ]
+                            },
+                        },
                     ]
                 },
             ]
@@ -498,9 +528,12 @@ def test_smart_sheet_sync_uses_offset_checkpoint_and_normalizes_links(tmp_path) 
     assert store.get_sheet("smart-sheet")["checkpoint_row"] == 2
     assert synchronizer.sync()["status"] == "completed"
     with store.connection() as connection:
-        resources = [dict(row) for row in connection.execute(
-            "SELECT title, share_url FROM resource ORDER BY row_number"
-        ).fetchall()]
+        resources = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT title, share_url FROM resource ORDER BY row_number"
+            ).fetchall()
+        ]
     assert resources == [
         {"title": "电影甲", "share_url": "https://115cdn.com/s/example"},
         {
@@ -536,6 +569,12 @@ def test_sync_continues_next_incomplete_sheet_before_new_round(tmp_path) -> None
     calls = []
 
     class FakeClient:
+        def get_sheets(self, file_id):
+            return [
+                {"sheet_id": sid, "used_row_count": 2, "used_column_count": 3}
+                for sid in ("sheet-a", "sheet-b")
+            ]
+
         def get_range(self, file_id, sheet_id, start_row, row_count, column_count):
             calls.append(sheet_id)
             return {

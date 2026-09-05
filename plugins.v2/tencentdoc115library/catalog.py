@@ -517,7 +517,9 @@ class CatalogSynchronizer:
                         "remote_sheet_id": remote_sheet_id,
                         "file_id": file_id,
                         "source_kind": source_kind,
-                        "mcp_file_id": encoded_id if source_kind == "smartsheet" else None,
+                        "mcp_file_id": encoded_id
+                        if source_kind == "smartsheet"
+                        else None,
                         "view_id": (
                             context["view_id"]
                             if source_kind == "smartsheet"
@@ -602,6 +604,15 @@ class CatalogSynchronizer:
             mcp_client = self.mcp_client_factory() if self.mcp_client_factory else None
             page_limit = max_pages or int(config.get("pages_per_run") or 5)
             page_limit = min(max(page_limit, 1), 100)
+            fresh_dimensions = {}
+            for file_id in {
+                str(item.get("file_id") or config.get("file_id") or "")
+                for item in sheets
+                if item.get("source_kind") != "smartsheet"
+            }:
+                if file_id:
+                    for remote in client.get_sheets(file_id):
+                        fresh_dimensions[(file_id, str(remote["sheet_id"]))] = remote
             requested_rows = int(config.get("page_rows") or 1000)
             max_columns = min(max(int(config.get("max_columns") or 10), 1), 200)
             for sheet in sheets:
@@ -610,11 +621,31 @@ class CatalogSynchronizer:
                 scan_id = checkpoint["scan_id"]
                 current_row = int(checkpoint["checkpoint_row"])
                 header_map = dict(checkpoint["header_map"])
-                total_rows = int(
-                    sheet.get("used_row_count") or sheet.get("row_count") or 0
+                dimensions = fresh_dimensions.get(
+                    (
+                        str(sheet.get("file_id") or config.get("file_id") or ""),
+                        str(sheet.get("remote_sheet_id") or current_sheet_id),
+                    )
                 )
+                total_rows = int(
+                    (dimensions or {}).get("used_row_count")
+                    or (dimensions or {}).get("row_count")
+                    or 0
+                )
+                if dimensions:
+                    self.store.update_sheet_dimensions(
+                        current_sheet_id,
+                        total_rows,
+                        int(
+                            dimensions.get("used_column_count")
+                            or dimensions.get("column_count")
+                            or 6
+                        ),
+                    )
                 column_count = int(
-                    sheet.get("used_column_count") or sheet.get("column_count") or 6
+                    (dimensions or sheet).get("used_column_count")
+                    or (dimensions or sheet).get("column_count")
+                    or 6
                 )
                 column_count = min(max(column_count, 1), max_columns)
                 source_kind = str(sheet.get("source_kind") or "worksheet")
@@ -631,7 +662,9 @@ class CatalogSynchronizer:
                     )
                     header_map = CatalogParser.identify_headers(smart_headers)
                     missing_headers = {
-                        field for field in ("title", "share_url") if field not in header_map
+                        field
+                        for field in ("title", "share_url")
+                        if field not in header_map
                     }
                     if missing_headers:
                         raise TencentDocumentError(
@@ -659,7 +692,9 @@ class CatalogSynchronizer:
                         rows = []
                         for record in smart_page["records"]:
                             values = mcp_client.record_values(record)
-                            rows.append([values.get(title, "") for title in smart_headers])
+                            rows.append(
+                                [values.get(title, "") for title in smart_headers]
+                            )
                         page = {
                             "rows": rows,
                             "requested_rows": smart_page["requested_rows"],
@@ -678,7 +713,9 @@ class CatalogSynchronizer:
                             file_id=str(
                                 sheet.get("file_id") or config.get("file_id") or ""
                             ),
-                            sheet_id=str(sheet.get("remote_sheet_id") or current_sheet_id),
+                            sheet_id=str(
+                                sheet.get("remote_sheet_id") or current_sheet_id
+                            ),
                             start_row=current_row,
                             row_count=requested_rows,
                             column_count=column_count,

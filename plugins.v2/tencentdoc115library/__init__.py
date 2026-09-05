@@ -1,6 +1,6 @@
 import asyncio
 import re
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from html import escape
 from secrets import compare_digest, token_urlsafe
 from threading import Event, Lock
@@ -31,6 +31,7 @@ try:
 except ImportError:
     from app.helper.thread import ThreadHelper
 
+from .browser_download import BrowserDownloads
 from .catalog import (
     CatalogSynchronizer,
     default_group_for_title,
@@ -59,6 +60,7 @@ from .search_bridge import (
     MoviePilotSearchBridge,
 )
 from .source_link import is_offline_link
+from .signing import sign_action, verify_action
 from .storage_limit import format_gib
 from .store import CatalogStore
 
@@ -72,6 +74,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "document_urls": "",
     "manual_import_links": "",
     "manual_import_token": "",
+    "action_signing_key": "",
     "manual_import_group": "自定义",
     "manual_import_media_mode": "mixed",
     "client_id": "",
@@ -92,6 +95,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "playback_token": "",
     "scrape_metadata": True,
     "native_search_enabled": True,
+    "browser_download_enabled": True,
     "native_search_scope": "all",
     "search_ready_only": True,
     "search_page_size": 50,
@@ -129,7 +133,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.12.3"
+    plugin_version = "0.13.0"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -154,6 +158,7 @@ class TencentDoc115Library(_PluginBase):
         self._task_message = "没有后台任务"
         self._resume_spec: Optional[Tuple[Any, Tuple[Any, ...], Dict[str, Any]]] = None
         self._store: Optional[CatalogStore] = None
+        self._browser_downloads = None
         self._synchronizer: Optional[CatalogSynchronizer] = None
         self._resolver: Optional[ShareResolver] = None
         self._builder: Optional[LibraryBuilder] = None
@@ -161,8 +166,9 @@ class TencentDoc115Library(_PluginBase):
         self._direct_downloader: Optional[DirectDownloadManager] = None
         self._gateway: Optional[DirectPlayGateway] = None
         self._search_bridge = MoviePilotSearchBridge(
-            lambda: self._enabled
-            and bool(self._config.get("native_search_enabled", True))
+            lambda: (
+                self._enabled and bool(self._config.get("native_search_enabled", True))
+            )
         )
         self._pipeline_status: Dict[str, Any] = {
             "phase": "idle",
@@ -217,6 +223,9 @@ class TencentDoc115Library(_PluginBase):
         if not self._config.get("playback_token"):
             self._config["playback_token"] = token_urlsafe(32)
             config_changed = True
+        if not self._config.get("action_signing_key"):
+            self._config["action_signing_key"] = token_urlsafe(32)
+            config_changed = True
         if not self._config.get("manual_import_token"):
             self._config["manual_import_token"] = token_urlsafe(32)
             config_changed = True
@@ -246,6 +255,9 @@ class TencentDoc115Library(_PluginBase):
         self._resolver = ShareResolver(
             store=self._store,
             config_provider=self._current_config,
+        )
+        self._browser_downloads = BrowserDownloads(
+            self._store, self._resolver, self._current_config
         )
         self._gateway = DirectPlayGateway(
             config_provider=self._current_config,
@@ -382,7 +394,8 @@ class TencentDoc115Library(_PluginBase):
                 dict(kwargs if resume_kwargs is None else resume_kwargs),
             )
             self._future = ThreadHelper().submit(function, *args, **kwargs)
-            self._future.add_done_callback(lambda future: self._task_done(name, future))
+            submitted = self._future
+        submitted.add_done_callback(lambda future: self._task_done(name, future))
         return Response(success=True, message=f"{name}已在后台启动")
 
     def _task_done(self, name: str, future: Future) -> None:
@@ -399,7 +412,9 @@ class TencentDoc115Library(_PluginBase):
                 self._task_message = f"{name}失败：{error}"
                 self._resume_spec = None
             return
-        result_status = str(result.get("status") or "") if isinstance(result, dict) else ""
+        result_status = (
+            str(result.get("status") or "") if isinstance(result, dict) else ""
+        )
         with self._task_lock:
             # 前一任务结束与下一任务启动极近时，旧回调不得覆盖新任务状态。
             if self._future is not future:
@@ -429,7 +444,8 @@ class TencentDoc115Library(_PluginBase):
                 "state": self._task_state,
                 "message": self._task_message,
                 "running": running,
-                "can_resume": self._task_state == "paused" and self._resume_spec is not None,
+                "can_resume": self._task_state == "paused"
+                and self._resume_spec is not None,
             }
 
     def get_state(self) -> bool:
@@ -466,14 +482,10 @@ class TencentDoc115Library(_PluginBase):
         if save_mode == "movie":
             return MediaType.MOVIE
         raw_type = str(
-            resource.get("detected_media_type")
-            or resource.get("media_type")
-            or ""
+            resource.get("detected_media_type") or resource.get("media_type") or ""
         ).lower()
         group_name = str(
-            resource.get("detected_group_name")
-            or resource.get("group_name")
-            or ""
+            resource.get("detected_group_name") or resource.get("group_name") or ""
         ).lower()
         if any(
             keyword in raw_type or keyword in group_name
@@ -498,9 +510,9 @@ class TencentDoc115Library(_PluginBase):
             100,
         )
         page_index = max(int(page or 0), 0)
-        search_scope = str(
-            self._config.get("native_search_scope") or "all"
-        ).strip().lower()
+        search_scope = (
+            str(self._config.get("native_search_scope") or "all").strip().lower()
+        )
         if search_scope not in {"unbuilt", "all", "ready"}:
             search_scope = "all"
         normalized_keyword = str(keyword or "").strip()
@@ -529,9 +541,7 @@ class TencentDoc115Library(_PluginBase):
         for resource in resources:
             media_type = self._resource_media_type(resource)
             if mtype and media_type != mtype:
-                sheet = self._store.get_sheet(
-                    str(resource.get("sheet_id") or "")
-                ) or {}
+                sheet = self._store.get_sheet(str(resource.get("sheet_id") or "")) or {}
                 unresolved_mixed = (
                     str(sheet.get("media_mode") or "").lower() == "mixed"
                     and not str(resource.get("detected_media_type") or "").strip()
@@ -569,7 +579,9 @@ class TencentDoc115Library(_PluginBase):
                     seeders=1,
                     labels=[
                         "腾讯文档",
-                        "115离线" if is_offline_link(resource["share_url"]) else "115分享",
+                        "115离线"
+                        if is_offline_link(resource["share_url"])
+                        else "115分享",
                         effective_group,
                         "右下角ⓘ保存" if is_unbuilt else "已入库",
                     ],
@@ -589,8 +601,7 @@ class TencentDoc115Library(_PluginBase):
     ) -> List[str]:
         """把详情页的 IMDb 搜索词映射为目录中已有的 TMDB ID。"""
         cache_key = (
-            f"{imdb_id.lower()}::"
-            f"{getattr(media_type, 'value', media_type) or ''}"
+            f"{imdb_id.lower()}::{getattr(media_type, 'value', media_type) or ''}"
         )
         with self._search_id_lock:
             cached = self._imdb_tmdb_cache.get(cache_key)
@@ -622,11 +633,20 @@ class TencentDoc115Library(_PluginBase):
 
     def _library_save_url(self, resource_id: str) -> str:
         """生成带插件密钥的搜索结果保存确认页地址。"""
-        token = str(self._config.get("playback_token") or "")
+        token = sign_action(
+            str(self._config.get("action_signing_key") or ""), "save", resource_id
+        )
         query = urlencode({"token": token})
         return (
             "/api/v1/plugin/TencentDoc115Library/"
             f"resources/save/{resource_id}?{query}"
+            + (
+                "#mp115-browser="
+                + urlencode({"url": self._browser_downloads.url(resource_id)})
+                if self._browser_downloads
+                and self._config.get("browser_download_enabled", True)
+                else ""
+            )
         )
 
     async def save_search_resource(
@@ -636,9 +656,15 @@ class TencentDoc115Library(_PluginBase):
         token: str = Query(default=""),
     ) -> HttpResponse:
         """显示或执行搜索结果的定向 STRM 入库操作。"""
-        expected_token = str(self._config.get("playback_token") or "")
-        if not expected_token or not compare_digest(token, expected_token):
-            return HTMLResponse("<h2>保存密钥无效</h2>", status_code=401)
+        if not verify_action(
+            str(self._config.get("action_signing_key") or ""),
+            token,
+            "save",
+            resource_id,
+        ):
+            return HTMLResponse(
+                "<h2>保存链接无效或已过期，请重新搜索</h2>", status_code=401
+            )
         if not self._store or not self._builder:
             return HTMLResponse("<h2>插件尚未初始化</h2>", status_code=503)
         resource = self._store.get_resource(resource_id)
@@ -654,9 +680,7 @@ class TencentDoc115Library(_PluginBase):
         configured_mode = str(resource.get("save_media_mode") or "").lower()
         if configured_mode not in {"movie", "tv", "mixed"}:
             raw_type = str(
-                resource.get("detected_media_type")
-                or resource.get("media_type")
-                or ""
+                resource.get("detected_media_type") or resource.get("media_type") or ""
             ).lower()
             configured_mode = (
                 "tv"
@@ -669,7 +693,9 @@ class TencentDoc115Library(_PluginBase):
         if request.method.upper() == "POST":
             form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
             requested_group = str((form.get("group_name") or [group_name])[0]).strip()
-            requested_mode = str((form.get("media_mode") or [configured_mode])[0]).lower()
+            requested_mode = str(
+                (form.get("media_mode") or [configured_mode])[0]
+            ).lower()
             if (
                 not requested_group
                 or len(requested_group) > 120
@@ -718,17 +744,35 @@ class TencentDoc115Library(_PluginBase):
                 )
             )
         if str(resource.get("strm_status") or "") == "ready":
-            return HTMLResponse(
-                self._save_page_html(
-                    title,
-                    group_name,
-                    configured_mode,
-                    "该资源已经在影视库中。",
-                    "#2e7d32",
-                    allow_submit=False,
-                )
+            page = self._save_page_html(
+                title,
+                group_name,
+                configured_mode,
+                "该资源已经在影视库中。",
+                "#2e7d32",
+                allow_submit=False,
             )
-        return HTMLResponse(self._save_page_html(title, group_name, configured_mode))
+            if self._browser_downloads:
+                link = escape(self._browser_downloads.url(resource_id), quote=True)
+                page = page.replace(
+                    "</body>",
+                    f'<p><a href="{link}" rel="noreferrer">用浏览器下载视频</a></p></body>',
+                )
+            return HTMLResponse(
+                page,
+                headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
+            )
+        page = self._save_page_html(title, group_name, configured_mode)
+        if self._browser_downloads:
+            link = escape(self._browser_downloads.url(resource_id), quote=True)
+            page = page.replace(
+                "</body>",
+                f'<p><a href="{link}" rel="noreferrer">用浏览器下载视频</a></p></body>',
+            )
+        return HTMLResponse(
+            page,
+            headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
+        )
 
     @staticmethod
     def _save_page_html(
@@ -761,8 +805,8 @@ class TencentDoc115Library(_PluginBase):
             else (
                 '<form method="post"><label>输出文件夹</label>'
                 f'<input name="group_name" value="{group_name}" maxlength="120" required>'
-                '<small>该文件夹位于输出根目录下，与“星火”同一级。</small>'
-                '<label>媒体类型</label>'
+                "<small>该文件夹位于输出根目录下，与“星火”同一级。</small>"
+                "<label>媒体类型</label>"
                 f'<select name="media_mode">{options}</select>'
                 '<button type="submit">保存到媒体库</button>'
                 "</form>"
@@ -1100,11 +1144,15 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             if action.group_name is None
             else action.group_name
         ).strip()
-        media_mode = str(
-            (self._config.get("manual_import_media_mode") or "mixed")
-            if action.media_mode is None
-            else action.media_mode
-        ).strip().lower()
+        media_mode = (
+            str(
+                (self._config.get("manual_import_media_mode") or "mixed")
+                if action.media_mode is None
+                else action.media_mode
+            )
+            .strip()
+            .lower()
+        )
         try:
             if (
                 not group_name
@@ -1155,12 +1203,9 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
 
     def _manual_import_page_url(self) -> str:
         """生成插件详情页“添加自选”按钮使用的轻量表单地址。"""
-        query = urlencode(
-            {"token": str(self._config.get("manual_import_token") or "")}
-        )
+        query = urlencode({"token": str(self._config.get("manual_import_token") or "")})
         return (
-            "/api/v1/plugin/TencentDoc115Library/"
-            f"resources/import-manual-page?{query}"
+            f"/api/v1/plugin/TencentDoc115Library/resources/import-manual-page?{query}"
         )
 
     async def manual_import_page(
@@ -1685,15 +1730,21 @@ refresh(); setInterval(refresh,1000);
         return Response(success=True, message="直链网关正在后台重启")
 
     def clear_all_data(self) -> Response:
-        """清空插件数据库以及输出目录中的 STRM 和元数据文件"""
+        """与后台任务提交互斥，避免清理与生成同时启动。"""
+        with self._task_lock:
+            return self._clear_all_data()
+
+    def _clear_all_data(self) -> Response:
+        """仅清除有归属记录且内容未变化的插件输出。"""
+        if self._direct_downloader and self._direct_downloader.has_active_tasks():
+            return Response(success=False, message="请先停止并等待下载任务结束")
         if self._future and not self._future.done():
             return Response(success=False, message="请先停止并等待后台任务结束")
         if not self._config.get("clear_confirmation"):
             return Response(
                 success=False,
                 message=(
-                    "请先在插件配置中开启“我确认清空全部插件数据和生成元数据”"
-                    "并保存"
+                    "请先在插件配置中开启“我确认清空全部插件数据和生成元数据”并保存"
                 ),
             )
         if not self._store or not self._builder:
@@ -1704,10 +1755,10 @@ refresh(); setInterval(refresh,1000);
                 if self._resolver
                 else {"failed": 0, "removed": 0}
             )
-            if offline_cleanup.get("failed"):
+            if offline_cleanup.get("failed") or offline_cleanup.get("skipped"):
                 return Response(
                     success=False,
-                    message="115离线缓存清理失败，已保留数据库记录供稍后重试",
+                    message="115离线缓存清理失败或正在使用，已保留数据库记录供稍后重试",
                     data=offline_cleanup,
                 )
             cleanup = self._builder.clear_generated_output()
@@ -1786,9 +1837,29 @@ refresh(); setInterval(refresh,1000);
                 content={"success": False, "message": str(error)},
             )
 
+    def browser_download(
+        self,
+        resource_id: str,
+        request: Request,
+        token: str = Query(default=""),
+        file_id: str = Query(default=""),
+    ) -> HttpResponse:
+        if not self._browser_downloads:
+            return JSONResponse(
+                status_code=503, content={"success": False, "message": "插件尚未初始化"}
+            )
+        return self._browser_downloads.handle(resource_id, request, token, file_id)
+
     def get_api(self) -> List[Dict[str, Any]]:
         """注册管理接口和带播放密钥的重定向接口。"""
         return [
+            {
+                "path": "/resources/browser/{resource_id}",
+                "endpoint": self.browser_download,
+                "methods": ["GET", "HEAD"],
+                "summary": "浏览器按需解析115直链，不创建下载器任务",
+                "allow_anonymous": True,
+            },
             {
                 "path": "/discover",
                 "endpoint": self.discover,
@@ -2064,9 +2135,7 @@ refresh(); setInterval(refresh,1000);
             [
                 sheet
                 for sheet in self._store.list_sheets()
-                if not str(sheet.get("sheet_id") or "").startswith(
-                    MANUAL_SHEET_PREFIX
-                )
+                if not str(sheet.get("sheet_id") or "").startswith(MANUAL_SHEET_PREFIX)
             ]
             if self._store
             else []
@@ -2211,6 +2280,21 @@ refresh(); setInterval(refresh,1000);
                                         "props": {
                                             "model": "native_search_enabled",
                                             "label": "接入原生检索/下载",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "browser_download_enabled",
+                                            "label": "使用浏览器下载视频",
+                                            "hint": "默认开启，不创建下载器任务；原生卡片点击需安装配套浏览器脚本，也可从详情页下载。",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -2907,7 +2991,9 @@ refresh(); setInterval(refresh,1000);
                     {
                         "component": "VAlert",
                         "props": {
-                            "type": "success" if gateway_state == "running" else "warning",
+                            "type": "success"
+                            if gateway_state == "running"
+                            else "warning",
                             "variant": "tonal",
                             "class": "mt-2",
                             "text": (
@@ -3060,3 +3146,10 @@ refresh(); setInterval(refresh,1000);
             self._direct_downloader.stop_all()
         if self._gateway:
             self._gateway.stop()
+        if self._future and not self._future.done():
+            try:
+                self._future.result(timeout=10)
+            except FutureTimeout as error:
+                raise RuntimeError("后台任务仍在停止，请稍后重新保存配置") from error
+            except Exception:
+                pass

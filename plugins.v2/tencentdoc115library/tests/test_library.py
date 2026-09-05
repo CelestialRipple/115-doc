@@ -1,3 +1,4 @@
+import re
 import os
 from pathlib import Path
 from threading import Event
@@ -111,12 +112,14 @@ def test_migrate_shared_old_directory_splits_strm_without_rescraping(
         assert (target_a / "movie.nfo").stat().st_ino == (
             target_b / "movie.nfo"
         ).stat().st_ino
-    assert Path(store.get_resource("resource-a")["strm_path"]).resolve() == (
-        target_a / first_strm.name
-    ).resolve()
-    assert Path(store.get_resource("resource-b")["strm_path"]).resolve() == (
-        target_b / second_strm.name
-    ).resolve()
+    assert (
+        Path(store.get_resource("resource-a")["strm_path"]).resolve()
+        == (target_a / first_strm.name).resolve()
+    )
+    assert (
+        Path(store.get_resource("resource-b")["strm_path"]).resolve()
+        == (target_b / second_strm.name).resolve()
+    )
 
 
 def test_build_honors_pause_before_starting_next_resource(tmp_path: Path) -> None:
@@ -163,13 +166,9 @@ def test_mixed_sheet_accepts_moviepilot_tv_result_and_changes_group(
         {"sheet-a": {"enabled": True, "group_name": "星火", "media_mode": "mixed"}}
     )
     checkpoint = store.begin_sheet_scan("sheet-a")
-    resource = _resource(
-        "resource-a", "魔奇少年 第二季", "https://115.com/s/example"
-    )
+    resource = _resource("resource-a", "魔奇少年 第二季", "https://115.com/s/example")
     resource["group_name"] = "星火"
-    store.save_page(
-        "sheet-a", checkpoint["scan_id"], 3, {}, [resource], 1
-    )
+    store.save_page("sheet-a", checkpoint["scan_id"], 3, {}, [resource], 1)
     resource = store.get_resource("resource-a")
 
     class TelevisionMediaChain:
@@ -251,6 +250,7 @@ def test_tv_iso_disc_numbers_are_used_as_episode_numbers(tmp_path: Path) -> None
         store=Store(),
         resolver=object(),
         config_provider=lambda: {
+            "output_root": str(tmp_path),
             "public_base_url": "http://moviepilot:3000",
             "playback_token": "test-token",
         },
@@ -289,7 +289,9 @@ def test_tv_iso_disc_numbers_are_used_as_episode_numbers(tmp_path: Path) -> None
     )
 
     generated = sorted(Path(result).rglob("*.strm"))
-    assert [item.name for item in generated] == [
+    assert [
+        re.sub(r" - [0-9a-f]{16}(?=\.strm$)", "", item.name) for item in generated
+    ] == [
         "北美大地 (2013) - S01E01.strm",
         "北美大地 (2013) - S01E03.strm",
     ]
@@ -323,6 +325,7 @@ def test_tv_files_without_episode_markers_use_natural_path_order(
         store=Store(),
         resolver=object(),
         config_provider=lambda: {
+            "output_root": str(tmp_path),
             "public_base_url": "http://moviepilot:3000",
             "playback_token": "test-token",
         },
@@ -347,7 +350,9 @@ def test_tv_files_without_episode_markers_use_natural_path_order(
     )
 
     generated = sorted(Path(result).rglob("*.strm"))
-    assert [item.name for item in generated] == [
+    assert [
+        re.sub(r" - [0-9a-f]{16}(?=\.strm$)", "", item.name) for item in generated
+    ] == [
         "测试剧集 (2020) - S02E01.strm",
         "测试剧集 (2020) - S02E02.strm",
         "测试剧集 (2020) - S02E03.strm",
@@ -373,6 +378,7 @@ def test_movie_strm_filename_respects_utf8_path_segment_limit(tmp_path: Path) ->
         store=Store(),
         resolver=Resolver(),
         config_provider=lambda: {
+            "output_root": str(tmp_path),
             "public_base_url": "http://moviepilot:3000",
             "playback_token": "test-token",
         },
@@ -409,14 +415,10 @@ def test_unrecognized_movie_still_generates_strm_without_metadata(
         {"sheet-a": {"enabled": True, "group_name": "星火", "media_mode": "mixed"}}
     )
     checkpoint = store.begin_sheet_scan("sheet-a")
-    resource = _resource(
-        "resource-a", "77年航空港", "https://115.com/s/example"
-    )
+    resource = _resource("resource-a", "77年航空港", "https://115.com/s/example")
     resource["year"] = "1977"
     resource["group_name"] = "星火"
-    store.save_page(
-        "sheet-a", checkpoint["scan_id"], 3, {}, [resource], 1
-    )
+    store.save_page("sheet-a", checkpoint["scan_id"], 3, {}, [resource], 1)
 
     class UnrecognizedMediaChain:
         @staticmethod

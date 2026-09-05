@@ -35,7 +35,10 @@ def _called_from_search_chain() -> bool:
             if not caller:
                 return False
             filename = str(caller.f_code.co_filename).replace("\\", "/")
-            if filename.endswith("/app/chain/search.py"):
+            if (
+                filename.endswith("/app/chain/search.py")
+                or "/app/chain/search/" in filename
+            ):
                 return True
             caller = caller.f_back
         return False
@@ -117,9 +120,7 @@ class MoviePilotSearchBridge:
                     return [bridge.local_indexer()]
                 return indexers
 
-            async def async_get_indexers(
-                helper: Any, *args: Any, **kwargs: Any
-            ) -> Any:
+            async def async_get_indexers(helper: Any, *args: Any, **kwargs: Any) -> Any:
                 indexers = original_async(helper, *args, **kwargs)
                 if isawaitable(indexers):
                     indexers = await indexers

@@ -1,3 +1,4 @@
+from weakref import WeakValueDictionary
 import hashlib
 import re
 from datetime import datetime, timedelta, timezone
@@ -92,7 +93,7 @@ class ShareResolver:
         self._client_lock = RLock()
         self._rate_lock = Lock()
         self._last_request_at = 0.0
-        self._resource_locks: Dict[str, Lock] = {}
+        self._resource_locks = WeakValueDictionary()
         self._resource_locks_guard = Lock()
         self._url_cache: Dict[Tuple[str, str, str], Tuple[str, float]] = {}
         self._url_cache_lock = Lock()
@@ -147,7 +148,7 @@ class ShareResolver:
                 "User-Agent": "Mozilla/5.0 MoviePilot TencentDoc115Library",
             },
         )
-        if not response:
+        if response is None:
             raise ShareResolutionError(
                 "115 公开分享目录接口无响应",
                 status_code=502,
@@ -597,8 +598,7 @@ class ShareResolver:
             if cached:
                 return cached
         url = self._download_url(share_url, file_id, user_agent)
-        if not force_refresh:
-            self._store_url(share_url, file_id, user_agent or "", url)
+        self._store_url(share_url, file_id, user_agent or "", url)
         return url
 
     def _offline_root(self) -> str:
@@ -628,9 +628,9 @@ class ShareResolver:
         except (TypeError, ValueError):
             hours = 24
         hours = min(max(hours, 24), 24 * 30)
-        return (
-            datetime.now(timezone.utc) + timedelta(hours=hours)
-        ).isoformat(timespec="seconds")
+        return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(
+            timespec="seconds"
+        )
 
     @staticmethod
     def _response_id(response: Any) -> str:
@@ -715,7 +715,9 @@ class ShareResolver:
                 for item in str(
                     config.get("video_extensions")
                     or ",".join(sorted(DEFAULT_VIDEO_EXTENSIONS))
-                ).replace("，", ",").split(",")
+                )
+                .replace("，", ",")
+                .split(",")
             )
             if value
         }
@@ -746,9 +748,7 @@ class ShareResolver:
                     if not normalized["file_id"] or not normalized["file_name"]:
                         continue
                     if normalized["is_dir"]:
-                        pending.append(
-                            (normalized["file_id"], normalized["file_path"])
-                        )
+                        pending.append((normalized["file_id"], normalized["file_path"]))
                     elif (
                         Path(normalized["file_name"]).suffix.lower() in extensions
                         and normalized["pick_code"]
@@ -786,10 +786,7 @@ class ShareResolver:
     def _offline_task_error(self, task: Dict[str, Any]) -> str:
         """识别115离线任务的终止错误。"""
         message = str(
-            task.get("error_msg")
-            or task.get("last_error")
-            or task.get("error")
-            or ""
+            task.get("error_msg") or task.get("last_error") or task.get("error") or ""
         ).strip()
         try:
             status = int(task.get("status"))
@@ -815,10 +812,7 @@ class ShareResolver:
         if status == 2:
             return True
         raw_percent = (
-            task.get("percentDone")
-            or task.get("percent")
-            or task.get("progress")
-            or 0
+            task.get("percentDone") or task.get("percent") or task.get("progress") or 0
         )
         try:
             percent = float(str(raw_percent).rstrip("%"))
@@ -894,7 +888,9 @@ class ShareResolver:
             try:
                 return self._ready_offline_url(resource_id, record, user_agent)
             except ShareResolutionError as error:
-                logger.warning(f"115离线缓存直链失效，重新定位：{resource_id} - {error}")
+                logger.warning(
+                    f"115离线缓存直链失效，重新定位：{resource_id} - {error}"
+                )
 
         directory_id = str(record.get("directory_id") or "")
         if not directory_id:
@@ -974,9 +970,7 @@ class ShareResolver:
                 task = self._find_task_payload(task_response, task_hash)
                 task_error = self._offline_task_error(task) if task else ""
                 if task_error:
-                    waiting_record.update(
-                        {"state": "failed", "last_error": task_error}
-                    )
+                    waiting_record.update({"state": "failed", "last_error": task_error})
                     self.store.upsert_offline_playback(waiting_record)
                     raise ShareResolutionError(
                         f"115离线下载失败：{task_error}",
@@ -1014,9 +1008,7 @@ class ShareResolver:
 
     def cleanup_offline_cache(self, include_all: bool = False) -> Dict[str, int]:
         """精确清理到期的插件离线目录，不触碰115中的其它文件。"""
-        records = self.store.list_offline_playbacks(
-            None if include_all else utc_now()
-        )
+        records = self.store.list_offline_playbacks(None if include_all else utc_now())
         removed = 0
         skipped = 0
         failed = 0
@@ -1044,13 +1036,13 @@ class ShareResolver:
                             )
                         )
                     except Exception as error:
-                        logger.warning(f"删除115离线任务记录失败，将继续清理目录：{error}")
+                        logger.warning(
+                            f"删除115离线任务记录失败，将继续清理目录：{error}"
+                        )
                 directory_id = str(current.get("directory_id") or "")
                 if directory_id:
                     if current.get("state") != "recycled":
-                        self._call_with_retry(
-                            lambda: client.fs_delete([directory_id])
-                        )
+                        self._call_with_retry(lambda: client.fs_delete([directory_id]))
                         current.update(
                             {
                                 "state": "recycled",
@@ -1111,7 +1103,9 @@ class ShareResolver:
                 try:
                     return self._resolve_offline(resource, user_agent or "")
                 except ShareResolutionError as error:
-                    self.store.update_resource_status(resource_id, "ready", str(error))
+                    self.store.update_resource_status(
+                        resource_id, resource.get("status") or "pending", str(error)
+                    )
                     logger.warning(f"115离线播放解析失败：{resource_id} - {error}")
                     raise
         known_file_id = (
@@ -1119,14 +1113,14 @@ class ShareResolver:
             or str(resource.get("resolved_file_id") or "").strip()
         )
         resource_file = None
-        known_file_name = str(resource.get("resolved_file_name") or "").strip()
+        str(resource.get("resolved_file_name") or "").strip()
         if str(file_id or "").strip():
             resource_file = self.store.get_resource_file(
                 resource_id,
                 str(file_id).strip(),
             )
             if resource_file:
-                known_file_name = str(resource_file.get("file_name") or "").strip()
+                str(resource_file.get("file_name") or "").strip()
         if known_file_id:
             cached = self._cached_url(
                 resource["share_url"],
@@ -1151,11 +1145,10 @@ class ShareResolver:
                             retryable=False,
                         )
                     target_file_name = str(resource_file.get("file_name") or "")
-                    target_file_size = int(resource_file.get("file_size") or 0)
+                    int(resource_file.get("file_size") or 0)
                 else:
                     target_file_id = str(resource.get("resolved_file_id") or "").strip()
                     target_file_name = str(resource.get("resolved_file_name") or "")
-                    target_file_size = 0
                     if target_file_id:
                         resolved_file = self.store.get_resource_file(
                             resource_id, target_file_id
@@ -1164,16 +1157,14 @@ class ShareResolver:
                             target_file_name = str(
                                 resolved_file.get("file_name") or target_file_name
                             )
-                            target_file_size = int(
-                                resolved_file.get("file_size") or 0
-                            )
+                            int(resolved_file.get("file_size") or 0)
                     if not target_file_id:
                         selected = self.choose_movie_file(
                             self.list_video_files(resource["share_url"])
                         )
                         target_file_id = selected["file_id"]
                         target_file_name = selected["file_name"]
-                        target_file_size = int(selected.get("file_size") or 0)
+                        int(selected.get("file_size") or 0)
                         self.store.update_resource_status(
                             resource_id,
                             resource.get("status") or "ready",
@@ -1182,11 +1173,14 @@ class ShareResolver:
                             resolved_at=utc_now(),
                         )
                 return self.resolve_file_url(
-                    resource["share_url"], target_file_id, user_agent,
+                    resource["share_url"],
+                    target_file_id,
+                    user_agent,
                     force_refresh=False,
                 )
             except ShareResolutionError as error:
-                status = "invalid_share" if not error.retryable else "ready"
-                self.store.update_resource_status(resource_id, status, str(error))
+                self.store.update_resource_status(
+                    resource_id, resource.get("status") or "ready", str(error)
+                )
                 logger.warning(f"115 分享资源解析失败：{resource_id} - {str(error)}")
                 raise

@@ -4,7 +4,7 @@ import socket
 import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qsl, parse_qs, urlsplit
 
 from aiohttp import ClientSession, web
 
@@ -84,10 +84,13 @@ def test_select_item_path_returns_unmatched_strm_for_diagnostics():
 def test_emby_url_avoids_duplicate_emby_prefix():
     config = {"emby_internal_url": "http://emby:8096/emby"}
 
-    assert DirectPlayGateway._emby_url(
-        config,
-        "/emby/Items/1?api_key=test",
-    ) == "http://emby:8096/emby/Items/1?api_key=test"
+    assert (
+        DirectPlayGateway._emby_url(
+            config,
+            "/emby/Items/1?api_key=test",
+        )
+        == "http://emby:8096/emby/Items/1?api_key=test"
+    )
 
 
 def test_playback_info_forces_gateway_direct_play():
@@ -122,7 +125,7 @@ def test_playback_info_forces_gateway_direct_play():
     assert "TranscodingUrl" not in source
     assert "TranscodingContainer" not in source
     assert "TranscodingSubProtocol" not in source
-    assert source["DirectStreamUrl"] == (
+    assert source["DirectStreamUrl"].split("&mp115_sig=")[0] == (
         "/videos/item-1/stream?Static=true&MediaSourceId=source-1"
     )
 
@@ -145,9 +148,7 @@ def test_playback_info_uses_original_media_source_path():
     modified = gateway._modify_playback_info(
         payload,
         config,
-        source_paths={
-            "mediasource_31": "/media/tencentdoc115/电影/测试.strm"
-        },
+        source_paths={"mediasource_31": "/media/tencentdoc115/电影/测试.strm"},
         item_id="item 31",
     )
 
@@ -155,7 +156,7 @@ def test_playback_info_uses_original_media_source_path():
     assert source["SupportsDirectPlay"] is True
     assert source["SupportsDirectStream"] is True
     assert source["SupportsTranscoding"] is False
-    assert source["DirectStreamUrl"] == (
+    assert source["DirectStreamUrl"].split("&mp115_sig=")[0] == (
         "/videos/item%2031/stream?Static=true&MediaSourceId=mediasource_31"
     )
 
@@ -169,9 +170,7 @@ def test_playback_info_preserves_auth_and_play_session_in_stream_url():
             {
                 "Id": "source-1",
                 "Path": "/media/tencentdoc115/电影/测试.strm",
-                "DirectStreamUrl": (
-                    "/Videos/1/stream?api_key=old-key&Static=true"
-                ),
+                "DirectStreamUrl": ("/Videos/1/stream?api_key=old-key&Static=true"),
             }
         ],
     }
@@ -229,7 +228,7 @@ def test_playback_info_preserves_iso_source_and_uses_normal_stream_route():
     assert source["SupportsDirectStream"] is True
     assert source["SupportsTranscoding"] is False
     assert "TranscodingUrl" not in source
-    assert source["DirectStreamUrl"] == (
+    assert source["DirectStreamUrl"].split("&mp115_sig=")[0] == (
         "/videos/item-iso/stream?Static=true&MediaSourceId=source-iso"
     )
 
@@ -362,14 +361,14 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         assert source["SupportsDirectPlay"] is True
                         assert source["SupportsDirectStream"] is True
                         assert source["SupportsTranscoding"] is False
-                        assert source["DirectStreamUrl"] == (
-                            "/videos/1/stream?Static=true&"
-                            "MediaSourceId=mediasource_source-1&"
-                            "api_key=client-key"
+                        signed_query = dict(
+                            parse_qsl(urlsplit(source["DirectStreamUrl"]).query)
                         )
+                        assert signed_query.pop("api_key") == "client-key"
+                        assert signed_query["mp115_sig"]
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Videos/1/stream.mkv",
-                        params={"MediaSourceId": "mediasource_source-1"},
+                        params=signed_query,
                         headers={"User-Agent": "infuse-test"},
                         allow_redirects=False,
                     ) as response:
@@ -381,7 +380,7 @@ def test_gateway_redirects_managed_strm_and_proxies_other_requests():
                         async with client.get(
                             f"http://127.0.0.1:{gateway_port}/emby/Audio/1/"
                             f"{media_endpoint}",
-                            params={"MediaSourceId": "mediasource_source-1"},
+                            params=signed_query,
                             headers={"User-Agent": "infuse-test"},
                             allow_redirects=False,
                         ) as response:
@@ -456,7 +455,9 @@ def test_iso_stream_preserves_playback_info_and_redirects_directly():
 
             emby_app = web.Application()
             emby_app.router.add_get("/emby/Items", items_handler)
-            emby_app.router.add_post("/emby/Items/1/PlaybackInfo", playback_info_handler)
+            emby_app.router.add_post(
+                "/emby/Items/1/PlaybackInfo", playback_info_handler
+            )
             emby_runner = web.AppRunner(emby_app)
             await emby_runner.setup()
             emby_port = _unused_port()
@@ -498,9 +499,7 @@ def test_iso_stream_preserves_playback_info_and_redirects_directly():
                         assert source["SupportsDirectPlay"] is True
                         assert source["SupportsDirectStream"] is True
                         assert source["SupportsTranscoding"] is False
-                        assert source["DirectStreamUrl"].startswith(
-                            "/videos/1/stream?"
-                        )
+                        assert source["DirectStreamUrl"].startswith("/videos/1/stream?")
                     async with client.get(
                         f"http://127.0.0.1:{gateway_port}/emby/Videos/1/original.iso",
                         params={

@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -299,13 +300,11 @@ def main() -> None:
             plugin.save_search_resource(
                 SimpleNamespace(method="GET"),
                 "smoke-resource",
-                token=plugin._config["playback_token"],
+                token=parse_qs(urlsplit(results[0].page_url).query)["token"][0],
             )
         )
         assert "保存到媒体库" in save_page.body.decode("utf-8")
-        async_results = asyncio.run(
-            module["async_search_torrents"]({}, "测试电影")
-        )
+        async_results = asyncio.run(module["async_search_torrents"]({}, "测试电影"))
         assert len(async_results) == 1
 
         plugin._imdb_tmdb_cache["tt0000001::电影"] = ("1",)
@@ -357,7 +356,7 @@ def main() -> None:
         assert clear_response.success is True
         assert store.list_sheets() == []
         assert not list(output_root.rglob("*.strm"))
-        assert not list(output_root.rglob("*.nfo"))
+        assert (output_root / "movie.nfo").read_text() == "metadata"
         assert (output_root / "keep.txt").is_file()
         assert plugin._config["clear_confirmation"] is False
 

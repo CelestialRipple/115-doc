@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic
+from concurrent.futures import wait
+from requests.exceptions import RequestException
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from app.schemas import DownloaderTorrent
@@ -24,7 +26,7 @@ except ImportError:
     from app.utils.http import RequestUtils
 
 from .download_marker import parse_download_marker
-from .library import safe_path_segment
+from .library import safe_path_segment, resource_suffix, LibraryBuilder, truncate_utf8
 from .resolver import ShareResolutionError, ShareResolver
 from .source_link import is_offline_link, offline_file_hint
 from .store import CatalogStore
@@ -49,6 +51,9 @@ class DirectDownloadManager:
         self._request = RequestUtils(proxies=settings.PROXY, timeout=60)
         self._task_events: Dict[str, Event] = {}
         self._task_events_lock = Lock()
+        self._task_futures = {}
+        self._restart_tasks = set()
+        self._closing = False
 
     @staticmethod
     def _task_id(resource_id: str, download_dir: Path) -> str:
@@ -58,14 +63,10 @@ class DirectDownloadManager:
     @staticmethod
     def _is_tv(resource: Dict[str, Any]) -> bool:
         media_type = str(
-            resource.get("detected_media_type")
-            or resource.get("media_type")
-            or ""
+            resource.get("detected_media_type") or resource.get("media_type") or ""
         ).lower()
         group_name = str(
-            resource.get("detected_group_name")
-            or resource.get("group_name")
-            or ""
+            resource.get("detected_group_name") or resource.get("group_name") or ""
         ).lower()
         return any(
             keyword in media_type or keyword in group_name
@@ -86,6 +87,13 @@ class DirectDownloadManager:
         resource_id = parse_download_marker(content)
         if not resource_id:
             return None
+        if self.config_provider().get("browser_download_enabled", True):
+            return (
+                DIRECT_DOWNLOADER_NAME,
+                None,
+                None,
+                "已启用浏览器下载，请使用浏览器直链入口（原生按钮需安装配套前端适配）",
+            )
         resource = self.store.get_resource(resource_id)
         if not resource or resource.get("status") == "removed":
             return DIRECT_DOWNLOADER_NAME, None, None, "资源不存在或已移除"
@@ -108,11 +116,23 @@ class DirectDownloadManager:
     def _start_task(self, task_id: str) -> None:
         with self._task_events_lock:
             current = self._task_events.get(task_id)
-            if current and not current.is_set():
+            if self._closing:
+                return
+            if current is not None:
+                if current.is_set():
+                    self._restart_tasks.add(task_id)
                 return
             stop_event = Event()
             self._task_events[task_id] = stop_event
-        ThreadHelper().submit(self._run_task, task_id, stop_event)
+            future = ThreadHelper().submit(self._run_task, task_id, stop_event)
+            self._task_futures[task_id] = future
+
+        def finished(done):
+            with self._task_events_lock:
+                if self._task_futures.get(task_id) is done:
+                    self._task_futures.pop(task_id, None)
+
+        future.add_done_callback(finished)
 
     def _select_files(
         self,
@@ -144,6 +164,20 @@ class DirectDownloadManager:
             files = self.store.list_resource_files(resource["resource_id"])
             if not files:
                 files = self.resolver.list_video_files(resource["share_url"])
+            files = [
+                {
+                    **item,
+                    "season": item.get("season")
+                    or LibraryBuilder._episode_identity(
+                        item["file_name"], str(item.get("file_path") or "")
+                    )[0],
+                    "episode": item.get("episode")
+                    or LibraryBuilder._episode_identity(
+                        item["file_name"], str(item.get("file_path") or "")
+                    )[1],
+                }
+                for item in files
+            ]
             if selected_episodes:
                 files = [
                     item
@@ -179,11 +213,30 @@ class DirectDownloadManager:
             stem = f"{title} ({year})" if year else title
             if version:
                 stem = f"{stem} - {version}"
-            return download_dir / f"{stem}{extension or '.mkv'}"
-        title = safe_path_segment(str(resource.get("title") or "未命名剧集"))
+            stem = truncate_utf8(safe_path_segment(stem), 150)
+            return (
+                download_dir
+                / f"{stem} - {resource_suffix(resource)}{extension or '.mkv'}"
+            )
+        title = truncate_utf8(
+            safe_path_segment(str(resource.get("title") or "未命名剧集")), 150
+        )
         season = int(source_file.get("season") or 1)
-        base = download_dir / title / f"Season {season:02d}" if multiple else download_dir
-        return base / source_name
+        base = (
+            download_dir
+            / f"{title} - {resource_suffix(resource)}"
+            / f"Season {season:02d}"
+        )
+        suffix = hashlib.sha256(
+            str(source_file.get("file_id") or source_name).encode()
+        ).hexdigest()[:12]
+        target = (
+            base
+            / f"{truncate_utf8(Path(source_name).stem, 150)} - {suffix}{extension or '.mkv'}"
+        )
+        if download_dir.resolve() not in target.resolve().parents:
+            raise RuntimeError("下载路径超出指定目录")
+        return target
 
     def _download_one(
         self,
@@ -196,14 +249,23 @@ class DirectDownloadManager:
         aggregate_total: int,
     ) -> int:
         config = self.config_provider()
-        retries = min(max(int(config.get("download_retries") or 4), 0), 10)
+        retries = min(max(int(config.get("download_retries", 4)), 0), 10)
         chunk_size = min(
             max(int(config.get("download_chunk_size") or 1024 * 1024), 64 * 1024),
             8 * 1024 * 1024,
         )
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.with_suffix(f"{target.suffix}.part")
+        if target.is_symlink() or partial.is_symlink():
+            raise RuntimeError("下载目标不能是符号链接")
         for attempt in range(retries + 1):
+            if stop_event.is_set():
+                raise InterruptedError("下载已暂停")
+            expected_size = int(source_file.get("file_size") or 0)
+            if target.exists():
+                if expected_size and target.stat().st_size == expected_size:
+                    return expected_size
+                raise RuntimeError("目标文件已存在且无法确认完整性，已保留原文件")
             existing = partial.stat().st_size if partial.exists() else 0
             headers = {"User-Agent": "MoviePilot TencentDoc115Library"}
             if existing:
@@ -218,6 +280,7 @@ class DirectDownloadManager:
                     resource["share_url"],
                     str(source_file["file_id"]),
                     headers["User-Agent"],
+                    force_refresh=attempt > 0,
                 )
             response = self._request.get_res(
                 url=direct_url,
@@ -225,16 +288,30 @@ class DirectDownloadManager:
                 stream=True,
                 allow_redirects=True,
             )
-            if not response:
+            if response is None:
                 if attempt < retries:
                     continue
                 raise RuntimeError("115 直链下载无响应")
             try:
                 if response.status_code not in (200, 206):
-                    if attempt < retries and response.status_code in (403, 429, 500, 502, 503, 504):
+                    if attempt < retries and response.status_code in (
+                        403,
+                        429,
+                        500,
+                        502,
+                        503,
+                        504,
+                    ):
+                        if stop_event.wait(min(2**attempt, 8)):
+                            raise InterruptedError("下载已暂停")
+                        self.resolver.clear_url_cache()
                         continue
                     raise RuntimeError(f"115 直链下载失败：HTTP {response.status_code}")
                 append = existing > 0 and response.status_code == 206
+                if response.status_code == 206 and not str(
+                    response.headers.get("Content-Range") or ""
+                ).startswith(f"bytes {existing}-"):
+                    raise RuntimeError("续传响应范围不匹配，已保留临时文件")
                 if not append:
                     existing = 0
                 started = monotonic()
@@ -255,13 +332,33 @@ class DirectDownloadManager:
                             total_size=aggregate_total,
                             speed=int((current - existing) / elapsed),
                         )
-                os.replace(partial, target)
-                return int(source_file.get("file_size") or target.stat().st_size)
+                if expected_size and current != expected_size:
+                    raise ConnectionError(f"文件大小不完整：{current}/{expected_size}")
+                # Atomic no-clobber publication; another writer cannot replace an existing video.
+                os.link(partial, target)
+                partial.unlink()
+                return current
+            except (RequestException, ConnectionError, TimeoutError) as error:
+                if attempt >= retries:
+                    raise RuntimeError("下载中断，重试次数已用尽") from error
+                if stop_event.wait(min(2**attempt, 8)):
+                    raise InterruptedError("下载已暂停")
             finally:
                 response.close()
         raise RuntimeError("115 直链下载重试次数已用尽")
 
     def _run_task(self, task_id: str, stop_event: Event) -> None:
+        try:
+            self._execute_task(task_id, stop_event)
+        finally:
+            with self._task_events_lock:
+                self._task_events.pop(task_id, None)
+                restart = task_id in self._restart_tasks and not self._closing
+                self._restart_tasks.discard(task_id)
+            if restart:
+                self._start_task(task_id)
+
+    def _execute_task(self, task_id: str, stop_event: Event) -> None:
         tasks = self.store.list_download_tasks(
             task_ids=[task_id],
             include_organized=True,
@@ -315,7 +412,10 @@ class DirectDownloadManager:
             content_path = (
                 str(content_paths[0])
                 if len(content_paths) == 1
-                else str(download_dir / safe_path_segment(resource["title"]))
+                else str(
+                    download_dir
+                    / f"{truncate_utf8(safe_path_segment(resource['title']), 150)} - {resource_suffix(resource)}"
+                )
             )
             self.store.update_download_task(
                 task_id,
@@ -342,9 +442,6 @@ class DirectDownloadManager:
                 last_error=str(error),
             )
             logger.error(f"115 直链下载失败：{resource['title']} - {error}")
-        finally:
-            with self._task_events_lock:
-                self._task_events.pop(task_id, None)
 
     @staticmethod
     def _task_states(status: Any) -> Optional[List[str]]:
@@ -410,12 +507,21 @@ class DirectDownloadManager:
                 self.store.update_download_task(task_id, state="paused", speed=0)
         return True
 
+    def has_active_tasks(self) -> bool:
+        with self._task_events_lock:
+            return bool(self._task_events)
+
     def stop_all(self) -> None:
         """插件停用或重载时请求所有本插件下载线程安全暂停。"""
         with self._task_events_lock:
+            self._closing = True
             task_ids = list(self._task_events)
         if task_ids:
             self.stop_torrents(task_ids, DIRECT_DOWNLOADER_NAME)
+        with self._task_events_lock:
+            futures = list(self._task_futures.values())
+        if futures and wait(futures, timeout=10).not_done:
+            raise RuntimeError("下载任务仍在停止，请稍后重新保存配置")
 
     def start_torrents(
         self,
@@ -423,6 +529,8 @@ class DirectDownloadManager:
         downloader: Optional[str] = None,
     ) -> Optional[bool]:
         """从 `.part` 文件恢复直链下载。"""
+        if self.config_provider().get("browser_download_enabled", True):
+            return False
         if downloader and downloader != DIRECT_DOWNLOADER_NAME:
             return None
         task_ids = [hashs] if isinstance(hashs, str) else list(hashs)

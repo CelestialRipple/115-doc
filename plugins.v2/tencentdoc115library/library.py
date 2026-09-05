@@ -1,4 +1,7 @@
 import os
+import hashlib
+import json
+from tempfile import NamedTemporaryFile
 import filecmp
 import re
 import shutil
@@ -8,7 +11,7 @@ from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, parse_qs
 
 from app.chain.media import MediaChain
 from app.schemas.file import FileItem
@@ -30,6 +33,7 @@ from .resolver import ShareResolutionError, ShareResolver
 from .source_link import is_offline_link, offline_file_hint
 from .storage_limit import configured_limit_bytes, directory_size
 from .store import CatalogStore
+from .ownership import MANIFEST, load_owned, owned_unchanged, record_owned, fingerprint
 
 INVALID_PATH_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 MAX_PATH_SEGMENT_BYTES = 180
@@ -142,7 +146,17 @@ def safe_path_segment(value: str, fallback: str = "未命名") -> str:
 
 
 def strm_file_name(stem: str) -> str:
-    """生成不会超过常见 NAS 单路径片段限制的 STRM 文件名。"""
+    """保留末尾资源身份，长中文片名也不会截断防冲突后缀。"""
+    match = re.search(r" - [0-9a-f]{16}$", stem)
+    if match:
+        suffix = match.group()
+        stem = (
+            truncate_utf8(
+                safe_path_segment(stem[: match.start()]),
+                MAX_PATH_SEGMENT_BYTES - len(suffix),
+            )
+            + suffix
+        )
     return f"{safe_path_segment(stem)}.strm"
 
 
@@ -152,6 +166,10 @@ def natural_path_key(value: str) -> Tuple[Tuple[int, Any], ...]:
         (1, int(part)) if part.isdigit() else (0, part.casefold())
         for part in re.split(r"(\d+)", str(value or ""))
     )
+
+
+def resource_suffix(resource: Dict[str, Any]) -> str:
+    return hashlib.sha256(str(resource["resource_id"]).encode()).hexdigest()[:16]
 
 
 class LibraryBuildError(RuntimeError):
@@ -203,9 +221,7 @@ class LibraryBuilder:
         if save_mode == "movie":
             return "电影"
         return str(
-            resource.get("detected_media_type")
-            or resource.get("media_type")
-            or ""
+            resource.get("detected_media_type") or resource.get("media_type") or ""
         )
 
     @staticmethod
@@ -244,11 +260,19 @@ class LibraryBuilder:
         group_name = str(resource.get("group_name") or "").lower()
         is_mixed = self._is_mixed_resource(resource)
         # 混合表中的类型标签只作提示。文件名/目录出现季集特征时优先按剧集处理。
-        if is_mixed and source_files and any(
-            self._looks_like_tv_path(
-                str(source_file.get("file_path") or source_file.get("file_name") or "")
+        if (
+            is_mixed
+            and source_files
+            and any(
+                self._looks_like_tv_path(
+                    str(
+                        source_file.get("file_path")
+                        or source_file.get("file_name")
+                        or ""
+                    )
+                )
+                for source_file in source_files
             )
-            for source_file in source_files
         ):
             return MediaType.TV
         if save_mode == "mixed":
@@ -417,7 +441,9 @@ class LibraryBuilder:
             or ""
         ).strip()
         if not identity:
-            title = str(getattr(mediainfo, "title", None) or resource.get("title") or "")
+            title = str(
+                getattr(mediainfo, "title", None) or resource.get("title") or ""
+            )
             year = str(getattr(mediainfo, "year", None) or resource.get("year") or "")
             identity = f"{title.strip().casefold()}::{year.strip()}"
         return media_type, identity
@@ -442,7 +468,11 @@ class LibraryBuilder:
         key = self._metadata_key(resource, mediainfo)
         with self._metadata_lock:
             cached = self._metadata_cache.get(key)
-        if cached and cached.exists() and cached.resolve() != target_directory.resolve():
+        if (
+            cached
+            and cached.exists()
+            and cached.resolve() != target_directory.resolve()
+        ):
             return cached
         record = self.store.find_metadata_source(
             media_id=str(getattr(mediainfo, "media_id", None) or ""),
@@ -487,6 +517,8 @@ class LibraryBuilder:
     ) -> None:
         with self._metadata_lock:
             self._metadata_cache[self._metadata_key(resource, mediainfo)] = directory
+            while len(self._metadata_cache) > 2048:
+                self._metadata_cache.pop(next(iter(self._metadata_cache)))
 
     def _scrape_with_reuse(
         self,
@@ -497,18 +529,36 @@ class LibraryBuilder:
     ) -> bool:
         """刮削前复用已完成结果，并协调并行任务避免同片重复刮削。"""
         key = self._metadata_key(resource, mediainfo)
-        metadata_suffixes = GENERATED_METADATA_SUFFIXES - {".strm", ".tmp"}
-        if directory.exists() and any(
-            path.is_file() and path.suffix.lower() in metadata_suffixes
-            for path in directory.rglob("*")
-        ):
-            self._remember_metadata(resource, mediainfo, directory)
-            return True
-        while True:
-            source = self._metadata_source(resource, mediainfo, directory)
-            if source and self._copy_metadata(source, directory):
+        marker = directory / ".tencentdoc115-scrape.json"
+        expected = {
+            "media": list(key),
+            "strms": sorted(
+                str(p.relative_to(directory)) for p in directory.rglob("*.strm")
+            ),
+        }
+        try:
+            completed = (
+                json.loads(marker.read_text()) if not marker.is_symlink() else {}
+            )
+            if (
+                completed.get("media") == expected["media"]
+                and completed.get("strms") == expected["strms"]
+                and completed.get("metadata")
+                and all((directory / item).is_file() for item in completed["metadata"])
+            ):
                 self._remember_metadata(resource, mediainfo, directory)
                 return True
+        except (OSError, ValueError):
+            pass
+        while True:
+            source = self._metadata_source(resource, mediainfo, directory)
+            if source:
+                before_copy = set(directory.rglob("*"))
+                self._copy_metadata(source, directory)
+                record_owned(
+                    Path(self.config_provider()["output_root"]),
+                    (p for p in directory.rglob("*") if p not in before_copy),
+                )
             with self._metadata_lock:
                 event = self._metadata_inflight.get(key)
                 if event is None:
@@ -522,15 +572,34 @@ class LibraryBuilder:
             # 同一个媒体已有任务正在刮削，等待它写完后再建立本目录的
             # 硬链接/副本；若对方失败，下一轮会成为新的执行者重试。
             event.wait()
+        before = set(directory.rglob("*"))
         try:
             self._scrape(directory, meta, mediainfo)
+            expected["metadata"] = sorted(
+                str(p.relative_to(directory))
+                for p in directory.rglob("*")
+                if p.is_file()
+                and not p.is_symlink()
+                and p.suffix.lower() in GENERATED_METADATA_SUFFIXES - {".strm", ".tmp"}
+            )
+            if marker.is_symlink():
+                raise LibraryBuildError("刮削完成标记不能是符号链接")
+            marker.write_text(
+                json.dumps(expected, ensure_ascii=False), encoding="utf-8"
+            )
             self._remember_metadata(resource, mediainfo, directory)
             return False
         finally:
-            with self._metadata_lock:
-                if self._metadata_inflight.get(key) is event:
-                    self._metadata_inflight.pop(key, None)
-            event.set()
+            try:
+                record_owned(
+                    Path(self.config_provider()["output_root"]),
+                    (p for p in directory.rglob("*") if p not in before or p == marker),
+                )
+            finally:
+                with self._metadata_lock:
+                    if self._metadata_inflight.get(key) is event:
+                        self._metadata_inflight.pop(key, None)
+                event.set()
 
     def storage_snapshot(self) -> Dict[str, Any]:
         """返回插件输出目录的当前占用和配置上限。"""
@@ -579,6 +648,7 @@ class LibraryBuilder:
         retained_files = 0
         freed_bytes = 0
         directories: List[Path] = []
+        owned = load_owned(root)
         for path in root.rglob("*"):
             if path.is_symlink():
                 retained_files += 1
@@ -586,7 +656,9 @@ class LibraryBuilder:
             if path.is_dir():
                 directories.append(path)
                 continue
-            if path.suffix.lower() not in GENERATED_METADATA_SUFFIXES:
+            if path.name == MANIFEST:
+                continue
+            if not owned_unchanged(root, path, owned):
                 retained_files += 1
                 continue
             try:
@@ -702,7 +774,12 @@ class LibraryBuilder:
                 "failed": 0,
             }
         root = configured_root.resolve()
-        if root in {Path("/"), Path("/config"), Path("/data"), Path("/media"), Path("/mnt")} or len(root.parts) < 3:
+        existing_ownership = load_owned(root)
+        if (
+            root
+            in {Path("/"), Path("/config"), Path("/data"), Path("/media"), Path("/mnt")}
+            or len(root.parts) < 3
+        ):
             return {
                 "status": "configuration_error",
                 "message": f"输出目录范围过大，已拒绝迁移：{root}",
@@ -798,11 +875,12 @@ class LibraryBuilder:
             if target_directory != root and root not in target_directory.parents:
                 failed += 1
                 continue
-            if source_directory != target_directory and source_directory in target_directory.parents:
+            if (
+                source_directory != target_directory
+                and source_directory in target_directory.parents
+            ):
                 failed += 1
-                logger.warning(
-                    f"迁移目标位于源目录内，已跳过：{resource.get('title')}"
-                )
+                logger.warning(f"迁移目标位于源目录内，已跳过：{resource.get('title')}")
                 continue
             directory_key = (source_directory, target_directory)
             try:
@@ -810,7 +888,9 @@ class LibraryBuilder:
                     str(resource.get("resource_id") or "")
                 )
                 try:
-                    relative_strm = recorded_path.resolve().relative_to(source_directory)
+                    relative_strm = recorded_path.resolve().relative_to(
+                        source_directory
+                    )
                 except ValueError as error:
                     raise LibraryBuildError(
                         f"STRM 路径不在媒体目录内：{recorded_path}"
@@ -833,12 +913,12 @@ class LibraryBuilder:
                 elif len(source_targets.get(source_directory, set())) == 1:
                     if directory_key not in moved_directories:
                         if source_directory.exists():
-                            self._merge_move_directory(source_directory, target_directory)
+                            self._merge_move_directory(
+                                source_directory, target_directory
+                            )
                             moved += 1
                         elif not target_directory.exists():
-                            raise LibraryBuildError(
-                                f"源目录不存在：{source_directory}"
-                            )
+                            raise LibraryBuildError(f"源目录不存在：{source_directory}")
                         moved_directories.add(directory_key)
                     elif not target_directory.exists():
                         raise LibraryBuildError(f"迁移目标不存在：{target_directory}")
@@ -875,12 +955,25 @@ class LibraryBuilder:
                     str(new_strm_path),
                     file_paths,
                 )
+                migrated_owned = []
+                for old_name, expected_digest in existing_ownership.items():
+                    try:
+                        relative = (root / old_name).relative_to(source_directory)
+                    except ValueError:
+                        continue
+                    candidate = target_directory / relative
+                    if (
+                        not candidate.is_symlink()
+                        and candidate.is_file()
+                        and fingerprint(candidate) == expected_digest
+                    ):
+                        migrated_owned.append(candidate)
+                if migrated_owned:
+                    record_owned(root, migrated_owned)
                 updated += 1
             except Exception as error:
                 failed += 1
-                logger.warning(
-                    f"迁移资源失败：{resource.get('title')} - {str(error)}"
-                )
+                logger.warning(f"迁移资源失败：{resource.get('title')} - {str(error)}")
         status = "completed" if not failed else "completed_with_errors"
         return {
             "status": status,
@@ -919,15 +1012,27 @@ class LibraryBuilder:
             query["file_id"] = file_id
         return f"{url}?{urlencode(query)}"
 
-    @staticmethod
-    def _write_strm(path: Path, url: str) -> None:
+    def _write_strm(self, path: Path, url: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         expected = f"{url}\n"
-        if path.exists() and path.read_text(encoding="utf-8") == expected:
-            return
-        temporary = path.with_suffix(f"{path.suffix}.tmp")
-        temporary.write_text(expected, encoding="utf-8")
-        os.replace(temporary, path)
+        if path.is_symlink():
+            raise LibraryBuildError("STRM 目标不能是符号链接")
+        if not path.exists() or path.read_text(encoding="utf-8") != expected:
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=".td115-",
+                suffix=".tmp",
+                delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                output.write(expected)
+            try:
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        record_owned(Path(self.config_provider()["output_root"]).expanduser(), [path])
 
     @staticmethod
     def _file_item(path: Path) -> FileItem:
@@ -961,6 +1066,36 @@ class LibraryBuilder:
         if not success:
             raise LibraryBuildError(f"MoviePilot 刮削失败：{message}")
 
+    def _retire_previous_strms(self, resource, new_paths) -> None:
+        """重建时只移除数据库登记且仍明确属于本资源的旧 STRM。"""
+        if not hasattr(self.store, "list_resource_files"):
+            return
+        root = Path(self.config_provider()["output_root"]).expanduser().resolve()
+        keep = {str(Path(path).resolve()) for path in new_paths}
+        for item in self.store.list_resource_files(resource["resource_id"]):
+            raw = item.get("strm_path")
+            if not raw:
+                continue
+            path = Path(raw)
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or str(path.resolve()) in keep
+                or root not in path.resolve().parents
+            ):
+                continue
+            try:
+                parsed = urlsplit(path.read_text(encoding="utf-8").strip())
+                prefix = f"/api/v1/plugin/TencentDoc115Library/play/{resource['resource_id']}"
+                if (
+                    parsed.path == prefix or parsed.path.startswith(prefix + "/")
+                ) and parse_qs(parsed.query).get("token") == [
+                    self.config_provider().get("playback_token")
+                ]:
+                    path.unlink()
+            except (OSError, ValueError):
+                continue
+
     def _build_movie(
         self,
         resource: Dict[str, Any],
@@ -976,7 +1111,9 @@ class LibraryBuilder:
         base_name = self._media_directory_name(resource, mediainfo)
         version = safe_path_segment(str(resource.get("version") or ""), "")
         filename = strm_file_name(
-            f"{base_name} - {version}" if version else base_name
+            (f"{base_name} - {version}" if version else base_name)
+            + " - "
+            + resource_suffix(resource)
         )
         strm_path = directory / filename
         self._write_strm(
@@ -987,6 +1124,7 @@ class LibraryBuilder:
                 selected_file["file_name"],
             ),
         )
+        self._retire_previous_strms(resource, [strm_path])
         self.store.replace_resource_files(
             resource["resource_id"],
             [{**selected_file, "strm_path": str(strm_path)}],
@@ -1085,12 +1223,12 @@ class LibraryBuilder:
                 continue
             season_directory = directory / f"Season {season:02d}"
             strm_path = season_directory / strm_file_name(
-                f"{media_name} - S{season:02d}E{episode:02d}"
+                f"{media_name} - S{season:02d}E{episode:02d} - {resource_suffix(resource)}"
             )
             if any(item.get("strm_path") == str(strm_path) for item in expanded_files):
                 suffix = safe_path_segment(Path(source_file["file_name"]).stem)
                 strm_path = season_directory / strm_file_name(
-                    f"{media_name} - S{season:02d}E{episode:02d} - {suffix}"
+                    f"{media_name} - S{season:02d}E{episode:02d} - {suffix} - {resource_suffix(resource)}"
                 )
             self._write_strm(
                 strm_path,
@@ -1114,6 +1252,9 @@ class LibraryBuilder:
                 "分享中存在视频，但无法识别任何剧集编号"
                 + (f"：{example}" if example else "")
             )
+        self._retire_previous_strms(
+            resource, [item["strm_path"] for item in expanded_files]
+        )
         self.store.replace_resource_files(resource["resource_id"], expanded_files)
         return str(directory)
 
@@ -1173,9 +1314,7 @@ class LibraryBuilder:
                         "completed": success_count + failed_count,
                         "success": success_count,
                         "failed": failed_count,
-                        "current_title": str(
-                            (resource or {}).get("title") or ""
-                        ),
+                        "current_title": str((resource or {}).get("title") or ""),
                     }
                 )
             except Exception as error:
@@ -1183,7 +1322,7 @@ class LibraryBuilder:
 
         def finish_scrapes(done: Any) -> None:
             """收集并发刮削结果，逐条写回可恢复状态。"""
-            nonlocal success_count, failed_count
+            nonlocal success_count, failed_count, usage_bytes
             for future in done:
                 resource, directory, output_path, mediainfo = pending_scrapes.pop(
                     future
@@ -1200,9 +1339,7 @@ class LibraryBuilder:
                         scrape_status="failed",
                         strm_path=output_path,
                     )
-                    logger.warning(
-                        f"并行刮削失败：{resource['title']} - {str(error)}"
-                    )
+                    logger.warning(f"并行刮削失败：{resource['title']} - {str(error)}")
                     notify_progress(resource, "finished")
                     continue
                 self.store.update_resource_status(
@@ -1224,6 +1361,8 @@ class LibraryBuilder:
                 success_count += 1
                 logger.info(f"STRM 资源生成完成：{resource['title']}")
                 notify_progress(resource, "finished")
+            usage_bytes = int(self.storage_snapshot()["usage_bytes"])
+
         try:
             config = self.config_provider()
             scrape_enabled = bool(config.get("scrape_metadata", True))
@@ -1396,9 +1535,7 @@ class LibraryBuilder:
                                 mediainfo,
                             )
                             if metadata_reused:
-                                logger.info(
-                                    f"复用已有元数据完成：{resource['title']}"
-                                )
+                                logger.info(f"复用已有元数据完成：{resource['title']}")
                     if recognition_error:
                         self.store.update_resource_status(
                             resource["resource_id"],
@@ -1413,8 +1550,7 @@ class LibraryBuilder:
                         )
                         success_count += 1
                         logger.warning(
-                            f"MoviePilot 未识别，已降级生成 STRM："
-                            f"{resource['title']}"
+                            f"MoviePilot 未识别，已降级生成 STRM：{resource['title']}"
                         )
                     elif not deferred_scrape and not scrape_enabled:
                         self.store.update_resource_status(

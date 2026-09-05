@@ -4,7 +4,7 @@ import json
 import re
 import zlib
 from pathlib import Path
-from secrets import compare_digest
+from secrets import compare_digest, token_urlsafe
 from threading import Lock, Thread
 from time import monotonic
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -18,6 +18,7 @@ except ImportError:
     from app.log import logger
 
 from .resolver import ShareResolutionError, ShareResolver
+from .signing import sign_action, verify_action
 
 
 # Emby MediaSourceId 查询流程参考 MediaWarp
@@ -48,8 +49,6 @@ PLAYBACK_INFO_PATTERN = re.compile(
     r"/(?:emby/)?Items/([^/]+)/PlaybackInfo$",
     re.IGNORECASE,
 )
-PLAYBACK_PATH_CACHE_TTL_SECONDS = 10 * 60
-PLAYBACK_PATH_CACHE_MAX_SIZE = 2048
 MEDIA_PROBE_COOLDOWN_SECONDS = 10 * 60
 MEDIA_PROBE_CACHE_MAX_SIZE = 2048
 
@@ -85,13 +84,11 @@ class DirectPlayGateway:
         self._last_error = ""
         self._item_paths: Dict[str, str] = {}
         self._unmanaged_items: Dict[str, str] = {}
-        self._playback_paths: Dict[
-            Tuple[str, str, str, str],
-            Tuple[str, float],
-        ] = {}
+        self._item_path_times = {}
         self._media_probe_times: Dict[Tuple[str, str], float] = {}
         self._media_probe_tasks: Set[asyncio.Task] = set()
         self._cache_lock = Lock()
+        self._stream_secret = token_urlsafe(32)
 
     @staticmethod
     def parse_path_mappings(value: str) -> List[Tuple[str, str]]:
@@ -307,6 +304,8 @@ class DirectPlayGateway:
         if len(self._unmanaged_items) >= 200:
             self._unmanaged_items.pop(next(iter(self._unmanaged_items)))
         self._unmanaged_items[item_id] = signature
+        while len(self._unmanaged_items) > 2048:
+            self._unmanaged_items.pop(next(iter(self._unmanaged_items)))
         logger.warning(
             f"直链网关未接管 Emby 媒体项 {item_id}："
             f"媒体路径={emby_path or '未取得'}，"
@@ -325,6 +324,14 @@ class DirectPlayGateway:
         if port < 1 or port > 65535:
             raise ValueError("直链网关端口必须在 1 到 65535 之间")
 
+    def _remember_item_path(self, item_id: str, path: str) -> None:
+        self._item_paths[item_id] = path
+        self._item_path_times[item_id] = monotonic() + 600
+        while len(self._item_paths) > 2048:
+            oldest = next(iter(self._item_paths))
+            self._item_paths.pop(oldest, None)
+            self._item_path_times.pop(oldest, None)
+
     async def _item_path(
         self,
         request_path: str,
@@ -332,7 +339,7 @@ class DirectPlayGateway:
         config: Dict[str, Any],
     ) -> str:
         cached = self._item_paths.get(item_id)
-        if cached:
+        if cached and self._item_path_times.get(item_id, 0) > monotonic():
             return cached
         headers = {"X-Emby-Token": str(config.get("emby_api_key") or "")}
         payload, status = await self._query_item(
@@ -343,13 +350,12 @@ class DirectPlayGateway:
         )
         if status != 200:
             logger.warning(
-                f"直链网关使用配置密钥查询 Emby 媒体项 {item_id} "
-                f"失败：HTTP {status}"
+                f"直链网关使用配置密钥查询 Emby 媒体项 {item_id} 失败：HTTP {status}"
             )
             return ""
         emby_path = self._select_item_path(payload, config)
         if emby_path:
-            self._item_paths[item_id] = emby_path
+            self._remember_item_path(item_id, emby_path)
         return emby_path
 
     @staticmethod
@@ -366,109 +372,14 @@ class DirectPlayGateway:
                 query[name] = value
         return headers, query
 
-    @staticmethod
-    def _playback_client_key(request: web.Request) -> Tuple[str, str]:
-        """
-        生成 PlaybackInfo 与后续媒体请求的客户端关联键
-
-        :param request (Request): 当前网关请求
-
-        :return Tuple: 客户端 IP 与 User-Agent
-        """
-        forwarded_for = str(request.headers.get("X-Forwarded-For") or "").strip()
-        real_ip = str(request.headers.get("X-Real-IP") or "").strip()
-        peer_ip = str(request.remote or "").strip()
-        client_ip = (
-            forwarded_for.split(",", 1)[0].strip()
-            if forwarded_for
-            else real_ip or peer_ip
-        )
-        return client_ip, str(request.headers.get("User-Agent") or "")
-
-    def _cache_playback_paths(
-        self,
-        request: web.Request,
-        item_id: str,
-        source_paths: Dict[str, str],
-        item_path: str,
-        config: Dict[str, Any],
-    ) -> None:
-        """
-        缓存已认证 PlaybackInfo 对应的 STRM 路径
-
-        Infuse 的后续媒体请求可能不重复携带 Emby Token，因此仅把已经通过
-        PlaybackInfo 认证的设备和媒体项短期关联起来
-
-        :param request (Request): PlaybackInfo 请求
-        :param item_id (str): Emby 媒体项 ID
-        :param source_paths (Dict): MediaSourceId 到原始路径的映射
-        :param item_path (str): 媒体项原始路径
-        :param config (Dict): 网关配置
-        """
-        headers, query = self._client_auth(request)
-        if not headers and not query:
-            return
-        client_ip, user_agent = self._playback_client_key(request)
-        managed_paths = [
-            (
-                self._normalize_media_source_id(source_id),
-                path,
-            )
-            for source_id, path in source_paths.items()
-            if self._is_managed_path(path, config)
-        ]
-        if self._is_managed_path(item_path, config):
-            managed_paths.append(("", item_path))
-        if not managed_paths:
-            return
-        if not any(source_id == "" for source_id, _ in managed_paths):
-            managed_paths.append(("", managed_paths[0][1]))
-        expires_at = monotonic() + PLAYBACK_PATH_CACHE_TTL_SECONDS
-        with self._cache_lock:
-            now = monotonic()
-            expired_keys = [
-                key
-                for key, (_, expiry) in self._playback_paths.items()
-                if expiry <= now
-            ]
-            for key in expired_keys:
-                self._playback_paths.pop(key, None)
-            for source_id, path in managed_paths:
-                cache_key = (client_ip, user_agent, item_id, source_id)
-                self._playback_paths[cache_key] = (path, expires_at)
-            while len(self._playback_paths) > PLAYBACK_PATH_CACHE_MAX_SIZE:
-                self._playback_paths.pop(next(iter(self._playback_paths)))
-
-    def _cached_playback_path(
-        self,
-        request: web.Request,
-        item_id: str,
-    ) -> str:
-        """
-        查询同一设备已认证 PlaybackInfo 的短期 STRM 路径
-
-        :param request (Request): 后续媒体请求
-        :param item_id (str): Emby 媒体项 ID
-
-        :return str: 命中的 STRM 路径，未命中返回空字符串
-        """
-        client_ip, user_agent = self._playback_client_key(request)
+    async def _signed_item_path(self, request, item_id, config) -> str:
         source_id = self._media_source_id(request)
-        keys = [
-            (client_ip, user_agent, item_id, source_id),
-            (client_ip, user_agent, item_id, ""),
-        ]
-        now = monotonic()
-        with self._cache_lock:
-            for key in keys:
-                cached = self._playback_paths.get(key)
-                if not cached:
-                    continue
-                path, expires_at = cached
-                if expires_at > now:
-                    return path
-                self._playback_paths.pop(key, None)
-        return ""
+        identity = f"{item_id}:{source_id}"
+        if not verify_action(
+            self._stream_secret, request.query.get("mp115_sig", ""), "stream", identity
+        ):
+            return ""
+        return await self._item_path(request.path, source_id or item_id, config)
 
     async def _authorized_item_path(
         self,
@@ -497,7 +408,7 @@ class DirectPlayGateway:
             return ""
         emby_path = self._select_item_path(payload, config)
         if emby_path:
-            self._item_paths[lookup_id] = emby_path
+            self._remember_item_path(lookup_id, emby_path)
         return emby_path
 
     async def _playback_source_paths(
@@ -574,9 +485,9 @@ class DirectPlayGateway:
             if store is None:
                 return "", 0, ""
             resource = store.get_resource(resource_id) or {}
-            target_file_id = file_id or str(
-                resource.get("resolved_file_id") or ""
-            ).strip()
+            target_file_id = (
+                file_id or str(resource.get("resolved_file_id") or "").strip()
+            )
             resource_file = (
                 store.get_resource_file(resource_id, target_file_id)
                 if target_file_id
@@ -743,8 +654,8 @@ class DirectPlayGateway:
                 {"success": False, "message": f"查询 Emby 媒体项失败：{error}"},
                 status=502,
             )
-        if not emby_path:
-            emby_path = self._cached_playback_path(request, item_id)
+        if not emby_path and not any(self._client_auth(request)):
+            emby_path = await self._signed_item_path(request, item_id, config)
         if not self._is_managed_path(emby_path, config):
             self._log_unmanaged_item(item_id, emby_path, config)
             return None
@@ -804,9 +715,7 @@ class DirectPlayGateway:
                 and not self._is_managed_path(emby_path, config)
             ):
                 continue
-            original_direct_stream_url = str(
-                source.get("DirectStreamUrl") or ""
-            )
+            original_direct_stream_url = str(source.get("DirectStreamUrl") or "")
             source["SupportsDirectPlay"] = True
             source["SupportsDirectStream"] = True
             source["SupportsTranscoding"] = False
@@ -828,10 +737,14 @@ class DirectPlayGateway:
                 stream_query = {
                     "Static": "true",
                     "MediaSourceId": source_id,
+                    "mp115_sig": sign_action(
+                        self._stream_secret,
+                        "stream",
+                        f"{item_id}:{self._normalize_media_source_id(source_id)}",
+                        ttl=600,
+                    ),
                 }
-                original_query = parse_qs(
-                    urlsplit(original_direct_stream_url).query
-                )
+                original_query = parse_qs(urlsplit(original_direct_stream_url).query)
                 for key in ("api_key", "X-Emby-Token", "PlaySessionId"):
                     value = str(
                         (original_query.get(key) or [""])[0]
@@ -860,6 +773,7 @@ class DirectPlayGateway:
         await downstream.prepare(request)
         headers = self._filtered_headers(request.headers)
         async with self._session.ws_connect(target_url, headers=headers) as upstream:
+
             async def downstream_to_upstream() -> None:
                 async for message in downstream:
                     if message.type == WSMsgType.TEXT:
@@ -943,13 +857,6 @@ class DirectPlayGateway:
                         item_path = item_path or await self._item_path(
                             request.path, playback_match.group(1), config
                         )
-                    self._cache_playback_paths(
-                        request,
-                        playback_match.group(1),
-                        source_paths,
-                        item_path,
-                        config,
-                    )
                     for source in payload.get("MediaSources") or []:
                         if not source.get("IsRemote"):
                             continue
@@ -1133,7 +1040,8 @@ class DirectPlayGateway:
         with self._cache_lock:
             self._item_paths.clear()
             self._unmanaged_items.clear()
-            self._playback_paths.clear()
+            self._item_path_times.clear()
+            self._stream_secret = token_urlsafe(32)
             self._media_probe_times.clear()
 
     def stop(self) -> None:

@@ -138,7 +138,7 @@ class TencentDocumentClient:
             },
             headers={"Accept": "application/json"},
         )
-        if not response:
+        if response is None:
             raise TencentDocumentError("刷新腾讯文档 Access Token 失败：无响应")
         try:
             payload = response.json()
@@ -157,9 +157,7 @@ class TencentDocumentClient:
         self.access_token = access_token
         self.access_token_expires_at = time() + expires_in if expires_in else 0
         refreshed_open_id = (
-            payload.get("open_id")
-            or payload.get("openid")
-            or payload.get("user_id")
+            payload.get("open_id") or payload.get("openid") or payload.get("user_id")
         )
         if refreshed_open_id:
             self.open_id = str(refreshed_open_id)
@@ -195,7 +193,7 @@ class TencentDocumentClient:
                 params=params,
                 headers=self._headers(),
             )
-            if not response:
+            if response is None:
                 last_error = "腾讯文档 API 无响应"
             else:
                 try:
@@ -246,7 +244,7 @@ class TencentDocumentClient:
                         )
                     return payload
             if attempt < self.retry_count:
-                sleep(min(2 ** attempt, 8))
+                sleep(min(2**attempt, 8))
         raise TencentDocumentError(last_error)
 
     @staticmethod
@@ -536,7 +534,7 @@ class TencentDocumentMcpClient:
                     "Content-Type": "application/json",
                 },
             )
-            if not response:
+            if response is None:
                 last_error = "腾讯文档 MCP 无响应"
             else:
                 try:
@@ -579,11 +577,15 @@ class TencentDocumentMcpClient:
                     if result.get("isError"):
                         data = self._result_data(result)
                         raise TencentDocumentError(
-                            str(data.get("message") or data.get("error") or "MCP 工具调用失败")
+                            str(
+                                data.get("message")
+                                or data.get("error")
+                                or "MCP 工具调用失败"
+                            )
                         )
                     return self._result_data(result)
             if attempt < self.retry_count:
-                sleep(min(2 ** attempt, 8))
+                sleep(min(2**attempt, 8))
         raise TencentDocumentError(last_error)
 
     def _tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -612,9 +614,7 @@ class TencentDocumentMcpClient:
                 if key in data:
                     return data[key]
             for value in data.values():
-                found = TencentDocumentMcpClient._find_value(
-                    value, *keys, default=None
-                )
+                found = TencentDocumentMcpClient._find_value(value, *keys, default=None)
                 if found is not None:
                     return found
         return default
@@ -632,22 +632,18 @@ class TencentDocumentMcpClient:
         sheets: List[Dict[str, Any]] = []
         for item in raw_sheets:
             sheet_id = str(
-                item.get("sheet_id")
-                or item.get("sheetId")
-                or item.get("id")
-                or ""
+                item.get("sheet_id") or item.get("sheetId") or item.get("id") or ""
             ).strip()
             title = str(
-                item.get("sheet_name")
-                or item.get("title")
-                or item.get("name")
-                or ""
+                item.get("sheet_name") or item.get("title") or item.get("name") or ""
             ).strip()
             if not sheet_id or not title:
                 continue
-            sheet_type = str(
-                item.get("sheet_type") or item.get("sheetType") or "worksheet"
-            ).strip().lower()
+            sheet_type = (
+                str(item.get("sheet_type") or item.get("sheetType") or "worksheet")
+                .strip()
+                .lower()
+            )
             sheets.append(
                 {
                     "sheet_id": sheet_id,
@@ -697,7 +693,9 @@ class TencentDocumentMcpClient:
                 ).strip()
                 if title and title not in titles:
                     titles.append(title)
-            has_more = bool(self._find_value(data, "has_more", "hasMore", default=False))
+            has_more = bool(
+                self._find_value(data, "has_more", "hasMore", default=False)
+            )
             next_offset = self._find_value(data, "next", "next_offset", "nextOffset")
             if not has_more or not fields:
                 break
@@ -754,8 +752,7 @@ class TencentDocumentMcpClient:
         raw_values = record.get("field_values") or record.get("fieldValues") or []
         if isinstance(raw_values, dict):
             raw_values = [
-                {"field": field, "value": value}
-                for field, value in raw_values.items()
+                {"field": field, "value": value} for field, value in raw_values.items()
             ]
         for item in raw_values:
             if not isinstance(item, dict):
