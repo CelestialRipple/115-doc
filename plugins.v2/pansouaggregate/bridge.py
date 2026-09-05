@@ -2,6 +2,7 @@
 
 import inspect
 from threading import Lock
+from .native_web import install_manual_web
 
 MARKER = "pansouaggregate_indexer"
 
@@ -147,6 +148,7 @@ class SearchBridge:
                         )
 
                 self._patch(SearchChain, name, wrapper)
+            install_manual_web(self, SearchChain)
         return "兼容站点搜索入口"
 
     def _patch(self, cls, name, wrapper):

@@ -26,7 +26,9 @@ def atomic_write(path, content):
             os.unlink(name)
 
 
-def install(public, script):
+def install(public, script, asset_name="moviepilot-aggregate-browser.js"):
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+\.js", asset_name):
+        raise ValueError("Invalid static asset name")
     public = Path(public).resolve()
     index = public / "index.html"
     before = index.read_bytes()
@@ -35,8 +37,12 @@ def install(public, script):
         raise ValueError("index.html does not contain a head element")
     code = Path(script).read_bytes()
     digest = hashlib.sha256(code).hexdigest()[:12]
-    tag = f'<script src="/moviepilot-aggregate-browser.js?v={digest}"></script>'
-    pattern = r"<script\b[^>]*\bsrc=[\"\']/moviepilot-aggregate-browser\.js(?:\?[^\"\']*)?[\"\'][^>]*>\s*</script>"
+    tag = f'<script src="/{asset_name}?v={digest}"></script>'
+    pattern = (
+        r"<script\b[^>]*\bsrc=[\"\']/"
+        + re.escape(asset_name)
+        + r"(?:\?[^\"\']*)?[\"\'][^>]*>\s*</script>"
+    )
     text = re.sub(pattern, "", text, flags=re.I)
     after = re.sub(
         r"(<head\b[^>]*>)", lambda m: m[0] + tag, text, count=1, flags=re.I
@@ -51,10 +57,10 @@ def install(public, script):
         backup.parent.mkdir(exist_ok=True)
         if not backup.exists():
             shutil.copy2(index, backup)
-        atomic_write(public / "moviepilot-aggregate-browser.js", code)
+        atomic_write(public / asset_name, code)
         atomic_write(index, after)
     else:
-        atomic_write(public / "moviepilot-aggregate-browser.js", code)
+        atomic_write(public / asset_name, code)
     return digest
 
 
@@ -65,5 +71,8 @@ if __name__ == "__main__":
         "--script",
         default=str(Path(__file__).with_name("moviepilot-browser-download.user.js")),
     )
+    parser.add_argument("--asset-name", default="moviepilot-aggregate-browser.js")
     args = parser.parse_args()
-    print("Browser adapter installed:", install(args.public, args.script))
+    print(
+        "Browser adapter installed:", install(args.public, args.script, args.asset_name)
+    )

@@ -38,3 +38,7 @@ git apply /path/to/115-doc/integrations/moviepilot-frontend-v3.patch
 - 302 不能替 115 修改最终响应的 `Content-Disposition`。某些视频可能先在浏览器播放，此时使用浏览器“另存为”；严格强制另存为需要上游提供 attachment 响应或代理视频正文，本插件不代理正文。
 - 操作链接按用途和资源签名，有效期一小时；过期后重新搜索。网关播放链接签名有效期十分钟，重启后失效。
 - 浏览器下载完成状态由浏览器管理，不会进入 MoviePilot 下载器的进度、历史或自动整理生命周期。
+
+## 订阅页的近期蓝光发行入口
+
+安装并启用“近期蓝光发行”后，可用同一个安装器增加 [moviepilot-bluray-calendar.js](moviepilot-bluray-calendar.js)。传入 `--asset-name moviepilot-bluray-calendar.js`，它会与搜索下载脚本共存。具体命令和功能说明见[发行日历文档](../docs/blurayreleasecalendar/README.md)。

@@ -33,7 +33,7 @@ class PanSouAggregate(_PluginBase):
     plugin_name = "PanSou聚合搜索"
     plugin_desc = "原生聚合115和磁力，支持浏览器下载、按类型保存影视库及自定义网页入口"
     plugin_icon = "https://raw.githubusercontent.com/CelestialRipple/115-doc/main/docs/pansouaggregate/icon.svg"
-    plugin_version = "0.3.1"
+    plugin_version = "0.3.2"
     plugin_author = "CelestialRipple"
     author_url = "https://github.com/CelestialRipple"
     plugin_config_prefix = "pansouaggregate_"
