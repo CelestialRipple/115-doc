@@ -211,7 +211,7 @@ class PanSouClient:
     def __init__(self, config):
         self.config = dict(config)
 
-    def search(self, keyword):
+    def search(self, keyword, refresh=False):
         import json
 
         base = http_url(self.config.get("pansou_url", ""))
@@ -255,6 +255,8 @@ class PanSouClient:
                 "src": "all",
                 "cloud_types": ["115", "magnet"],
             }
+            if refresh:
+                body["refresh"] = True
             for field in ("plugins", "channels"):
                 raw = self.config.get(field)
                 values = (

@@ -74,7 +74,12 @@ class SearchEngine:
         items, errors = [], {}
         if self.config.get("pansou_enabled"):
             try:
-                items = PanSouClient(self.config).search(keyword)
+                provider = PanSouClient(self.config)
+                items = (
+                    provider.search(keyword, refresh=True)
+                    if refresh
+                    else provider.search(keyword)
+                )
             except ProviderError as error:
                 errors["PanSou"] = str(error)
             except Exception:

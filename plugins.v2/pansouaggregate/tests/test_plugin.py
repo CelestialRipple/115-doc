@@ -207,3 +207,19 @@ def test_custom_web_native_entries_redirect_without_library_calls(
         assert response.status_code == 302
         assert response.headers["location"].startswith("https://example.com/search?q=")
     assert client.post(item.page_url, content="group=Movies").status_code == 400
+
+
+def test_refresh_bypasses_both_cache_layers(monkeypatch, plugin, client):
+    calls = []
+
+    def search(self, keyword, refresh=False):
+        calls.append(refresh)
+        return [Resource("Movie", clean_link(MAGNET), "PanSou", "magnet")]
+
+    monkeypatch.setattr("pansouaggregate.engine.PanSouClient.search", search)
+    for suffix in ["", "", "&refresh=1", ""]:
+        assert (
+            client.get(BASE + "/search?keyword=Movie" + suffix, headers=KEY).status_code
+            == 200
+        )
+    assert calls == [False, True]

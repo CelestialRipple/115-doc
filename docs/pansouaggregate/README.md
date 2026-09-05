@@ -1,4 +1,4 @@
-# PanSou 聚合搜索 0.3.2
+# PanSou 聚合搜索 0.3.3
 
 MoviePilot 原生“站点资源”搜索同时显示腾讯文档和 PanSou 结果。BT4G 默认提供一个带当前关键词的网页搜索入口，点击后打开新标签页。插件不请求 BT4G 页面，不回填结果，也不处理 Cloudflare 验证。
 
@@ -60,3 +60,5 @@ RE0|https://re0.me/search?tab=media&query={keyword}&page=1&type=multi
 ## 0.3.2 搜索卡片修复
 
 网页入口按站点保留独立卡片；兼容当前群晖 MoviePilot 的直接站点搜索及 TMDB 详情页“搜索标题”普通与流式搜索。仅手动搜索绕过网页入口的影片匹配，订阅任务仍按原有规则筛选真实资源。
+
+新增或调整 PanSou 来源后，可在插件搜索页重新点击“搜索”：0.3.3 会同时刷新 MoviePilot 插件与 PanSou 服务端缓存，原生页面重新搜索后即可使用更新的结果。

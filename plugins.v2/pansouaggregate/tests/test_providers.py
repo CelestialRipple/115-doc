@@ -149,3 +149,19 @@ def test_pansou_endpoint_and_authorization(monkeypatch):
     assert calls[0][0] == "http://nas/api/auth/login"
     assert calls[1][1]["headers"]["Authorization"] == "Bearer test-token"
     assert calls[1][1]["json"]["cloud_types"] == ["115", "magnet"]
+
+
+def test_force_refresh_is_forwarded_to_pansou(monkeypatch):
+    bodies = []
+
+    def read(session, method, url, **kwargs):
+        bodies.append(kwargs["json"])
+        return '{"total":0,"merged_by_type":{}}'
+
+    monkeypatch.setattr("pansouaggregate.providers.read_response", read)
+    client = PanSouClient({"pansou_url": "http://nas:8888"})
+    client.search("千与千寻")
+    client.search("千与千寻", refresh=True)
+    assert not bodies[0].get("refresh")
+    assert bodies[1]["refresh"] is True
+    assert bodies[1]["cloud_types"] == ["115", "magnet"]
