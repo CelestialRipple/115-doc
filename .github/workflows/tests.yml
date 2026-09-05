@@ -18,5 +18,6 @@ jobs:
           node-version: '24'
       - run: python -m pip install -r requirements-test.txt
       - run: python -m pytest plugins.v2/tencentdoc115library/tests -q
-      - run: node --test integrations/test-browser-download.cjs
+      - run: python -m pytest plugins.v2/pansouaggregate/tests -q
+      - run: node --test integrations/test-browser-download.cjs integrations/test-bt4g-results.cjs
       - run: git diff --check

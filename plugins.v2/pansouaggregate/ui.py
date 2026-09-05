@@ -1,0 +1,25 @@
+SEARCH_HTML = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>PanSou 聚合搜索</title>
+<style>body{font:16px system-ui;background:#f4f6fa;color:#17263c;margin:0}main{max-width:1000px;margin:2em auto;padding:1.5em}h1{font-size:1.8em}input,textarea,button{font:inherit;padding:.7em;border:1px solid #bac5d6;border-radius:8px}input{min-width:50%}button{cursor:pointer;background:#254fa1;color:white}button:disabled{opacity:.5}#status{white-space:pre-wrap;margin:1em 0}.item{background:white;padding:1em;margin:1em 0;border-radius:12px;overflow-wrap:anywhere}.item h2{font-size:1.1em;margin:0 0 .5em}.item a{display:inline-block;margin:.5em 1em .2em 0;color:#254fa1}textarea{width:95%;height:100px}summary{cursor:pointer}small{color:#596b83}</style></head>
+<body><main><h1>PanSou 聚合搜索</h1><p>网盘与磁力资源聚合 · 结果右侧可打开原始分享或联动115媒体库</p>
+<form id="search-form"><input id="keyword" placeholder="输入片名" maxlength="200" required><button id="search">搜索</button></form>
+<p><button id="verify" disabled>打开 BT4G，验证并带回结果</button></p>
+<p><small>BT4G 出现真人验证时请手动完成。安装 <a href="https://raw.githubusercontent.com/CelestialRipple/115-doc/main/integrations/bt4g-results.user.js" target="_blank" rel="noopener noreferrer">结果助手脚本</a> 后，在 BT4G 点击“带回 MoviePilot”。验证 Cookie 不会发送给 MoviePilot。</small></p>
+<details><summary>手动粘贴 BT4G 结果（浏览器阻止窗口回传时使用）</summary><p>在 BT4G 结果助手中复制 JSON，粘贴到此处。</p><textarea id="import-data"></textarea><button id="import">导入结果</button></details>
+<p id="status" role="status">请输入关键词开始搜索。</p><section id="items"></section></main>
+<script>
+(()=>{'use strict';
+const key=new URL(location.href).searchParams.get('key'), base=location.pathname.replace(/\/ui$/, '');
+const $=id=>document.getElementById(id);let lastKeyword='',btUrl='',child=null,nonce='',busy=false;
+function status(message){$('status').textContent=message}
+function safeUrl(raw, protocols=['http:','https:']){try{const url=new URL(raw,location.origin);return protocols.includes(url.protocol)&&!url.username&&!url.password?url.href:null}catch{return null}}
+async function api(path,options={}){const response=await fetch(base+path,{...options,headers:{'x-pansou-key':key,...options.headers}});let data;try{data=await response.json()}catch{throw Error('服务没有返回有效数据')}if(!response.ok)throw Error(data.detail||'请求失败');return data}
+function render(items){$('items').replaceChildren();for(const item of items){const card=document.createElement('article');card.className='item';const h=document.createElement('h2');h.textContent=item.title;card.append(h);const p=document.createElement('p');p.textContent=item.source+' · '+item.cloud+(item.password?' · 提取码 '+item.password:'');card.append(p);const url=safeUrl(item.action_url);if(url&&new URL(url).origin===location.origin){const a=document.createElement('a');a.href=url;a.target='_blank';a.rel='noopener noreferrer';a.textContent='打开资源 / 添加到115媒体库';card.append(a)}const copy=document.createElement('button');copy.textContent='复制链接';copy.onclick=async()=>{try{await navigator.clipboard.writeText(item.url+(item.password?'\n提取码：'+item.password:''));status('链接已复制')}catch{status('浏览器不允许复制，请打开资源页复制链接')}};card.append(copy);$('items').append(card)}}
+async function search(refresh=false){if(busy)return;const keyword=$('keyword').value.trim();if(!keyword)return;busy=true;$('search').disabled=true;$('verify').disabled=true;status('正在聚合搜索…');try{const data=await api('/search?'+new URLSearchParams({keyword,refresh:refresh?'1':'0'}));lastKeyword=data.keyword;btUrl=safeUrl(data.bt4g_url);render(data.items);status('找到 '+data.items.length+' 条资源'+Object.entries(data.errors||{}).map(([source,message])=>'\n'+source+'：'+message).join(''));$('verify').disabled=!btUrl}catch(error){status(error.message)}finally{busy=false;$('search').disabled=false}}
+$('search-form').onsubmit=event=>{event.preventDefault();search(true)};
+$('verify').onclick=()=>{if(!btUrl)return;nonce=crypto.randomUUID();const target=new URL(btUrl);target.hash='mp-pansou='+encodeURIComponent(JSON.stringify({origin:location.origin,nonce,keyword:lastKeyword}));child=window.open(target.href,'_blank');status('请在 BT4G 完成验证，然后点击结果助手的“带回 MoviePilot”。若窗口回传受限，可复制 JSON 后在本页导入。')};
+async function importItems(payload){if(!payload||payload.keyword!==lastKeyword||!Array.isArray(payload.items))throw Error('结果关键词与当前搜索不同，请先搜索相同关键词');const data=await api('/browser-import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyword:lastKeyword,items:payload.items})});status('已导入 '+data.count+' 条结果，正在更新…');await search()}
+window.addEventListener('message',async event=>{if(!child||event.source!==child||!btUrl||event.origin!==new URL(btUrl).origin)return;const payload=event.data;if(!payload||payload.type!=='mp-pansou-results'||payload.nonce!==nonce)return;try{await importItems(payload)}catch(error){status(error.message)}});
+$('import').onclick=async()=>{try{await importItems(JSON.parse($('import-data').value))}catch(error){status(error.message)}};
+})();
+</script></body></html>"""

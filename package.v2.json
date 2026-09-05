@@ -71,5 +71,17 @@
             "v0.1.1": "兼容群晖 MoviePilot 套件和新版容器的浏览器、插件管理器模块布局",
             "v0.1.0": "独立RE0登录会话、MoviePilot媒体识别、资源搜索、积分确认解锁、可选媒体库导入和每日签到"
         }
+    },
+    "PanSouAggregate": {
+        "name": "PanSou聚合搜索",
+        "description": "聚合PanSou网盘和BT4G资源，支持MoviePilot原生搜索、浏览器手动验证回传及可选115媒体库导入",
+        "labels": "聚合搜索,PanSou,BT4G,网盘,磁力",
+        "version": "0.1.0",
+        "icon": "https://raw.githubusercontent.com/CelestialRipple/115-doc/main/docs/pansouaggregate/icon.svg",
+        "author": "CelestialRipple",
+        "level": 1,
+        "history": {
+            "v0.1.0": "接入PanSou搜索API和BT4G公开页面；兼容原生与旧版搜索入口；浏览器手动完成CF验证后带回资源，支持真实详情页磁力解析、去重、超时隔离和115媒体库导入"
+        }
     }
 }
