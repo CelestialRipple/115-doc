@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 import requests
-from bs4 import BeautifulSoup
 
 
 class ProviderError(Exception):
@@ -198,9 +197,7 @@ def read_response(
             or (response.status_code in {403, 503} and "cf-chl-" in text.lower())
         )
         if is_challenge:
-            raise ChallengeRequired(
-                "BT4G 需要浏览器真人验证，请在插件搜索页打开 BT4G 并带回结果"
-            )
+            raise ChallengeRequired("搜索服务要求浏览器验证，请检查 PanSou 服务地址")
         if not 200 <= response.status_code < 300:
             raise ProviderError(
                 f"搜索服务返回 HTTP {response.status_code}，请检查地址、认证或稍后重试"
@@ -276,131 +273,3 @@ class PanSouClient:
 
 def bt4g_search_url(base, keyword, page=0):
     return base.rstrip("/") + "/search?" + urlencode({"q": keyword, "p": page + 1})
-
-
-def parse_size(text):
-    match = re.search(
-        r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB|B)\b", text, re.I
-    )
-    if not match:
-        return 0
-    exponent = {"B": 0, "KB": 1, "MB": 2, "GB": 3, "TB": 4}
-    return int(
-        float(match[1].replace(",", ""))
-        * 1024 ** exponent[match[2].upper().replace("I", "")]
-    )
-
-
-def parse_bt4g(html, base, limit=100):
-    """Extract visible result links; never infer an infohash from a detail-page ID."""
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-    detail_title = soup.select_one("h1.notion-detail-title")
-    if detail_title:
-        for anchor in soup.select(".notion-btn-group a[href]"):
-            parsed = urlsplit(urljoin(base, anchor["href"]))
-            match = re.fullmatch(r"/hash/([a-fA-F0-9]{40})", parsed.path)
-            if parsed.hostname == "downloadtorrentfile.com" and match:
-                title = detail_title.get_text(" ", strip=True)[:500]
-                # This is the explicit hash in the site's download link, not its
-                # opaque /magnet/ page identifier. No visit to the external host.
-                magnet = clean_link(
-                    "magnet:?" + urlencode({"xt": "urn:btih:" + match[1], "dn": title})
-                )
-                items.append(Resource(title, magnet, "BT4G", "magnet", page_url=base))
-    for anchor in soup.select("a[href]"):
-        href = anchor.get("href", "")
-        url = clean_link(href) if href.startswith("magnet:") else ""
-        if not url:
-            continue
-        row = (
-            anchor.find_parent(
-                class_=re.compile(
-                    r"(?:^|\s)(?:result|search-result|torrent|list-group-item|notion-list-item)(?:\s|$)"
-                )
-            )
-            or anchor.find_parent("li")
-            or anchor.parent
-        )
-        heading = row.find(["h3", "h4", "h5", "h6"]) if row else None
-        dn = parse_qs(urlsplit(url).query).get("dn", [""])[0]
-        title = (
-            heading.get_text(" ", strip=True)
-            if heading
-            else dn or anchor.get_text(" ", strip=True)
-        )[:500]
-        page_url = base
-        if heading and heading.find("a", href=True):
-            candidate = urljoin(base, heading.find("a")["href"])
-            if urlsplit(candidate).netloc == urlsplit(base).netloc:
-                page_url = candidate
-        items.append(
-            Resource(
-                title or "BT4G 资源",
-                url,
-                "BT4G",
-                "magnet",
-                size=parse_size(row.get_text(" ", strip=True)),
-                page_url=page_url,
-            )
-        )
-    # BT4G commonly exposes magnets on detail pages only. Preserve the verified
-    # same-origin detail links as navigable results instead of fabricating hashes.
-    for heading in soup.select(
-        ".notion-list-item-title a[href], h3 a[href], h4 a[href], h5 a[href]"
-    ):
-        url = urljoin(base, heading["href"])
-        parts = urlsplit(url)
-        if parts.netloc != urlsplit(base).netloc or not re.fullmatch(
-            r"/(?:magnet|hash|torrent)/[a-zA-Z0-9_-]+/?", parts.path
-        ):
-            continue
-        title = heading.get_text(" ", strip=True)[:500]
-        if title and not any(item.title == title for item in items):
-            row = heading.find_parent(class_="notion-list-item")
-            total = row.select_one(".red-pill") if row else None
-            seeds = row.select_one(".notion-seeders") if row else None
-            seeders = re.sub(r"\D", "", seeds.get_text()) if seeds else ""
-            items.append(
-                Resource(
-                    title,
-                    url,
-                    "BT4G",
-                    "bt4g",
-                    size=parse_size(total.get_text()) if total else 0,
-                    seeders=int(seeders[:8] or 0),
-                    page_url=url,
-                )
-            )
-    if not items and not any(
-        text in soup.get_text(" ", strip=True).lower()
-        for text in ("no results", "no result", "not found", "没有找到", "0 results")
-    ):
-        raise ProviderError(
-            "BT4G 页面没有可识别的结果结构，请用浏览器打开并带回当前页结果"
-        )
-    return dedupe(items, limit)
-
-
-class BT4GClient:
-    def __init__(self, config):
-        self.config = dict(config)
-
-    def search(self, keyword, page=0):
-        base = http_url(self.config.get("bt4g_url", "https://bt4gprx.com"))
-        if not base:
-            raise ProviderError("BT4G 地址无效")
-        with requests.Session() as session:
-            session.trust_env = False
-            proxy = http_url(self.config.get("bt4g_proxy", ""))
-            if proxy:
-                session.proxies = {"http": proxy, "https": proxy}
-            html = read_response(
-                session,
-                "GET",
-                bt4g_search_url(base, keyword, page),
-                timeout=int(self.config.get("timeout", 20)),
-                same_origin_redirects=3,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
-            )
-        return parse_bt4g(html, base, int(self.config.get("limit", 100)))

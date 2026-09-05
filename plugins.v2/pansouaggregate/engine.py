@@ -1,10 +1,16 @@
 """In-memory search cache and independent provider failure reporting."""
 
 import time
-from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, RLock
 
-from .providers import BT4GClient, PanSouClient, ProviderError, dedupe
+from .providers import (
+    PanSouClient,
+    ProviderError,
+    Resource,
+    bt4g_search_url,
+    dedupe,
+    http_url,
+)
 
 
 class SearchEngine:
@@ -13,7 +19,6 @@ class SearchEngine:
         self.lock = RLock()
         self.search_lock = Lock()
         self.cache = {}
-        self.imported = {}
         self.resources = {}
         self.errors = {}
         self.stopped = False
@@ -36,26 +41,6 @@ class SearchEngine:
         with self.lock:
             pair = self.resources.get(rid)
             return pair[1] if pair and time.monotonic() - pair[0] < 3600 else None
-
-    def import_browser(self, keyword, items):
-        with self.lock:
-            key = self.key(keyword)
-            old = self.imported.get(key)
-            previous = old[1] if old and time.monotonic() - old[0] < 1800 else []
-            resolved_pages = {item.page_url for item in items if item.cloud == "magnet"}
-            items = dedupe(
-                [
-                    *items,
-                    *(item for item in previous if item.url not in resolved_pages),
-                ],
-                self.config["limit"],
-            )
-            self.imported[key] = (time.monotonic(), items)
-            while len(self.imported) > 50:
-                self.imported.pop(next(iter(self.imported)))
-            self.cache.pop(key, None)
-            self._remember(items)
-            return len(items)
 
     def search(self, keyword, refresh=False):
         # Bound contention as well as HTTP calls; a slow provider must not leave
@@ -82,50 +67,33 @@ class SearchEngine:
                 self.errors = dict(cached[2])
                 self._remember(cached[1])
                 return list(cached[1]), dict(cached[2])
-            imported = self.imported.get(key)
-            browser_items = (
-                imported[1]
-                if self.config.get("bt4g_enabled")
-                and imported
-                and now - imported[0] < 1800
-                else []
-            )
-        # Network calls never hold the resource/cache lock: opening a result or
-        # importing a verified browser page must remain responsive during searches.
-        providers = {}
+        # Only PanSou is fetched on the server. BT4G is a browser shortcut,
+        # independent of PanSou failures and excluded from the resource limit.
+        items, errors = [], {}
         if self.config.get("pansou_enabled"):
-            providers["PanSou"] = PanSouClient(self.config)
-        if self.config.get("bt4g_enabled") and not browser_items:
-            providers["BT4G"] = BT4GClient(self.config)
-        items, errors = list(browser_items), {}
-        with ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="pansou-search"
-        ) as pool:
-            futures = {
-                name: pool.submit(client.search, keyword)
-                for name, client in providers.items()
-            }
-            for name, future in futures.items():
-                try:
-                    items.extend(future.result())
-                except ProviderError as error:
-                    errors[name] = str(error)
-                except Exception:
-                    # requests exceptions may contain authorization URLs or
-                    # share keys. Never expose their raw text in UI or logs.
-                    errors[name] = "请求失败，请检查网络、服务地址和认证配置"
+            try:
+                items = PanSouClient(self.config).search(keyword)
+            except ProviderError as error:
+                errors["PanSou"] = str(error)
+            except Exception:
+                errors["PanSou"] = "请求失败，请检查网络、服务地址和认证配置"
+        items = dedupe(items, self.config["limit"])
+        if self.config.get("bt4g_enabled"):
+            base = http_url(self.config.get("bt4g_url", ""))
+            if base:
+                items.append(
+                    Resource(
+                        keyword + " · BT4G 网页搜索",
+                        bt4g_search_url(base, keyword),
+                        "BT4G网页搜索",
+                        "bt4g",
+                    )
+                )
+            else:
+                errors["BT4G"] = "请配置有效的 BT4G 地址"
         with self.lock:
             if self.stopped:
                 return [], {}
-            imported = self.imported.get(key)
-            if (
-                self.config.get("bt4g_enabled")
-                and imported
-                and time.monotonic() - imported[0] < 1800
-            ):
-                items = [*imported[1], *items]
-                errors.pop("BT4G", None)
-            items = dedupe(items, self.config["limit"])
             self.errors = errors
             self.cache[key] = (time.monotonic(), items, errors)
             while len(self.cache) > 50:

@@ -5,7 +5,7 @@
 - “腾讯文档115媒体库”负责同步普通表、智能表和自选资源，生成并维护 STRM 媒体库
 - “RE0资源搜索”使用 MoviePilot 内置浏览器登录 RE0，按 TMDB 搜索资源，并在用户逐条确认积分后解锁 115、磁力或 ED2K 链接
 
-- “PanSou聚合搜索”接入自建 PanSou 与 BT4G，支持原生搜索、浏览器完成验证后带回结果，以及可选115媒体库导入
+- “PanSou聚合搜索”接入自建 PanSou 与 BT4G，支持原生搜索、浏览器下载、保存115影视库，以及 BT4G 新标签页搜索入口
 
 RE0 插件只负责资源获取，不复制腾讯文档插件的解析和媒体库代码。用户明确点击“保存到媒体库”时，才会把已解锁链接交给腾讯文档插件现有的自选导入入口；没有安装腾讯文档插件时仍可独立搜索、解锁和打开链接
 
@@ -26,7 +26,7 @@ https://github.com/CelestialRipple/115-doc/
 - 腾讯文档插件的完整配置、路径映射和测试方法见[使用说明](docs/tencentdoc115library/README.md)
 - RE0 插件的功能边界和配置说明见[RE0资源搜索](docs/re0search/README.md)
 
-- PanSou 与 BT4G 的配置、手动验证和限制见[PanSou聚合搜索](docs/pansouaggregate/README.md)
+- PanSou 与 BT4G 的配置、下载和原生页面接入见[PanSou聚合搜索](docs/pansouaggregate/README.md)
 
 ## 安全说明
 

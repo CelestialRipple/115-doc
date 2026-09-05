@@ -8,7 +8,7 @@ import re
 import secrets
 import time
 from types import SimpleNamespace
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 from fastapi import HTTPException, Request
 from starlette.responses import HTMLResponse
@@ -22,16 +22,17 @@ except ImportError:
     from app.core.context import TorrentInfo
 
 from .bridge import MARKER, SearchBridge
+from .downloads import DownloadService, download_response, library_plugin, share_url
 from .engine import SearchEngine
-from .providers import Resource, bt4g_search_url, clean_link, http_url
+from .providers import bt4g_search_url
 from .ui import SEARCH_HTML
 
 
 class PanSouAggregate(_PluginBase):
     plugin_name = "PanSou聚合搜索"
-    plugin_desc = "聚合 PanSou 网盘与 BT4G 资源，支持浏览器手动验证和可选115媒体库导入"
+    plugin_desc = "原生搜索聚合 PanSou，支持浏览器下载、115媒体库保存和 BT4G 网页搜索"
     plugin_icon = "https://raw.githubusercontent.com/CelestialRipple/115-doc/main/docs/pansouaggregate/icon.svg"
-    plugin_version = "0.1.0"
+    plugin_version = "0.2.0"
     plugin_author = "CelestialRipple"
     author_url = "https://github.com/CelestialRipple"
     plugin_config_prefix = "pansouaggregate_"
@@ -64,6 +65,7 @@ class PanSouAggregate(_PluginBase):
             self._config["ui_key"] = secrets.token_urlsafe(32)
             self.update_config(self._config)
         self._engine = SearchEngine(self._config)
+        self._downloads = DownloadService(lambda: self.get_data_path())
         self._bridge = SearchBridge(self)
         self._bridge_status = "未启用"
         if self.get_state():
@@ -127,12 +129,25 @@ class PanSouAggregate(_PluginBase):
             logger.warning(f"PanSou聚合搜索 {name}：{message}")
         return [
             TorrentInfo(
-                site_name="PanSou聚合搜索",
+                site_name="BT4G网页搜索" if item.cloud == "bt4g" else "PanSou聚合搜索",
                 site_order=0,
                 title=item.title,
-                description=f"{item.source} · {item.cloud} · 右下角ⓘ打开资源",
-                enclosure=item.url if item.cloud == "magnet" else "",
-                page_url=self._resource_url(item.id),
+                description=f"{item.source} · {item.cloud} · "
+                + (
+                    "点击打开网页搜索"
+                    if item.cloud == "bt4g"
+                    else "点击下载 · ⓘ保存影视库"
+                ),
+                enclosure="pansou://" + item.id,
+                page_url=self._resource_url(item.id)
+                + "#mp-pansou="
+                + urlencode(
+                    {
+                        "url": self._resource_url(item.id).replace(
+                            "/resource/", "/download/"
+                        )
+                    }
+                ),
                 size=item.size,
                 seeders=item.seeders,
                 labels=[item.cloud, "ⓘ资源操作"],
@@ -209,83 +224,34 @@ class PanSouAggregate(_PluginBase):
             "bt4g_url": bt4g_search_url(self._config["bt4g_url"], keyword),
         }
 
-    async def browser_import(self, request: Request):
-        self._require(request)
-        body = bytearray()
-        async for chunk in request.stream():
-            body.extend(chunk)
-            if len(body) > 256 * 1024:
-                raise HTTPException(413, "结果数据过大")
-        import json
-
-        try:
-            payload = json.loads(body)
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPException(400, "结果数据不是有效 JSON")
-        if not isinstance(payload, dict):
-            raise HTTPException(400, "结果格式错误")
-        keyword = self._keyword(payload.get("keyword"))
-        rows = payload.get("items")
-        if not keyword or not isinstance(rows, list) or len(rows) > 200:
-            raise HTTPException(400, "关键词或结果数量无效")
-        base = http_url(self._config["bt4g_url"])
-        items = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            url = clean_link(row.get("url"))
-            magnet = url.startswith("magnet:")
-            parsed = urlsplit(url)
-            if not magnet and not (
-                http_url(url)
-                and parsed.netloc == urlsplit(base).netloc
-                and re.fullmatch(
-                    r"/(?:magnet|hash|torrent)/[a-zA-Z0-9_-]+/?", parsed.path
-                )
-            ):
-                continue
-            title = str(row.get("title") or "BT4G资源").strip()[:500]
-
-            def number(name, maximum):
-                try:
-                    return max(0, min(maximum, int(row.get(name) or 0)))
-                except (ValueError, TypeError, OverflowError):
-                    return 0
-
-            page_url = http_url(row.get("page_url", ""))
-            if not page_url or urlsplit(page_url).netloc != urlsplit(base).netloc:
-                page_url = base
-
-            items.append(
-                Resource(
-                    title,
-                    url,
-                    "BT4G（浏览器）",
-                    "magnet" if magnet else "bt4g",
-                    size=number("size", 10**16),
-                    seeders=number("seeders", 10**8),
-                    page_url=url if not magnet else page_url,
-                )
-            )
-        if not items:
-            raise HTTPException(
-                400, "没有有效的 BT4G 资源链接；请先完成验证并打开结果页"
-            )
-        count = await asyncio.to_thread(self._engine.import_browser, keyword, items)
-        return {"success": True, "count": count}
-
     async def resource_page(self, rid: str, request: Request):
         item = self._resource(rid, request)
+        if item.cloud == "bt4g":
+            from starlette.responses import RedirectResponse
+
+            return RedirectResponse(item.url, status_code=302, headers=self._headers())
         escape = html.escape
+        download = escape(
+            request.url.path.replace("/resource/", "/download/")
+            + "?"
+            + request.url.query,
+            quote=True,
+        )
         supported = item.cloud in {"115", "magnet", "ed2k"}
         form = (
-            '<form method="post"><label>直属文件夹 <input name="group" value="聚合搜索" maxlength="60"></label><button>添加到115媒体库</button><p>此操作提交后台导入和刮削；磁力或 ED2K 首次播放时才进行115离线。</p></form>'
+            '<form method="post"><label>直属文件夹 <input name="group" value="聚合搜索" maxlength="60"></label><button>保存影视库</button><p>此操作提交后台导入和刮削；磁力或 ED2K 首次播放时才进行115离线。</p></form>'
             if supported
             else ""
         )
         # POST is same URL with its short, resource-scoped signature. No global key.
-        content = f'<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>{escape(item.title)}</title><style>body{{font:17px system-ui;max-width:800px;margin:3em auto;padding:1em;line-height:1.7}}input,button{{font:inherit;padding:.5em;margin:.5em}}textarea{{width:100%;height:100px}}</style><h1>{escape(item.title)}</h1><p>{escape(item.source)} · {escape(item.cloud)}</p><p>提取码：{escape(item.password or "无")}</p><p><a href="{escape(item.url, quote=True)}" target="_blank" rel="noopener noreferrer">打开原始资源</a></p><textarea readonly>{escape(item.url)}</textarea>{form}<p>网盘分享页和磁力不是视频直链。115媒体库导入完成后可在其资源页使用浏览器下载。</p>'
+        content = f'<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>{escape(item.title)}</title><style>body{{font:17px system-ui;max-width:800px;margin:3em auto;padding:1em;line-height:1.7}}input,button{{font:inherit;padding:.5em;margin:.5em}}textarea{{width:100%;height:100px}}</style><h1>{escape(item.title)}</h1><p>{escape(item.source)} · {escape(item.cloud)}</p><p>提取码：{escape(item.password or "无")}</p><p><a href="{escape(item.url, quote=True)}" target="_blank" rel="noopener noreferrer">打开原始资源</a></p><textarea readonly>{escape(item.url)}</textarea>{form}<p><a href="{download}" target="_blank" rel="noopener noreferrer">浏览器下载 / 打开网盘</a></p><p>115 分享可选视频文件后下载；磁力和 ED2K 通过115离线解析后下载。其他网盘打开原始分享页。</p>'
         return HTMLResponse(content, headers=self._headers())
+
+    async def download(self, rid: str, request: Request):
+        item = self._resource(rid, request)
+        return await asyncio.to_thread(
+            download_response, item, request, self._headers(), self._downloads
+        )
 
     async def import_library(self, rid: str, request: Request):
         item = self._resource(rid, request)
@@ -311,25 +277,8 @@ class PanSouAggregate(_PluginBase):
         if item.cloud not in {"115", "magnet", "ed2k"}:
             raise HTTPException(400, "该类型不支持115媒体库导入")
         try:
-            try:
-                from app.runtime.extensions.plugin.manager import PluginManager
-            except ImportError:
-                try:
-                    from app.runtime.extensions.plugin_manager import PluginManager
-                except ImportError:
-                    from app.core.plugin import PluginManager
-            target = PluginManager().running_plugins.get("TencentDoc115Library")
-            if target is None or not hasattr(target, "import_manual_resources"):
-                raise HTTPException(409, "请先启用腾讯文档115媒体库插件")
-            url = item.url
-            if (
-                item.cloud == "115"
-                and item.password
-                and not parse_qs(urlsplit(url).query).get("password")
-            ):
-                url += ("&" if "?" in url else "?") + urlencode(
-                    {"password": item.password}
-                )
+            target = library_plugin()
+            url = share_url(item)
             title = item.title.replace("|", " ").replace("\n", " ").replace("\r", " ")
             result = await asyncio.to_thread(
                 target.import_manual_resources,
@@ -374,11 +323,11 @@ class PanSouAggregate(_PluginBase):
                 "summary": "搜索聚合资源",
             },
             {
-                "path": "/browser-import",
-                "endpoint": self.browser_import,
-                "methods": ["POST"],
+                "path": "/download/{rid}",
+                "endpoint": self.download,
+                "methods": ["GET"],
                 "allow_anonymous": True,
-                "summary": "导入浏览器验证后的BT4G结果",
+                "summary": "浏览器下载或打开网页搜索",
             },
             {
                 "path": "/resource/{rid}",
@@ -404,12 +353,12 @@ class PanSouAggregate(_PluginBase):
             {
                 "component": "VAlert",
                 "props": {"type": "info", "variant": "tonal"},
-                "text": f"搜索入口：{getattr(self, '_bridge_status', '未初始化')}。原生结果右下角ⓘ打开资源；BT4G验证请进入聚合搜索页。",
+                "text": f"搜索入口：{getattr(self, '_bridge_status', '未初始化')}。原生结果点击下载，右下角ⓘ保存影视库；BT4G 点击后在新标签页搜索。",
             },
             {
                 "component": "VBtn",
                 "props": {"href": url, "target": "_blank", "color": "primary"},
-                "text": "打开聚合搜索与BT4G验证",
+                "text": "打开聚合搜索",
             },
         ]
 
@@ -439,9 +388,8 @@ class PanSouAggregate(_PluginBase):
                 {},
             ),
             ("channels", "TG 频道（逗号分隔，留空使用服务默认）", "VTextField", {}),
-            ("bt4g_enabled", "聚合 BT4G", "VSwitch", {}),
+            ("bt4g_enabled", "显示 BT4G 网页搜索入口", "VSwitch", {}),
             ("bt4g_url", "BT4G 地址", "VTextField", {}),
-            ("bt4g_proxy", "BT4G HTTP代理（可选，仅用于BT4G）", "VTextField", {}),
             ("timeout", "单来源请求超时秒数（5–45）", "VTextField", {"type": "number"}),
             ("limit", "每次最多结果数（1–200）", "VTextField", {"type": "number"}),
             (
@@ -477,4 +425,16 @@ class PanSouAggregate(_PluginBase):
         return []
 
     def get_service(self):
-        return []
+        if not self.get_state():
+            return []
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        return [
+            {
+                "id": "PanSouOfflineCleanup",
+                "name": "PanSou离线下载缓存清理",
+                "trigger": IntervalTrigger(minutes=30),
+                "func": self._downloads.cleanup,
+                "kwargs": {},
+            }
+        ]

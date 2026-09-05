@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         MoviePilot 115 浏览器下载
+// @name         MoviePilot 聚合资源浏览器下载
 // @namespace    https://github.com/CelestialRipple/115-doc
-// @version      0.13.0
+// @version      0.14.0
 // @description  点击腾讯文档115搜索结果后使用浏览器直链下载，不创建下载器任务
 // @match        http://*/*
 // @match        https://*/*
@@ -13,11 +13,29 @@
   'use strict';
   // 安装后应在脚本管理器中将匹配范围限制为自己的 MoviePilot 地址。
   // 只读取同源搜索响应，不读取登录 Token，不发送额外网络请求。
+  if (window.__mpAggregateBrowserAdapter) return;
+  window.__mpAggregateBrowserAdapter = true;
+  const pluginNames = ['腾讯文档115媒体库', 'PanSou聚合搜索', 'BT4G网页搜索'];
   const pluginName = '腾讯文档115媒体库';
   const prefix = '/api/v1/plugin/TencentDoc115Library/resources/browser/';
   const records = new Map();
   function browserUrl(torrent, origin = location.origin) {
     try {
+      if (['PanSou聚合搜索', 'BT4G网页搜索'].includes(torrent?.site_name)) {
+        const marker = /^pansou:\/\/([a-f0-9]{32})$/.exec(torrent.enclosure || '');
+        if (!marker) return '';
+        const detail = new URL(torrent.page_url, origin);
+        if (detail.origin !== origin || detail.pathname !== '/api/v1/plugin/PanSouAggregate/resource/' + marker[1]
+            || !detail.hash.startsWith('#mp-pansou=')) return '';
+        const raw = new URLSearchParams(detail.hash.slice('#mp-pansou='.length)).get('url');
+        if (!raw) return '';
+        const target = new URL(raw, origin);
+        if (target.origin !== origin || target.pathname !== '/api/v1/plugin/PanSouAggregate/download/' + marker[1]
+            || !/^[a-f0-9]{64}$/.test(target.searchParams.get('sig') || '')
+            || !/^\d{1,12}$/.test(target.searchParams.get('expires') || '')
+            || Number(target.searchParams.get('expires')) * 1000 <= Date.now()) return '';
+        return target.href;
+      }
       if (torrent?.site_name !== pluginName) return '';
       const marker = new URL(torrent.enclosure);
       const id = marker.searchParams.get('x.td115');
@@ -86,7 +104,7 @@
     // 同名不同分享绝不能猜测；让用户从本次真实搜索结果中选取。
     const dialog = document.createElement('dialog');
     const heading = document.createElement('h3');
-    heading.textContent = '选择要下载的 115 资源';
+    heading.textContent = '选择资源';
     dialog.append(heading);
     items.forEach((item, index) => {
       const link = document.createElement('a');
@@ -110,9 +128,11 @@
     if (event.type === 'keydown' && event.key !== 'Enter') return;
     if (event.target.closest('a,button,input,select,textarea')) return;
     const card = event.target.closest('.torrent-card,.torrent-item');
-    if (!card || (!card.textContent.includes(pluginName) && !card.querySelector('[title="腾讯文档115媒体库"]'))) return;
+    if (!card) return;
+    const siteName = pluginNames.find(name => card.textContent.includes(name) || card.querySelector(`[title="${name}"]`));
+    if (!siteName) return;
     const title = card.querySelector('.text-subtitle-2[title]')?.getAttribute('title');
-    const candidates = [...records.values()].filter(item => item.title === title && browserUrl(item.torrent));
+    const candidates = [...records.values()].filter(item => item.title === title && item.torrent.site_name === siteName && browserUrl(item.torrent));
     // 没有精确匹配时不劫持；插件默认也会拒绝创建旧下载器任务。
     if (!candidates.length) return;
     const description = card.querySelector('.text-body-2[title]')?.getAttribute('title');

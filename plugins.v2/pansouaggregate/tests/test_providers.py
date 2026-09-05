@@ -4,7 +4,6 @@ from unittest.mock import Mock
 import pytest
 
 from pansouaggregate.providers import (
-    BT4GClient,
     ChallengeRequired,
     PanSouClient,
     ProviderError,
@@ -12,7 +11,6 @@ from pansouaggregate.providers import (
     clean_link,
     dedupe,
     normalize_pansou,
-    parse_bt4g,
     read_response,
 )
 
@@ -88,47 +86,6 @@ def test_pansou_nested_and_results_format():
         normalize_pansou({"error": "authentication failed"})
 
 
-def test_bt4g_details_are_not_fabricated_magnets():
-    items = parse_bt4g(
-        '<h5><a href="/magnet/1234567890">Big Buck Bunny</a></h5><h5><a href="https://evil.test/magnet/abc">Ad</a></h5>',
-        "https://bt4gprx.com",
-    )
-    assert len(items) == 1
-    assert items[0].cloud == "bt4g"
-    assert items[0].url.endswith("/magnet/1234567890")
-
-
-def test_live_bt4g_notion_layout_uses_total_size_not_first_file_size():
-    # Minimal fixture from the user-verified public Big Buck Bunny search page.
-    html = '<div class="notion-list-item"><div class="notion-list-item-title"><a href="/magnet/kzb8HRBQ62h4eEUGBY6bKvf5ZIzBIqezD"><b>Big Buck Bunny</b> both discs</a></div><div class="notion-file-row">VIDEO_TS.BUP <span>24.00KB</span></div><div class="notion-list-item-meta">Total Size: <b class="cpill red-pill">13.69GB</b><span class="notion-seeders">2</span></div></div>'
-    items = parse_bt4g(html, "https://bt4gprx.com")
-    assert items[0].title == "Big Buck Bunny both discs"
-    assert items[0].size == int(13.69 * 1024**3)
-    assert items[0].seeders == 2
-
-
-def test_live_detail_extracts_explicit_hash_without_visiting_download_host():
-    body = '<h1 class="notion-detail-title">Big Buck Bunny</h1><div class="notion-btn-group"><a href="//downloadtorrentfile.com/hash/6d2d195d2e79fb1719d55ffc1982ff09bc0eaed7?name=Big-Buck-Bunny">Magnet Link</a></div>'
-    items = parse_bt4g(
-        body, "https://bt4gprx.com/magnet/sBWeZGLRdNGXO4NrnQbtT1TYPBbGSoy9A"
-    )
-    assert items[0].cloud == "magnet"
-    assert "6d2d195d2e79fb1719d55ffc1982ff09bc0eaed7" in items[0].url
-    assert "sBWeZ" not in items[0].url
-
-
-def test_bt4g_magnet_size_and_empty_layout_failure():
-    items = parse_bt4g(
-        f'<li><h5>Movie</h5>1.5 GB<a href="{MAGNET}">Download</a></li>',
-        "https://bt4gprx.com",
-    )
-    assert items[0].size == 1610612736
-    assert items[0].title == "Movie"
-    assert parse_bt4g("<p>No results</p>", "https://bt4gprx.com") == []
-    with pytest.raises(ProviderError):
-        parse_bt4g("<title>Changed site layout</title>", "https://bt4gprx.com")
-
-
 def response(status=200, body=b"{}", headers=None):
     response = Mock(status_code=status, headers=headers or {})
     response.iter_content.return_value = [body]
@@ -192,14 +149,3 @@ def test_pansou_endpoint_and_authorization(monkeypatch):
     assert calls[0][0] == "http://nas/api/auth/login"
     assert calls[1][1]["headers"]["Authorization"] == "Bearer test-token"
     assert calls[1][1]["json"]["cloud_types"] == ["115", "magnet"]
-
-
-def test_bt4g_does_not_receive_pansou_token(monkeypatch):
-    def read(session, method, url, **kwargs):
-        assert "Authorization" not in kwargs["headers"]
-        assert "private" not in str(kwargs)
-        assert "q=Big+Buck+Bunny" in url
-        return "<p>No results</p>"
-
-    monkeypatch.setattr("pansouaggregate.providers.read_response", read)
-    assert BT4GClient({"pansou_token": "private"}).search("Big Buck Bunny") == []

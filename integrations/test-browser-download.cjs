@@ -22,7 +22,7 @@ function environment() {
     get textContent() { return this.item.compact ? this.item.site_name[0] : this.item.site_name; }
     closest(selector) { return selector.startsWith('a,') ? (this.interactive ? this : null) : this; }
     querySelector(selector) {
-      if (selector.startsWith('[title=')) return this.item.site_name === '腾讯文档115媒体库' ? this : null;
+      if (selector.startsWith('[title=')) return selector === `[title="${this.item.site_name}"]` ? this : null;
       return { getAttribute: () => selector.includes('subtitle') ? this.item.title : this.item.description };
     }
   }
@@ -104,4 +104,51 @@ test('native frontend helper consumes the same capability without a downloader c
     global.window = priorWindow;
     global.location = priorLocation;
   }
+});
+
+function aggregateTorrent(site_name = 'PanSou聚合搜索', id = 'a'.repeat(32)) {
+  const query = new URLSearchParams({expires: Math.floor(Date.now()/1000)+3600, sig:'b'.repeat(64)});
+  const target = `/api/v1/plugin/PanSouAggregate/download/${id}?${query}`;
+  return {title:'Movie', description:'PanSou · 115', site_name, enclosure:`pansou://${id}`,
+    page_url:`/api/v1/plugin/PanSouAggregate/resource/${id}?${query}#mp-pansou=${new URLSearchParams({url:target})}`};
+}
+test('PanSou and BT4G native clicks open scoped browser routes without downloader', () => {
+  for (const name of ['PanSou聚合搜索', 'BT4G网页搜索']) {
+    const env=environment(), item=aggregateTorrent(name);
+    env.source.emit({torrent_info:item});
+    assert.equal(env.click(item).stopped,true);
+    assert.equal(env.opened.length,1);
+    assert.ok(env.opened[0][0].includes('/PanSouAggregate/download/'));
+    assert.equal(env.click(item,true).stopped,undefined);
+    assert.equal(env.click({...item,compact:true}).stopped,true);
+  }
+});
+test('same-title document and PanSou cards cannot open each other', () => {
+  const env=environment(), a=aggregateTorrent(), b=torrent('one',{title:a.title,description:a.description});
+  env.source.emit([a,b]);
+  env.click(a);
+  assert.equal(env.opened.length,1);
+  assert.ok(env.opened[0][0].includes('/PanSouAggregate/'));
+  assert.equal(env.dialogs.length,0);
+});
+test('PanSou rejects forged cross-origin, expired and mismatched capabilities', () => {
+  for (const target of ['https://evil.example/file',
+    '/api/v1/plugin/PanSouAggregate/download/'+ 'c'.repeat(32)+'?expires=9999999999&sig='+'b'.repeat(64),
+    '/api/v1/plugin/PanSouAggregate/download/'+ 'a'.repeat(32)+'?expires=1&sig='+'b'.repeat(64)]) {
+    const env=environment(),item=aggregateTorrent();
+    item.page_url=item.page_url.split('#')[0]+'#mp-pansou='+new URLSearchParams({url:target});
+    env.source.emit(item);
+    assert.equal(env.click(item).stopped,undefined);
+    assert.equal(env.opened.length,0);
+  }
+});
+test('native source helper handles both new aggregate sources', () => {
+  const {openPluginBrowserDownload}=require('./moviepilotBrowserDownload.ts');
+  const oldWindow=global.window,oldLocation=global.location,opened=[];
+  global.window={open:(...a)=>opened.push(a)};global.location={origin};
+  try {
+    assert.equal(openPluginBrowserDownload(aggregateTorrent()),true);
+    assert.equal(openPluginBrowserDownload(aggregateTorrent('BT4G网页搜索')),true);
+    assert.equal(opened.length,2);
+  } finally {global.window=oldWindow;global.location=oldLocation;}
 });
