@@ -1123,6 +1123,7 @@ class LibraryBuilder:
         retry_failed: bool = False,
         known_usage_bytes: Optional[int] = None,
         resource_ids: Optional[List[str]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """
         限量处理待生成资源
@@ -1154,6 +1155,31 @@ class LibraryBuilder:
             Future,
             Tuple[Dict[str, Any], Path, str, Any],
         ] = {}
+        progress_total = 0
+
+        def notify_progress(
+            resource: Optional[Dict[str, Any]],
+            stage: str,
+        ) -> None:
+            """向手动导入等调用方报告轻量进度，回调异常不影响构建。"""
+            if not progress_callback:
+                return
+            try:
+                progress_callback(
+                    {
+                        "stage": stage,
+                        "total": progress_total,
+                        "processed": processed,
+                        "completed": success_count + failed_count,
+                        "success": success_count,
+                        "failed": failed_count,
+                        "current_title": str(
+                            (resource or {}).get("title") or ""
+                        ),
+                    }
+                )
+            except Exception as error:
+                logger.warning(f"媒体库生成进度回调失败：{error}")
 
         def finish_scrapes(done: Any) -> None:
             """收集并发刮削结果，逐条写回可恢复状态。"""
@@ -1177,6 +1203,7 @@ class LibraryBuilder:
                     logger.warning(
                         f"并行刮削失败：{resource['title']} - {str(error)}"
                     )
+                    notify_progress(resource, "finished")
                     continue
                 self.store.update_resource_status(
                     resource["resource_id"],
@@ -1196,6 +1223,7 @@ class LibraryBuilder:
                 self._remember_metadata(resource, mediainfo, directory)
                 success_count += 1
                 logger.info(f"STRM 资源生成完成：{resource['title']}")
+                notify_progress(resource, "finished")
         try:
             config = self.config_provider()
             scrape_enabled = bool(config.get("scrape_metadata", True))
@@ -1234,6 +1262,8 @@ class LibraryBuilder:
                 retry_failed=retry_failed,
                 resource_ids=resource_ids,
             )
+            progress_total = len(resources)
+            notify_progress(None, "starting")
             for resource in resources:
                 if scrape_executor and len(pending_scrapes) >= scrape_workers:
                     done, _ = wait(
@@ -1250,6 +1280,8 @@ class LibraryBuilder:
                 directory: Optional[Path] = None
                 directory_size_before = 0
                 current_stage = "validating"
+                deferred_scrape = False
+                notify_progress(resource, current_stage)
                 try:
                     self.store.update_resource_status(
                         resource["resource_id"],
@@ -1282,6 +1314,7 @@ class LibraryBuilder:
                     media_type = self._media_type(resource, source_files)
                     mixed_resource = self._is_mixed_resource(resource)
                     current_stage = "recognizing"
+                    notify_progress(resource, current_stage)
                     self.store.update_resource_status(
                         resource["resource_id"],
                         "processing",
@@ -1302,6 +1335,7 @@ class LibraryBuilder:
                         meta, mediainfo = self._fallback_media(resource, media_type)
                     self._save_detected_type(resource, media_type)
                     current_stage = "generating"
+                    notify_progress(resource, current_stage)
                     self.store.update_resource_status(
                         resource["resource_id"],
                         "processing",
@@ -1328,10 +1362,10 @@ class LibraryBuilder:
                             directory=directory,
                             source_files=source_files,
                         )
-                    deferred_scrape = False
                     metadata_reused = False
                     if scrape_enabled and not recognition_error:
                         current_stage = "scraping"
+                        notify_progress(resource, current_stage)
                         self.store.update_resource_status(
                             resource["resource_id"],
                             "processing",
@@ -1486,6 +1520,8 @@ class LibraryBuilder:
                             directory_size(directory) - directory_size_before,
                             0,
                         )
+                    if not deferred_scrape:
+                        notify_progress(resource, "finished")
                 if limit_bytes and usage_bytes >= limit_bytes:
                     space_limit_reached = True
                     break
@@ -1509,6 +1545,7 @@ class LibraryBuilder:
             else:
                 status = "completed"
                 message = "媒体库生成批次已结束"
+            notify_progress(None, status)
             return {
                 "status": status,
                 "message": message,

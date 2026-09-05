@@ -197,6 +197,7 @@ def test_mixed_sheet_accepts_moviepilot_tv_result_and_changes_group(
 
     original_media_chain = library_module.MediaChain
     library_module.MediaChain = TelevisionMediaChain
+    progress = []
     try:
         builder = LibraryBuilder(
             store=store,
@@ -211,7 +212,10 @@ def test_mixed_sheet_accepts_moviepilot_tv_result_and_changes_group(
         )
         # 模拟表格标签把动画剧集预判为电影；最终以 MoviePilot 返回类型为准。
         builder._media_type = lambda _resource, _files=None: MediaType.MOVIE
-        result = builder.build(limit=1)
+        result = builder.build(
+            limit=1,
+            progress_callback=lambda item: progress.append(dict(item)),
+        )
     finally:
         library_module.MediaChain = original_media_chain
 
@@ -223,6 +227,16 @@ def test_mixed_sheet_accepts_moviepilot_tv_result_and_changes_group(
     episode_strms = list(Path(updated["strm_path"]).rglob("*.strm"))
     assert len(episode_strms) == 1
     assert episode_strms[0].parent.name == "Season 02"
+    assert {item["stage"] for item in progress} >= {
+        "starting",
+        "validating",
+        "recognizing",
+        "generating",
+        "finished",
+        "completed",
+    }
+    assert progress[-1]["completed"] == 1
+    assert progress[-1]["success"] == 1
 
 
 def test_tv_iso_disc_numbers_are_used_as_episode_numbers(tmp_path: Path) -> None:

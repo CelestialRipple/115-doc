@@ -59,6 +59,8 @@ def main() -> None:
         assert "/migrate-output" in api_paths
         assert "/resources/retry-all" in api_paths
         assert "/resources/import-manual" in api_paths
+        assert "/resources/import-manual-page" in api_paths
+        assert "/resources/import-status" in api_paths
         assert "/resources/save/{resource_id}" in api_paths
         assert "/gateway/restart" in api_paths
         assert "/clear-all" in api_paths
@@ -68,7 +70,9 @@ def main() -> None:
         assert "内置直链网关" in page_text
         assert "清空并重新开始" in page_text
         assert "迁移现有目录" in page_text
-        assert "导入自定义资源" in page_text
+        assert "添加自选资源" in page_text
+        assert "自选资源导入进度" in page_text
+        assert "manual_import_links" not in str(plugin.get_form()[0])
 
         output_root = Path(temporary_directory) / "output"
         output_root.mkdir()

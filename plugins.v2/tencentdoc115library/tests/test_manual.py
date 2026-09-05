@@ -54,6 +54,25 @@ def test_manual_import_persists_files_and_skips_unchanged_share(tmp_path):
     assert store.list_resource_files(resource["resource_id"])[0]["file_id"] == "file-1"
 
 
+def test_manual_import_reports_link_resolution_progress(tmp_path):
+    store = CatalogStore(tmp_path / "catalog.db")
+    importer = ManualLibraryImporter(store, FakeResolver(), Event())
+    progress = []
+
+    result = importer.import_links(
+        "电影甲|https://115.com/s/first\n电影乙|https://115.com/s/second",
+        "自选",
+        "movie",
+        progress_callback=lambda item: progress.append(dict(item)),
+    )
+
+    assert result["imported"] == 2
+    assert progress[0]["current"] == 0
+    assert progress[-1]["current"] == 2
+    assert progress[-1]["imported"] == 2
+    assert progress[-1]["current_title"] == "电影乙"
+
+
 def test_targeted_build_candidates_do_not_consume_other_pending_rows(tmp_path):
     store = CatalogStore(tmp_path / "catalog.db")
     resolver = FakeResolver()

@@ -71,6 +71,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "document_url": "",
     "document_urls": "",
     "manual_import_links": "",
+    "manual_import_token": "",
     "manual_import_group": "自定义",
     "manual_import_media_mode": "mixed",
     "client_id": "",
@@ -128,7 +129,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.12.0"
+    plugin_version = "0.12.1"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -144,6 +145,7 @@ class TencentDoc115Library(_PluginBase):
         self._pause_event = Event()
         self._task_lock = Lock()
         self._pipeline_lock = Lock()
+        self._manual_import_lock = Lock()
         self._search_id_lock = Lock()
         self._imdb_tmdb_cache: Dict[str, Tuple[str, ...]] = {}
         self._future: Optional[Future] = None
@@ -171,6 +173,23 @@ class TencentDoc115Library(_PluginBase):
             "success": 0,
             "failed": 0,
         }
+        self._manual_import_status: Dict[str, Any] = {
+            "state": "idle",
+            "phase": "idle",
+            "message": "尚未执行自定义资源导入",
+            "total": 0,
+            "current": 0,
+            "current_title": "",
+            "imported": 0,
+            "unchanged": 0,
+            "link_failed": 0,
+            "build_total": 0,
+            "build_processed": 0,
+            "build_completed": 0,
+            "success": 0,
+            "build_failed": 0,
+            "stage": "idle",
+        }
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """加载配置并初始化持久化和任务组件。"""
@@ -197,6 +216,13 @@ class TencentDoc115Library(_PluginBase):
                 config_changed = True
         if not self._config.get("playback_token"):
             self._config["playback_token"] = token_urlsafe(32)
+            config_changed = True
+        if not self._config.get("manual_import_token"):
+            self._config["manual_import_token"] = token_urlsafe(32)
+            config_changed = True
+        if self._config.get("manual_import_links"):
+            # v0.12.1 起表单内容只随当前请求处理，不再持久化资源链接。
+            self._config["manual_import_links"] = ""
             config_changed = True
         if config_changed:
             self.update_config(dict(self._config))
@@ -846,48 +872,215 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         """解析手动资源，并只构建本次新增或变化的资源。"""
         if not self._manual_importer or not self._builder:
             return {"status": "failed", "message": "插件尚未初始化"}
-        imported = self._manual_importer.import_links(
-            links,
-            group_name,
-            media_mode,
+        total = len(self._manual_importer.parse_entries(links))
+        self._set_manual_import_status(
+            state="running",
+            phase="resolving",
+            message="正在解析自定义资源链接",
+            total=total,
+            current=0,
+            current_title="",
+            imported=0,
+            unchanged=0,
+            link_failed=0,
+            build_total=0,
+            build_processed=0,
+            build_completed=0,
+            success=0,
+            build_failed=0,
+            stage="resolving",
         )
+
+        def import_progress(progress: Dict[str, Any]) -> None:
+            self._set_manual_import_status(
+                state="running",
+                phase="resolving",
+                message="正在解析并登记资源",
+                total=int(progress.get("total") or total),
+                current=int(progress.get("current") or 0),
+                current_title=str(progress.get("current_title") or ""),
+                imported=int(progress.get("imported") or 0),
+                unchanged=int(progress.get("unchanged") or 0),
+                link_failed=int(progress.get("failed") or 0),
+                stage="resolving",
+            )
+
+        try:
+            imported = self._manual_importer.import_links(
+                links,
+                group_name,
+                media_mode,
+                progress_callback=import_progress,
+            )
+        except Exception as error:
+            self._set_manual_import_status(
+                state="failed",
+                phase="failed",
+                message=f"自定义资源导入失败：{error}",
+            )
+            raise
         queued_ids = list(imported.get("queued_ids") or [])
         if imported.get("paused"):
+            self._set_manual_import_status(
+                state="paused",
+                phase="paused",
+                message="自定义资源导入已暂停",
+            )
             return {
                 **imported,
                 "status": "paused",
                 "message": "手动导入已暂停；已保存的资源和文件列表不会丢失",
             }
         if imported.get("interrupted"):
+            self._set_manual_import_status(
+                state="stopped",
+                phase="stopped",
+                message="自定义资源导入已停止",
+            )
             return {
                 **imported,
                 "status": "interrupted",
                 "message": "手动导入已停止；已保存的资源不会丢失",
             }
         if not queued_ids:
+            message = (
+                f"导入完成：0 条需要生成，{imported['unchanged']} 条未变化，"
+                f"{imported['failed']} 条链接无效或解析失败"
+            )
+            self._set_manual_import_status(
+                state="completed",
+                phase="completed",
+                message=message,
+                current=total,
+                current_title="",
+                imported=int(imported.get("imported") or 0),
+                unchanged=int(imported.get("unchanged") or 0),
+                link_failed=int(imported.get("failed") or 0),
+            )
             return {
                 **imported,
                 "status": "completed",
-                "message": (
-                    f"手动导入完成：0 条需要生成，{imported['unchanged']} 条未变化，"
-                    f"{imported['failed']} 条链接无效或解析失败"
-                ),
+                "message": message,
             }
-        built = self._builder.build(
-            limit=len(queued_ids),
-            resource_ids=queued_ids,
+
+        self._set_manual_import_status(
+            state="running",
+            phase="building",
+            message="链接解析完成，正在识别、刮削并生成 STRM",
+            current=total,
+            current_title="",
+            imported=int(imported.get("imported") or 0),
+            unchanged=int(imported.get("unchanged") or 0),
+            link_failed=int(imported.get("failed") or 0),
+            build_total=len(queued_ids),
+            stage="starting",
+        )
+
+        def build_progress(progress: Dict[str, Any]) -> None:
+            self._set_manual_import_status(
+                state="running",
+                phase="building",
+                message="正在识别、刮削并生成 STRM",
+                current_title=str(progress.get("current_title") or ""),
+                build_total=int(progress.get("total") or len(queued_ids)),
+                build_processed=int(progress.get("processed") or 0),
+                build_completed=int(progress.get("completed") or 0),
+                success=int(progress.get("success") or 0),
+                build_failed=int(progress.get("failed") or 0),
+                stage=str(progress.get("stage") or "building"),
+            )
+
+        try:
+            built = self._builder.build(
+                limit=len(queued_ids),
+                resource_ids=queued_ids,
+                progress_callback=build_progress,
+            )
+        except Exception as error:
+            self._set_manual_import_status(
+                state="failed",
+                phase="failed",
+                message=f"自定义资源生成失败：{error}",
+            )
+            raise
+        message = (
+            f"自定义导入 {imported['imported']} 条，"
+            f"STRM/刮削 {built.get('success', 0)} 成功、"
+            f"{built.get('failed', 0)} 失败；"
+            f"另有 {imported['unchanged']} 条未变化、"
+            f"{imported['failed']} 条链接无效或解析失败"
+        )
+        built_status = str(built.get("status") or "completed")
+        final_state = (
+            "paused"
+            if built_status == "paused"
+            else "stopped"
+            if built_status in {"stopped", "interrupted"}
+            else "failed"
+            if built_status in {"failed", "busy", "space_limit"}
+            else "completed"
+        )
+        self._set_manual_import_status(
+            state=final_state,
+            phase=final_state,
+            message=message,
+            current_title="",
+            build_processed=int(built.get("processed") or 0),
+            build_completed=(
+                int(built.get("success") or 0) + int(built.get("failed") or 0)
+            ),
+            success=int(built.get("success") or 0),
+            build_failed=int(built.get("failed") or 0),
+            stage=built_status,
         )
         return {
             **imported,
             **built,
-            "message": (
-                f"手动导入 {imported['imported']} 条，"
-                f"STRM/刮削 {built.get('success', 0)} 成功、"
-                f"{built.get('failed', 0)} 失败；"
-                f"另有 {imported['unchanged']} 条未变化、"
-                f"{imported['failed']} 条链接无效或解析失败"
-            ),
+            "message": message,
         }
+
+    def _set_manual_import_status(self, **values: Any) -> None:
+        """线程安全地更新详情页与导入页共用的进度。"""
+        with self._manual_import_lock:
+            self._manual_import_status.update(values)
+
+    def _manual_import_snapshot(self) -> Dict[str, Any]:
+        """返回不含资源链接的自定义导入进度。"""
+        with self._manual_import_lock:
+            status = dict(self._manual_import_status)
+        state = str(status.get("state") or "idle")
+        phase = str(status.get("phase") or "idle")
+        if state == "completed":
+            percent = 100
+        elif state in {"failed", "paused", "stopped"}:
+            if int(status.get("build_total") or 0):
+                percent = 40 + round(
+                    int(status.get("build_completed") or 0)
+                    * 60
+                    / max(int(status.get("build_total") or 0), 1)
+                )
+            else:
+                percent = round(
+                    int(status.get("current") or 0)
+                    * 40
+                    / max(int(status.get("total") or 0), 1)
+                )
+        elif phase == "resolving":
+            percent = round(
+                int(status.get("current") or 0)
+                * 40
+                / max(int(status.get("total") or 0), 1)
+            )
+        elif phase == "building":
+            percent = 40 + round(
+                int(status.get("build_completed") or 0)
+                * 60
+                / max(int(status.get("build_total") or 0), 1)
+            )
+        else:
+            percent = 0
+        status["percent"] = min(max(percent, 0), 100)
+        return status
 
     def import_manual_resources(
         self,
@@ -897,31 +1090,213 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         if not self._manual_importer or not self._builder:
             return Response(success=False, message="插件尚未初始化")
         action = payload or ManualImportRequest()
-        links = str(action.links or self._config.get("manual_import_links") or "")
+        links = str(
+            self._config.get("manual_import_links") or ""
+            if action.links is None
+            else action.links
+        )
         group_name = str(
-            action.group_name or self._config.get("manual_import_group") or ""
+            self._config.get("manual_import_group") or ""
+            if action.group_name is None
+            else action.group_name
         ).strip()
         media_mode = str(
-            action.media_mode
-            or self._config.get("manual_import_media_mode")
-            or "mixed"
+            (self._config.get("manual_import_media_mode") or "mixed")
+            if action.media_mode is None
+            else action.media_mode
         ).strip().lower()
         try:
-            if not group_name:
-                raise ManualImportError("请填写自定义资源输出文件夹")
+            if (
+                not group_name
+                or len(group_name) > 120
+                or group_name in {".", ".."}
+                or "/" in group_name
+                or "\\" in group_name
+            ):
+                raise ManualImportError(
+                    "文件夹名称不能为空、不能包含斜杠，且最多 120 个字符"
+                )
             if media_mode not in {"movie", "tv", "mixed"}:
                 raise ManualImportError("媒体类型必须是电影、剧集或自动识别")
             if not self._manual_importer.parse_entries(links):
                 raise ManualImportError("没有识别到有效的115分享、磁力或ED2K链接")
         except ManualImportError as error:
             return Response(success=False, message=str(error))
-        return self._submit(
+        previous_status = self._manual_import_snapshot()
+        self._set_manual_import_status(
+            state="queued",
+            phase="queued",
+            message="自定义资源导入已排队",
+            total=len(self._manual_importer.parse_entries(links)),
+            current=0,
+            current_title="",
+            imported=0,
+            unchanged=0,
+            link_failed=0,
+            build_total=0,
+            build_processed=0,
+            build_completed=0,
+            success=0,
+            build_failed=0,
+            stage="queued",
+            percent=0,
+        )
+        response = self._submit(
             "导入自定义资源",
             self._import_manual_resources,
             links,
             group_name,
             media_mode,
         )
+        if not response.success:
+            with self._manual_import_lock:
+                self._manual_import_status = previous_status
+        return response
+
+    def _manual_import_page_url(self) -> str:
+        """生成插件详情页“添加自选”按钮使用的轻量表单地址。"""
+        query = urlencode(
+            {"token": str(self._config.get("manual_import_token") or "")}
+        )
+        return (
+            "/api/v1/plugin/TencentDoc115Library/"
+            f"resources/import-manual-page?{query}"
+        )
+
+    async def manual_import_page(
+        self,
+        request: Request,
+        token: str = Query(default=""),
+    ) -> HttpResponse:
+        """显示自定义资源表单，并把提交内容直接加入后台构建任务。"""
+        expected_token = str(self._config.get("manual_import_token") or "")
+        if not expected_token or not compare_digest(token, expected_token):
+            return HTMLResponse("<h2>导入密钥无效</h2>", status_code=401)
+        links = ""
+        group_name = "自定义"
+        media_mode = "mixed"
+        message = ""
+        success: Optional[bool] = None
+        if request.method.upper() == "POST":
+            form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
+            links = str((form.get("links") or [""])[0])
+            group_name = str((form.get("group_name") or ["自定义"])[0]).strip()
+            media_mode = str((form.get("media_mode") or ["mixed"])[0]).lower()
+            response = self.import_manual_resources(
+                ManualImportRequest(
+                    links=links,
+                    group_name=group_name,
+                    media_mode=media_mode,
+                )
+            )
+            success = bool(response.success)
+            message = str(response.message or "已提交")
+            if success:
+                links = ""
+        return HTMLResponse(
+            self._manual_import_page_html(
+                links=links,
+                group_name=group_name,
+                media_mode=media_mode,
+                message=message,
+                success=success,
+            )
+        )
+
+    def manual_import_progress(
+        self,
+        token: str = Query(default=""),
+    ) -> HttpResponse:
+        """供轻量导入页轮询，不返回输入链接或任何账户凭据。"""
+        expected_token = str(self._config.get("manual_import_token") or "")
+        if not expected_token or not compare_digest(token, expected_token):
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "message": "导入密钥无效"},
+            )
+        return JSONResponse(
+            content={"success": True, "data": self._manual_import_snapshot()}
+        )
+
+    @staticmethod
+    def _manual_import_page_html(
+        links: str,
+        group_name: str,
+        media_mode: str,
+        message: str = "",
+        success: Optional[bool] = None,
+    ) -> str:
+        """渲染不依赖 MoviePilot 前端扩展的自选资源导入页。"""
+        options = "".join(
+            f'<option value="{value}"{(" selected" if media_mode == value else "")}>{label}</option>'
+            for value, label in (
+                ("movie", "电影"),
+                ("tv", "剧集"),
+                ("mixed", "自动识别并分流"),
+            )
+        )
+        message_html = ""
+        if message:
+            color = "#46c37b" if success else "#ff6b6b"
+            message_html = (
+                f'<p class="message" style="color:{color}">{escape(message)}</p>'
+            )
+        return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>添加自选资源</title><style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+background:#10131a;color:#eef2f7;margin:0;padding:20px}}
+main{{max-width:680px;margin:4vh auto;background:#1b202b;border-radius:16px;
+padding:26px;box-shadow:0 12px 40px #0006}}
+p{{color:#b8c0cc;line-height:1.6}}label{{display:block;margin:15px 0 7px}}
+textarea,input,select{{box-sizing:border-box;width:100%;border:1px solid #465064;
+border-radius:9px;background:#111620;color:#eef2f7;padding:11px;font-size:15px}}
+textarea{{min-height:170px;resize:vertical}}small{{display:block;color:#8e99aa;margin-top:6px}}
+.row{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}button{{margin-top:18px;
+border:0;border-radius:10px;background:#1976d2;color:white;font-size:16px;
+padding:12px 22px;cursor:pointer}}.message{{font-weight:600}}
+.status{{margin-top:24px;padding:18px;background:#111620;border-radius:12px}}
+.bar{{height:12px;background:#30394a;border-radius:999px;overflow:hidden}}
+.fill{{height:100%;width:0;background:#46c37b;transition:width .3s}}
+#detail{{font-size:14px;color:#aeb8c7}}@media(max-width:600px){{.row{{grid-template-columns:1fr}}}}
+</style></head><body><main><h2>添加自选资源</h2>
+<p>提交后会立即在后台解析、识别、刮削并生成 STRM，不会把链接保存到插件设置。</p>
+{message_html}<form method="post">
+<label>115分享 / 磁力 / ED2K</label>
+<textarea name="links" required placeholder="每行一条；也支持 标题|链接 或 标题|年份|链接">{escape(links)}</textarea>
+<small>一次最多100条；115访问码可直接放在链接参数中。</small>
+<div class="row"><div><label>输出文件夹</label>
+<input name="group_name" value="{escape(group_name, quote=True)}" maxlength="120" required>
+<small>位于输出根目录下，与“星火”等目录同级。</small></div>
+<div><label>媒体类型</label><select name="media_mode">{options}</select></div></div>
+<button type="submit">开始导入并生成</button></form>
+<section class="status"><strong id="state">正在读取进度…</strong>
+<p id="summary"></p><div class="bar"><div class="fill" id="fill"></div></div>
+<p id="detail"></p></section></main>
+<script>
+const labels={{idle:'空闲',queued:'已排队',running:'运行中',completed:'已完成',
+failed:'失败',paused:'已暂停',stopped:'已停止'}};
+const stages={{idle:'',queued:'等待后台线程',resolving:'解析链接',starting:'准备生成',
+validating:'校验资源',recognizing:'识别媒体',generating:'生成STRM',scraping:'刮削元数据',
+finished:'完成当前资源',completed:'全部完成',space_limit:'空间达到上限',busy:'生成器忙碌'}};
+async function refresh(){{try{{
+  const response=await fetch('import-status'+window.location.search,{{cache:'no-store'}});
+  const body=await response.json(); if(!body.success) throw new Error(body.message);
+  const s=body.data||{{}}; document.getElementById('state').textContent=
+    '导入状态：'+(labels[s.state]||s.state||'未知')+' · '+(s.percent||0)+'%';
+  document.getElementById('fill').style.width=(s.percent||0)+'%';
+  document.getElementById('summary').textContent=s.message||'';
+  const current=s.current_title?(' · 当前：'+s.current_title):'';
+  document.getElementById('detail').textContent=
+    '链接 '+(s.current||0)+'/'+(s.total||0)+'，新增 '+(s.imported||0)+
+    '，未变化 '+(s.unchanged||0)+'，链接失败 '+(s.link_failed||0)+
+    '；生成 '+(s.build_completed||0)+'/'+(s.build_total||0)+
+    '，成功 '+(s.success||0)+'，失败 '+(s.build_failed||0)+
+    ' · '+(stages[s.stage]||s.stage||'')+current;
+}}catch(error){{document.getElementById('state').textContent='进度读取失败：'+error.message;}}}}
+refresh(); setInterval(refresh,1000);
+</script></body></html>"""
 
     def _set_pipeline_status(self, **values: Any) -> None:
         """线程安全地更新一键同步流水线状态。"""
@@ -1441,6 +1816,20 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                 "methods": ["POST"],
                 "summary": "导入115分享、磁力或ED2K并生成媒体库",
                 "auth": "bear",
+            },
+            {
+                "path": "/resources/import-manual-page",
+                "endpoint": self.manual_import_page,
+                "methods": ["GET", "POST"],
+                "summary": "自选资源即时导入页面",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/resources/import-status",
+                "endpoint": self.manual_import_progress,
+                "methods": ["GET"],
+                "summary": "查询自选资源导入进度",
+                "allow_anonymous": True,
             },
             {
                 "path": "/resources/save/{resource_id}",
@@ -2011,69 +2400,6 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                     {
                         "component": "div",
                         "props": {"class": "text-h6 mb-2"},
-                        "text": "自定义资源链接",
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "tonal",
-                            "class": "mb-3",
-                            "text": (
-                                "填写后先保存设置，再到详情页点击“导入自定义资源”。"
-                                "115分享会匿名解析；磁力/ED2K只先识别和生成STRM，首次播放才提交115离线任务；"
-                                "同一批链接使用下方同一个文件夹和媒体类型。"
-                            ),
-                        },
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self._textarea_field(
-                                "manual_import_links",
-                                "115分享/磁力/ED2K（每行一条，最多100条）",
-                                "支持：链接；标题|链接；标题|年份|链接。115访问码可放在链接参数中。",
-                            ),
-                            self._text_field(
-                                "manual_import_group",
-                                "输出文件夹",
-                                6,
-                                hint="例如：自定义、朋友分享；作为输出根目录下的一级分组",
-                            ),
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "manual_import_media_mode",
-                                            "label": "媒体类型",
-                                            "items": [
-                                                {"title": "电影", "value": "movie"},
-                                                {"title": "剧集", "value": "tv"},
-                                                {
-                                                    "title": "自动识别并分流",
-                                                    "value": "mixed",
-                                                },
-                                            ],
-                                            "item-title": "title",
-                                            "item-value": "value",
-                                            "persistent-hint": True,
-                                            "hint": "自动模式会按文件特征和 MoviePilot 识别结果分到电影或“文件夹-剧集”",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VDivider",
-                        "props": {"class": "my-4"},
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "text-h6 mb-2"},
                         "text": "内置 Emby 直链网关",
                     },
                     {
@@ -2257,6 +2583,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         )
         pipeline = self._pipeline_snapshot()
         task = self._task_snapshot()
+        manual_import = self._manual_import_snapshot()
         gateway = (
             self._gateway.status()
             if self._gateway
@@ -2269,12 +2596,6 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
         )
         buttons = [
             ("发现工作表", "mdi-table-search", "discover", "primary"),
-            (
-                "导入自定义资源",
-                "mdi-link-plus",
-                "resources/import-manual",
-                "info",
-            ),
             ("继续同步", "mdi-sync", "sync", "primary"),
             ("同步全部并生成", "mdi-playlist-check", "sync-all", "success"),
             ("重新扫描", "mdi-restart-alert", "sync/reset", "warning"),
@@ -2322,6 +2643,21 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             }
             for label, icon, endpoint, color in buttons
         ]
+        button_components.insert(
+            1,
+            {
+                "component": "VBtn",
+                "props": {
+                    "color": "info",
+                    "variant": "tonal",
+                    "prepend-icon": "mdi-link-plus",
+                    "class": "ma-1",
+                    "href": self._manual_import_page_url(),
+                    "target": "_blank",
+                },
+                "text": "添加自选资源",
+            },
+        )
         sheet_items: List[Dict[str, Any]] = []
         media_mode_labels = {
             "movie": "电影",
@@ -2473,6 +2809,44 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             f"进行中 {int(offline_states.get('downloading') or 0)} / "
             f"失败 {int(offline_states.get('failed') or 0)}）"
         )
+        manual_state_labels = {
+            "idle": "空闲",
+            "queued": "已排队",
+            "running": "运行中",
+            "completed": "已完成",
+            "failed": "失败",
+            "paused": "已暂停",
+            "stopped": "已停止",
+        }
+        manual_stage_labels = {
+            "idle": "",
+            "queued": "等待后台线程",
+            "resolving": "解析链接",
+            "starting": "准备生成",
+            "validating": "校验资源",
+            "recognizing": "识别媒体",
+            "generating": "生成 STRM",
+            "scraping": "刮削元数据",
+            "finished": "完成当前资源",
+            "completed": "全部完成",
+            "space_limit": "空间达到上限",
+            "busy": "生成器忙碌",
+        }
+        manual_percent = int(manual_import.get("percent") or 0)
+        manual_current = str(manual_import.get("current_title") or "").strip()
+        manual_progress_text = (
+            f"链接 {int(manual_import.get('current') or 0)}/"
+            f"{int(manual_import.get('total') or 0)} · "
+            f"新增 {int(manual_import.get('imported') or 0)} · "
+            f"未变化 {int(manual_import.get('unchanged') or 0)} · "
+            f"链接失败 {int(manual_import.get('link_failed') or 0)}；"
+            f"生成 {int(manual_import.get('build_completed') or 0)}/"
+            f"{int(manual_import.get('build_total') or 0)} · "
+            f"成功 {int(manual_import.get('success') or 0)} · "
+            f"失败 {int(manual_import.get('build_failed') or 0)}"
+        )
+        if manual_current:
+            manual_progress_text += f" · 当前：{manual_current}"
         error_items: List[Dict[str, Any]] = []
         for item in snapshot.get("recent_errors", [])[:10]:
             error_items.append(
@@ -2541,6 +2915,42 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
                                 "直链播放时视频数据由客户端直接从115获取。"
                             ),
                         },
+                    },
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-4"},
+                "content": [
+                    {"component": "VCardTitle", "text": "自选资源导入进度"},
+                    {
+                        "component": "VCardSubtitle",
+                        "text": (
+                            f"{manual_state_labels.get(str(manual_import.get('state')), str(manual_import.get('state')))}"
+                            f" · {manual_stage_labels.get(str(manual_import.get('stage')), str(manual_import.get('stage') or ''))}"
+                            f" · {manual_percent}%"
+                        ),
+                    },
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "VProgressLinear",
+                                "props": {
+                                    "model-value": manual_percent,
+                                    "color": "info",
+                                    "height": 12,
+                                    "rounded": True,
+                                    "class": "mb-3",
+                                },
+                            },
+                            {"component": "div", "text": manual_progress_text},
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption mt-2"},
+                                "text": str(manual_import.get("message") or ""),
+                            },
+                        ],
                     },
                 ],
             },

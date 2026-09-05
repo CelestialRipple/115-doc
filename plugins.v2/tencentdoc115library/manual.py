@@ -2,7 +2,7 @@ import hashlib
 import re
 from pathlib import Path, PurePosixPath
 from threading import Event
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .resolver import ShareResolutionError, ShareResolver
 from .source_link import (
@@ -138,6 +138,7 @@ class ManualLibraryImporter:
         group_name: str,
         media_mode: str,
         maximum: int = 100,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """校验并保存资源，磁力和ED2K只登记、不在导入时离线下载。"""
         group_name = str(group_name or "").strip()
@@ -163,11 +164,35 @@ class ManualLibraryImporter:
         unchanged = 0
         failed = 0
         errors: List[str] = []
-        for entry in entries:
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "resolving",
+                    "total": len(entries),
+                    "current": 0,
+                    "current_title": "",
+                    "imported": 0,
+                    "unchanged": 0,
+                    "failed": 0,
+                }
+            )
+        for index, entry in enumerate(entries, start=1):
             if self.stop_event.is_set() or self.pause_event.is_set():
                 break
             resource_id = self._resource_id(sheet_id, entry["share_code"])
             fallback_title = entry["title"] or f"自定义资源 {entry['share_code']}"
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "resolving",
+                        "total": len(entries),
+                        "current": index,
+                        "current_title": fallback_title,
+                        "imported": imported,
+                        "unchanged": unchanged,
+                        "failed": failed,
+                    }
+                )
             try:
                 offline = is_offline_link(entry["share_url"])
                 if offline:
@@ -231,6 +256,18 @@ class ManualLibraryImporter:
                 )
                 failed += 1
                 errors.append(f"{fallback_title}：{message}")
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "resolving",
+                        "total": len(entries),
+                        "current": index,
+                        "current_title": fallback_title,
+                        "imported": imported,
+                        "unchanged": unchanged,
+                        "failed": failed,
+                    }
+                )
         return {
             "total": len(entries),
             "imported": imported,
