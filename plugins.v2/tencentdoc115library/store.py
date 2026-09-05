@@ -432,6 +432,9 @@ class CatalogStore:
         """
         with self._lock, self.connection() as connection:
             for sheet_id, mapping in mappings.items():
+                # Manual groups are append-only imports, never remote sheet snapshots.
+                if str(sheet_id).startswith("manual:"):
+                    continue
                 group_name = str(mapping.get("group_name") or "").strip()
                 current = connection.execute(
                     "SELECT group_name, media_mode FROM sheet_state "
@@ -696,6 +699,10 @@ class CatalogStore:
                 "SELECT row_hash, status FROM resource WHERE resource_id = ?",
                 (resource_id,),
             ).fetchone()
+            # A failed re-import must not discard an existing playable index,
+            # its metadata, or its pending build. Report the attempt to the caller.
+            if existing is not None and status != "pending":
+                return False
             changed = bool(existing and existing["row_hash"] != row_hash)
             queued = status == "pending" and (
                 existing is None
@@ -975,6 +982,8 @@ class CatalogStore:
         :param sheet_id (str): 工作表 ID
         :param scan_id (str): 当前扫描 ID
         """
+        if str(sheet_id).startswith("manual:"):
+            return
         now = utc_now()
         with self._lock, self.connection() as connection:
             connection.execute(

@@ -113,3 +113,38 @@ def test_manual_ed2k_import_does_not_resolve_before_playback(tmp_path):
     files = store.list_resource_files(result["queued_ids"][0])
     assert files[0]["file_name"] == "Example.Movie.2026.iso"
     assert files[0]["file_size"] == 42714660864
+
+
+def test_manual_batches_are_incremental_and_immune_to_remote_scan(tmp_path):
+    store = CatalogStore(tmp_path / 'catalog.db')
+    importer = ManualLibraryImporter(store, FakeResolver(), Event())
+    first = importer.import_links('https://115.com/s/first', '自选', 'movie')
+    rid = first['queued_ids'][0]
+    before = store.get_resource(rid)
+    files = store.list_resource_files(rid)
+    second = importer.import_links('https://115.com/s/second', '自选', 'movie')
+    assert second['imported'] == 1
+    store.complete_sheet_scan(before['sheet_id'], 'remote-scan')
+    store.configure_sheets({before['sheet_id']: {'enabled': True, 'group_name': '自选', 'media_mode': 'tv'}})
+    assert store.get_resource(rid) == before
+    assert store.list_resource_files(rid) == files
+    assert store.get_resource(second['queued_ids'][0])['status'] == 'pending'
+
+
+def test_failed_reimport_preserves_ready_resource_and_files(tmp_path):
+    from tencentdoc115library.resolver import ShareResolutionError
+    store = CatalogStore(tmp_path / 'catalog.db')
+    resolver = FakeResolver()
+    importer = ManualLibraryImporter(store, resolver, Event())
+    raw = 'https://115.com/s/first'
+    rid = importer.import_links(raw, '自选', 'movie')['queued_ids'][0]
+    with store.connection() as db:
+        db.execute("UPDATE resource SET status='ready', strm_status='ready', scrape_status='ready', strm_path='/library/old.strm' WHERE resource_id=?", (rid,))
+    before = store.get_resource(rid)
+    files = store.list_resource_files(rid)
+    def fail(url):
+        raise ShareResolutionError('临时失败')
+    resolver.list_video_files = fail
+    assert importer.import_links(raw, '自选', 'movie')['failed'] == 1
+    assert store.get_resource(rid) == before
+    assert store.list_resource_files(rid) == files

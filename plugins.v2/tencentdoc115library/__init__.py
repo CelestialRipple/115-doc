@@ -133,7 +133,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.13.0"
+    plugin_version = "0.13.1"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -1306,11 +1306,11 @@ padding:12px 22px;cursor:pointer}}.message{{font-weight:600}}
 .fill{{height:100%;width:0;background:#46c37b;transition:width .3s}}
 #detail{{font-size:14px;color:#aeb8c7}}@media(max-width:600px){{.row{{grid-template-columns:1fr}}}}
 </style></head><body><main><h2>添加自选资源</h2>
-<p>提交后会立即在后台解析、识别、刮削并生成 STRM，不会把链接保存到插件设置。</p>
+<p>提交后会立即在后台解析、识别、刮削并生成 STRM。链接持久保存在资源目录中，不回填插件设置。</p>
 {message_html}<form method="post">
 <label>115分享 / 磁力 / ED2K</label>
 <textarea name="links" required placeholder="每行一条；也支持 标题|链接 或 标题|年份|链接">{escape(links)}</textarea>
-<small>一次最多100条；115访问码可直接放在链接参数中。</small>
+<small>增量添加：只需填写本次新增链接，之前添加的资源会保留；一次最多100条。115访问码可直接放在链接参数中。</small>
 <div class="row"><div><label>输出文件夹</label>
 <input name="group_name" value="{escape(group_name, quote=True)}" maxlength="120" required>
 <small>位于输出根目录下，与“星火”等目录同级。</small></div>
