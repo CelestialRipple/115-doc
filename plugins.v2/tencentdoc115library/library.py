@@ -1301,6 +1301,16 @@ class LibraryBuilder:
             Tuple[Dict[str, Any], Path, str, Any],
         ] = {}
         progress_total = 0
+        # Track each output directory once, including resources sharing a folder.
+        # Keep a high-water mark: deletions must not create artificial free space.
+        directory_usage: Dict[Path, int] = {}
+
+        def account_directory(directory: Path) -> None:
+            nonlocal usage_bytes
+            current = directory_size(directory)
+            previous = directory_usage[directory]
+            usage_bytes += max(current - previous, 0)
+            directory_usage[directory] = max(current, previous)
 
         def notify_progress(
             resource: Optional[Dict[str, Any]],
@@ -1327,6 +1337,10 @@ class LibraryBuilder:
         def finish_scrapes(done: Any) -> None:
             """收集并发刮削结果，逐条写回可恢复状态。"""
             nonlocal success_count, failed_count, usage_bytes
+            # Include partially written metadata from other active workers in
+            # the capacity check without traversing the entire media library.
+            for directory in {item[1] for item in pending_scrapes.values()}:
+                account_directory(directory)
             for future in done:
                 resource, directory, output_path, mediainfo = pending_scrapes.pop(
                     future
@@ -1365,7 +1379,6 @@ class LibraryBuilder:
                 success_count += 1
                 logger.info(f"STRM 资源生成完成：{resource['title']}")
                 notify_progress(resource, "finished")
-            usage_bytes = int(self.storage_snapshot()["usage_bytes"])
 
         try:
             config = self.config_provider()
@@ -1421,7 +1434,6 @@ class LibraryBuilder:
                     break
                 processed += 1
                 directory: Optional[Path] = None
-                directory_size_before = 0
                 current_stage = "validating"
                 deferred_scrape = False
                 notify_progress(resource, current_stage)
@@ -1488,7 +1500,8 @@ class LibraryBuilder:
                         ),
                     )
                     directory = self._base_directory(resource, mediainfo)
-                    directory_size_before = directory_size(directory)
+                    if directory not in directory_usage:
+                        directory_usage[directory] = directory_size(directory)
                     if media_type == MediaType.TV:
                         output_path = self._build_tv(
                             resource,
@@ -1656,10 +1669,7 @@ class LibraryBuilder:
                     )
                 finally:
                     if directory:
-                        usage_bytes += max(
-                            directory_size(directory) - directory_size_before,
-                            0,
-                        )
+                        account_directory(directory)
                     if not deferred_scrape:
                         notify_progress(resource, "finished")
                 if limit_bytes and usage_bytes >= limit_bytes:

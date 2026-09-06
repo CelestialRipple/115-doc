@@ -1,4 +1,5 @@
 import re
+import pytest
 import os
 from pathlib import Path
 from threading import Event
@@ -473,3 +474,71 @@ def test_unrecognized_movie_still_generates_strm_without_metadata(
         encoding="utf-8"
     )
     assert not list(strm_path.parent.glob("*.nfo"))
+
+
+@pytest.mark.parametrize('shared,fail,limit_bytes', [
+    (False, False, 0), (True, False, 0),
+    (True, True, 0), (False, False, 115), (True, True, 115),
+])
+def test_parallel_build_accounts_growth_without_repeated_root_scans(
+    tmp_path, monkeypatch, shared, fail, limit_bytes,
+):
+    root = tmp_path / 'output'
+    root.mkdir()
+    (root / 'existing.nfo').write_bytes(b'x' * 100)
+    resources = [dict(_resource(str(i), str(i), 'https://115.com/s/test'),
+                      sheet_id='sheet') for i in range(6)]
+    states = {}
+    store = SimpleNamespace(
+        list_build_candidates=lambda *args, **kwargs: resources,
+        update_resource_status=lambda rid, status, *args, **kwargs:
+            states.update({rid: (status, kwargs)}),
+        get_sheet=lambda rid: {},
+    )
+    builder = LibraryBuilder(
+        store=store,
+        resolver=SimpleNamespace(list_video_files=lambda url: []),
+        config_provider=lambda: {
+            'output_root': str(root), 'scrape_workers': 2,
+            'output_size_limit_gb': limit_bytes / (1024 ** 3),
+        },
+        stop_event=Event(),
+    )
+    monkeypatch.setattr(builder, '_media_type', lambda *args: MediaType.MOVIE)
+    monkeypatch.setattr(builder, '_is_mixed_resource', lambda *args: False)
+    monkeypatch.setattr(builder, '_recognize', lambda *args, **kwargs:
+                        (SimpleNamespace(), SimpleNamespace(type=MediaType.MOVIE)))
+    monkeypatch.setattr(builder, '_save_detected_type', lambda *args: None)
+    monkeypatch.setattr(builder, '_remember_metadata', lambda *args: None)
+    monkeypatch.setattr(builder, '_base_directory', lambda resource, info:
+                        root / ('shared' if shared else resource['resource_id']))
+
+    def build_movie(resource, *args, directory, **kwargs):
+        directory.mkdir(exist_ok=True)
+        path = directory / (resource['resource_id'] + '.strm')
+        path.write_bytes(b'x')
+        return str(path)
+
+    def scrape(resource, directory, *args):
+        (directory / (resource['resource_id'] + '.nfo')).write_bytes(b'x' * 10)
+        if fail:
+            raise RuntimeError('partial metadata failure')
+
+    monkeypatch.setattr(builder, '_build_movie', build_movie)
+    monkeypatch.setattr(builder, '_scrape_with_reuse', scrape)
+    original_size = library_module.directory_size
+    root_scans = []
+
+    def measured_size(path):
+        if path == root:
+            root_scans.append(path)
+        return original_size(path)
+
+    monkeypatch.setattr(library_module, 'directory_size', measured_size)
+    result = builder.build(limit=6)
+    expected_processed = 2 if limit_bytes else 6
+    assert result['processed'] == expected_processed
+    assert result['usage_bytes'] == original_size(root) == 100 + 11 * expected_processed
+    assert result['status'] == ('space_limit' if limit_bytes else 'completed')
+    assert result['failed' if fail else 'success'] == expected_processed
+    assert len(root_scans) == 2  # Start/end only, regardless of completion batches.
