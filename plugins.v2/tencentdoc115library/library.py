@@ -31,7 +31,7 @@ except ImportError:
 
 from .resolver import ShareResolutionError, ShareResolver
 from .source_link import is_offline_link, offline_file_hint
-from .storage_limit import configured_limit_bytes, directory_size
+from .storage_limit import DisplayStorageCache, configured_limit_bytes, directory_size
 from .store import CatalogStore
 from .ownership import MANIFEST, load_owned, owned_unchanged, record_owned, fingerprint
 
@@ -208,6 +208,7 @@ class LibraryBuilder:
         self.config_provider = config_provider
         self.stop_event = stop_event
         self.pause_event = pause_event or Event()
+        self._display_storage = DisplayStorageCache()
         self._run_lock = Lock()
         self._metadata_lock = Lock()
         self._metadata_cache: Dict[Tuple[str, str], Path] = {}
@@ -600,6 +601,9 @@ class LibraryBuilder:
                     if self._metadata_inflight.get(key) is event:
                         self._metadata_inflight.pop(key, None)
                 event.set()
+
+    def display_storage_snapshot(self) -> Dict[str, Any]:
+        return self._display_storage.snapshot(self.config_provider())
 
     def storage_snapshot(self) -> Dict[str, Any]:
         """返回插件输出目录的当前占用和配置上限。"""

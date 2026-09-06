@@ -133,7 +133,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.13.1"
+    plugin_version = "0.13.2"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -1713,7 +1713,7 @@ refresh(); setInterval(refresh,1000);
         snapshot["task_running"] = bool(task.get("running"))
         snapshot["task"] = task
         snapshot["pipeline"] = self._pipeline_snapshot()
-        snapshot["storage"] = self._builder.storage_snapshot() if self._builder else {}
+        snapshot["storage"] = self._builder.display_storage_snapshot() if self._builder else {}
         snapshot["offline_playback"] = self._store.offline_playback_snapshot()
         snapshot["direct_gateway"] = (
             self._gateway.status() if self._gateway else {"state": "disabled"}
@@ -2657,7 +2657,7 @@ refresh(); setInterval(refresh,1000);
             }
         )
         storage = (
-            self._builder.storage_snapshot()
+            self._builder.display_storage_snapshot()
             if self._builder
             else {
                 "usage_bytes": 0,
@@ -2834,7 +2834,11 @@ refresh(); setInterval(refresh,1000);
             round(scrape_ready * 100 / active_resources) if active_resources else 0
         )
         limit_bytes = int(storage.get("limit_bytes") or 0)
-        usage_text = format_gib(int(storage.get("usage_bytes") or 0))
+        usage_text = ("后台统计中" if storage.get("usage_pending") else format_gib(int(storage.get("usage_bytes") or 0)))
+        if storage.get("usage_error"):
+            usage_text = "统计暂不可用"
+        elif storage.get("usage_refreshing") and not storage.get("usage_pending"):
+            usage_text += "（后台更新中）"
         limit_text = format_gib(limit_bytes) if limit_bytes else "不限"
         phase_labels = {
             "idle": "空闲",
