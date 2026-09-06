@@ -61,7 +61,6 @@ from .search_bridge import (
 )
 from .source_link import is_offline_link
 from .signing import sign_action, verify_action
-from .storage_limit import format_gib
 from .store import CatalogStore
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -90,7 +89,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "scrape_workers": 1,
     "separate_source_folders": False,
     "output_root": "/media/tencentdoc115",
-    "output_size_limit_gb": 0,
     "public_base_url": "http://127.0.0.1:3000",
     "playback_token": "",
     "scrape_metadata": True,
@@ -133,7 +131,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.13.3"
+    plugin_version = "0.13.4"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -203,6 +201,7 @@ class TencentDoc115Library(_PluginBase):
         self._stop_event = Event()
         self._pause_event.clear()
         self._config = {**DEFAULT_CONFIG, **(config or {})}
+        self._config.pop("output_size_limit_gb", None)
         config_changed = False
         # 清理旧版本曾保存的转存和 ISO 实验开关，避免升级后继续显示或生效。
         for legacy_key in (
@@ -309,6 +308,7 @@ class TencentDoc115Library(_PluginBase):
     def _replace_config(self, config: Dict[str, Any]) -> None:
         """保存同步器发现的工作表和文件 ID 配置。"""
         self._config = {**DEFAULT_CONFIG, **config}
+        self._config.pop("output_size_limit_gb", None)
         for legacy_key in (
             "iso_fresh_redirect",
             "iso_blank_user_agent",
@@ -1061,7 +1061,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             else "stopped"
             if built_status in {"stopped", "interrupted"}
             else "failed"
-            if built_status in {"failed", "busy", "space_limit"}
+            if built_status in {"failed", "busy"}
             else "completed"
         )
         self._set_manual_import_status(
@@ -1324,7 +1324,7 @@ const labels={{idle:'空闲',queued:'已排队',running:'运行中',completed:'�
 failed:'失败',paused:'已暂停',stopped:'已停止'}};
 const stages={{idle:'',queued:'等待后台线程',resolving:'解析链接',starting:'准备生成',
 validating:'校验资源',recognizing:'识别媒体',generating:'生成STRM',scraping:'刮削元数据',
-finished:'完成当前资源',completed:'全部完成',space_limit:'空间达到上限',busy:'生成器忙碌'}};
+finished:'完成当前资源',completed:'全部完成',busy:'生成器忙碌'}};
 async function refresh(){{try{{
   const response=await fetch('import-status'+window.location.search,{{cache:'no-store'}});
   const body=await response.json(); if(!body.success) throw new Error(body.message);
@@ -1417,11 +1417,9 @@ refresh(); setInterval(refresh,1000);
             message="目录同步完成，正在排队识别、刮削并生成 STRM",
             **totals,
         )
-        known_usage_bytes: Optional[int] = None
         while not self._stop_event.is_set() and not self._pause_event.is_set():
-            result = self._builder.build(known_usage_bytes=known_usage_bytes)
+            result = self._builder.build()
             processed = int(result.get("processed") or 0)
-            known_usage_bytes = int(result.get("usage_bytes") or 0)
             totals["built"] += processed
             totals["success"] += int(result.get("success") or 0)
             totals["failed"] += int(result.get("failed") or 0)
@@ -1429,8 +1427,6 @@ refresh(); setInterval(refresh,1000);
             self._set_pipeline_status(
                 phase="building",
                 message=str(result.get("message") or "正在生成媒体库"),
-                usage_bytes=int(result.get("usage_bytes") or 0),
-                limit_bytes=int(result.get("limit_bytes") or 0),
                 **totals,
             )
             if self._pause_event.is_set():
@@ -1440,13 +1436,6 @@ refresh(); setInterval(refresh,1000);
                     **totals,
                 )
                 return {"status": "paused", **totals}
-            if build_status == "space_limit":
-                self._set_pipeline_status(
-                    phase="space_limit",
-                    message="已达到输出空间上限；剩余资源仍在 pending 队列",
-                    **totals,
-                )
-                return {"status": "space_limit", **totals}
             if build_status in {"busy", "interrupted"}:
                 final_phase = "stopped" if build_status == "interrupted" else "failed"
                 self._set_pipeline_status(
@@ -1601,7 +1590,6 @@ refresh(); setInterval(refresh,1000);
             message=f"已锁定 {requeued} 条失败资源，正在逐条重试一次",
             **totals,
         )
-        known_usage_bytes: Optional[int] = None
         remaining_ids = list(resource_ids)
         while not self._stop_event.is_set() and not self._pause_event.is_set():
             try:
@@ -1629,7 +1617,6 @@ refresh(); setInterval(refresh,1000);
                 return {"status": "completed", "requeued": requeued, **totals}
             result = self._builder.build(
                 limit=len(batch_ids),
-                known_usage_bytes=known_usage_bytes,
                 retry_failed=True,
                 resource_ids=batch_ids,
             )
@@ -1640,7 +1627,6 @@ refresh(); setInterval(refresh,1000);
                 for resource_id in remaining_ids
                 if resource_id not in processed_ids
             ]
-            known_usage_bytes = int(result.get("usage_bytes") or 0)
             totals["built"] += processed
             totals["success"] += int(result.get("success") or 0)
             totals["failed"] += int(result.get("failed") or 0)
@@ -1651,8 +1637,6 @@ refresh(); setInterval(refresh,1000);
                     f"失败资源重试中：{totals['success']} 成功 / "
                     f"{totals['failed']} 再次失败"
                 ),
-                usage_bytes=int(result.get("usage_bytes") or 0),
-                limit_bytes=int(result.get("limit_bytes") or 0),
                 **totals,
             )
             if self._pause_event.is_set():
@@ -1662,13 +1646,6 @@ refresh(); setInterval(refresh,1000);
                     **totals,
                 )
                 return {"status": "paused", "requeued": requeued, **totals}
-            if build_status == "space_limit":
-                self._set_pipeline_status(
-                    phase="space_limit",
-                    message="重试已因输出空间上限停止；未处理项保持原状态",
-                    **totals,
-                )
-                return {"status": "space_limit", "requeued": requeued, **totals}
             if build_status in {"busy", "interrupted"}:
                 final_phase = "stopped" if build_status == "interrupted" else "failed"
                 self._set_pipeline_status(
@@ -1713,7 +1690,6 @@ refresh(); setInterval(refresh,1000);
         snapshot["task_running"] = bool(task.get("running"))
         snapshot["task"] = task
         snapshot["pipeline"] = self._pipeline_snapshot()
-        snapshot["storage"] = self._builder.display_storage_snapshot() if self._builder else {}
         snapshot["offline_playback"] = self._store.offline_playback_snapshot()
         snapshot["direct_gateway"] = (
             self._gateway.status() if self._gateway else {"state": "disabled"}
@@ -2376,12 +2352,6 @@ refresh(); setInterval(refresh,1000);
                         "content": [
                             self._text_field("output_root", "STRM/元数据输出目录", 6),
                             self._text_field(
-                                "output_size_limit_gb",
-                                "输出目录空间上限（GiB）",
-                                6,
-                                hint="统计 STRM、NFO 和图片；0 表示不限。达到上限后保留 pending 队列。",
-                            ),
-                            self._text_field(
                                 "public_base_url",
                                 "Emby 可访问的 MoviePilot 地址",
                                 6,
@@ -2620,6 +2590,7 @@ refresh(); setInterval(refresh,1000);
         ]
         defaults = dict(DEFAULT_CONFIG)
         defaults.update(self._config)
+        defaults.pop("output_size_limit_gb", None)
         if (
             not str(defaults.get("document_urls") or "").strip()
             and str(defaults.get("document_url") or "").strip()
@@ -2654,15 +2625,6 @@ refresh(); setInterval(refresh,1000);
                 "current_resources": [],
                 "sheets": [],
                 "recent_errors": [],
-            }
-        )
-        storage = (
-            self._builder.display_storage_snapshot()
-            if self._builder
-            else {
-                "usage_bytes": 0,
-                "limit_bytes": 0,
-                "limit_reached": False,
             }
         )
         pipeline = self._pipeline_snapshot()
@@ -2833,13 +2795,6 @@ refresh(); setInterval(refresh,1000);
         scrape_percent = (
             round(scrape_ready * 100 / active_resources) if active_resources else 0
         )
-        limit_bytes = int(storage.get("limit_bytes") or 0)
-        usage_text = ("后台统计中" if storage.get("usage_pending") else format_gib(int(storage.get("usage_bytes") or 0)))
-        if storage.get("usage_error"):
-            usage_text = "统计暂不可用"
-        elif storage.get("usage_refreshing") and not storage.get("usage_pending"):
-            usage_text += "（后台更新中）"
-        limit_text = format_gib(limit_bytes) if limit_bytes else "不限"
         phase_labels = {
             "idle": "空闲",
             "syncing": "正在同步",
@@ -2849,7 +2804,6 @@ refresh(); setInterval(refresh,1000);
             "stopping": "正在停止",
             "stopped": "已停止",
             "completed": "已完成",
-            "space_limit": "空间已满",
             "failed": "失败",
         }
         phase = str(pipeline.get("phase") or "idle")
@@ -2917,7 +2871,6 @@ refresh(); setInterval(refresh,1000);
             "scraping": "刮削元数据",
             "finished": "完成当前资源",
             "completed": "全部完成",
-            "space_limit": "空间达到上限",
             "busy": "生成器忙碌",
         }
         manual_percent = int(manual_import.get("percent") or 0)
@@ -2986,7 +2939,7 @@ refresh(); setInterval(refresh,1000);
                             "type": "info",
                             "variant": "tonal",
                             "text": (
-                                f"{pipeline_text} {task_text} 输出目录占用：{usage_text} / {limit_text}。"
+                                f"{pipeline_text} {task_text}"
                                 "“同步全部并生成”会在后台跑完已勾选工作表，再逐批处理 pending；"
                                 "可暂停或停止，恢复会从断点继续。重新打开本页可刷新状态。"
                             ),

@@ -168,7 +168,7 @@ def main() -> None:
 
         plugin._config["output_size_limit_gb"] = 1 / (1024**3)
         limited_build = plugin._builder.build()
-        assert limited_build["status"] == "space_limit"
+        assert limited_build["status"] == "completed"
         assert limited_build["processed"] == 0
         plugin._config["output_size_limit_gb"] = 1
 
@@ -382,28 +382,22 @@ def main() -> None:
         class FakeBuilder:
             calls = 0
 
-            def build(self, known_usage_bytes=None):
+            def build(self):
                 self.calls += 1
                 if self.calls == 1:
-                    assert known_usage_bytes is None
                     return {
                         "status": "completed",
                         "message": "批次完成",
                         "processed": 2,
                         "success": 2,
                         "failed": 0,
-                        "usage_bytes": 1024,
-                        "limit_bytes": 2048,
                     }
-                assert known_usage_bytes == 1024
                 return {
                     "status": "completed",
                     "message": "无待处理资源",
                     "processed": 0,
                     "success": 0,
                     "failed": 0,
-                    "usage_bytes": 1024,
-                    "limit_bytes": 2048,
                 }
 
         plugin._synchronizer = FakeSynchronizer()

@@ -476,12 +476,9 @@ def test_unrecognized_movie_still_generates_strm_without_metadata(
     assert not list(strm_path.parent.glob("*.nfo"))
 
 
-@pytest.mark.parametrize('shared,fail,limit_bytes', [
-    (False, False, 0), (True, False, 0),
-    (True, True, 0), (False, False, 115), (True, True, 115),
-])
-def test_parallel_build_accounts_growth_without_repeated_root_scans(
-    tmp_path, monkeypatch, shared, fail, limit_bytes,
+@pytest.mark.parametrize('shared,fail', [(False, False), (True, False), (True, True)])
+def test_parallel_build_ignores_old_capacity_limit_and_never_scans_for_size(
+    tmp_path, monkeypatch, shared, fail,
 ):
     root = tmp_path / 'output'
     root.mkdir()
@@ -500,7 +497,7 @@ def test_parallel_build_accounts_growth_without_repeated_root_scans(
         resolver=SimpleNamespace(list_video_files=lambda url: []),
         config_provider=lambda: {
             'output_root': str(root), 'scrape_workers': 2,
-            'output_size_limit_gb': limit_bytes / (1024 ** 3),
+            'output_size_limit_gb': 1 / (1024 ** 3),
         },
         stop_event=Event(),
     )
@@ -526,19 +523,28 @@ def test_parallel_build_accounts_growth_without_repeated_root_scans(
 
     monkeypatch.setattr(builder, '_build_movie', build_movie)
     monkeypatch.setattr(builder, '_scrape_with_reuse', scrape)
-    original_size = library_module.directory_size
-    root_scans = []
+    def forbid_scan(*args, **kwargs):
+        raise AssertionError('Capacity accounting must not scan directories')
 
-    def measured_size(path):
-        if path == root:
-            root_scans.append(path)
-        return original_size(path)
-
-    monkeypatch.setattr(library_module, 'directory_size', measured_size)
+    monkeypatch.setattr(os, 'scandir', forbid_scan)
     result = builder.build(limit=6)
-    expected_processed = 2 if limit_bytes else 6
-    assert result['processed'] == expected_processed
-    assert result['usage_bytes'] == original_size(root) == 100 + 11 * expected_processed
-    assert result['status'] == ('space_limit' if limit_bytes else 'completed')
-    assert result['failed' if fail else 'success'] == expected_processed
-    assert len(root_scans) == 2  # Start/end only, regardless of completion batches.
+    assert result['processed'] == 6
+    assert result['status'] == 'completed'
+    assert result['failed' if fail else 'success'] == 6
+    assert 'usage_bytes' not in result
+    assert 'limit_bytes' not in result
+
+
+def test_page_and_status_do_not_scan_output_for_capacity(plugin, monkeypatch):
+    def forbid_scan(*args, **kwargs):
+        raise AssertionError('Page/status must not traverse the output directory')
+
+    monkeypatch.setattr(os, 'scandir', forbid_scan)
+    plugin._config['output_size_limit_gb'] = 1
+    assert plugin.get_page()
+    status = plugin.status()
+    assert status.success
+    assert 'storage' not in status.data
+    form, defaults = plugin.get_form()
+    assert 'output_size_limit_gb' not in str(form)
+    assert 'output_size_limit_gb' not in defaults

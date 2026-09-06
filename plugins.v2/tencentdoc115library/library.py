@@ -31,7 +31,6 @@ except ImportError:
 
 from .resolver import ShareResolutionError, ShareResolver
 from .source_link import is_offline_link, offline_file_hint
-from .storage_limit import DisplayStorageCache, configured_limit_bytes, directory_size
 from .store import CatalogStore
 from .ownership import MANIFEST, load_owned, owned_unchanged, record_owned, fingerprint
 
@@ -208,7 +207,6 @@ class LibraryBuilder:
         self.config_provider = config_provider
         self.stop_event = stop_event
         self.pause_event = pause_event or Event()
-        self._display_storage = DisplayStorageCache()
         self._run_lock = Lock()
         self._metadata_lock = Lock()
         self._metadata_cache: Dict[Tuple[str, str], Path] = {}
@@ -601,23 +599,6 @@ class LibraryBuilder:
                     if self._metadata_inflight.get(key) is event:
                         self._metadata_inflight.pop(key, None)
                 event.set()
-
-    def display_storage_snapshot(self) -> Dict[str, Any]:
-        return self._display_storage.snapshot(self.config_provider())
-
-    def storage_snapshot(self) -> Dict[str, Any]:
-        """返回插件输出目录的当前占用和配置上限。"""
-        config = self.config_provider()
-        output_root = str(config.get("output_root") or "").strip()
-        root = Path(output_root).expanduser().resolve() if output_root else None
-        usage_bytes = directory_size(root) if root else 0
-        limit_bytes = configured_limit_bytes(config)
-        return {
-            "output_root": str(root) if root else "",
-            "usage_bytes": usage_bytes,
-            "limit_bytes": limit_bytes,
-            "limit_reached": bool(limit_bytes and usage_bytes >= limit_bytes),
-        }
 
     def clear_generated_output(self) -> Dict[str, int]:
         """
@@ -1266,7 +1247,6 @@ class LibraryBuilder:
         self,
         limit: Optional[int] = None,
         retry_failed: bool = False,
-        known_usage_bytes: Optional[int] = None,
         resource_ids: Optional[List[str]] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
@@ -1275,7 +1255,6 @@ class LibraryBuilder:
 
         :param limit (int): 本次最大资源数
         :param retry_failed (bool): 是否包含失败资源
-        :param known_usage_bytes (int): 连续批次沿用的已知目录占用，避免反复扫描
         :param resource_ids (List[str]): 只处理指定资源，供手动导入立即构建
 
         :return Dict: 处理统计
@@ -1291,9 +1270,6 @@ class LibraryBuilder:
         processed = 0
         success_count = 0
         failed_count = 0
-        space_limit_reached = False
-        usage_bytes = 0
-        limit_bytes = 0
         scrape_workers = 1
         scrape_executor: Optional[ThreadPoolExecutor] = None
         pending_scrapes: Dict[
@@ -1301,17 +1277,6 @@ class LibraryBuilder:
             Tuple[Dict[str, Any], Path, str, Any],
         ] = {}
         progress_total = 0
-        # Track each output directory once, including resources sharing a folder.
-        # Keep a high-water mark: deletions must not create artificial free space.
-        directory_usage: Dict[Path, int] = {}
-
-        def account_directory(directory: Path) -> None:
-            nonlocal usage_bytes
-            current = directory_size(directory)
-            previous = directory_usage[directory]
-            usage_bytes += max(current - previous, 0)
-            directory_usage[directory] = max(current, previous)
-
         def notify_progress(
             resource: Optional[Dict[str, Any]],
             stage: str,
@@ -1336,11 +1301,7 @@ class LibraryBuilder:
 
         def finish_scrapes(done: Any) -> None:
             """收集并发刮削结果，逐条写回可恢复状态。"""
-            nonlocal success_count, failed_count, usage_bytes
-            # Include partially written metadata from other active workers in
-            # the capacity check without traversing the entire media library.
-            for directory in {item[1] for item in pending_scrapes.values()}:
-                account_directory(directory)
+            nonlocal success_count, failed_count
             for future in done:
                 resource, directory, output_path, mediainfo = pending_scrapes.pop(
                     future
@@ -1395,22 +1356,6 @@ class LibraryBuilder:
                     max_workers=scrape_workers,
                     thread_name_prefix="TencentDoc115Scrape",
                 )
-            limit_bytes = configured_limit_bytes(config)
-            usage_bytes = (
-                max(int(known_usage_bytes), 0)
-                if known_usage_bytes is not None
-                else int(self.storage_snapshot()["usage_bytes"])
-            )
-            if limit_bytes and usage_bytes >= limit_bytes:
-                return {
-                    "status": "space_limit",
-                    "message": "输出目录已达到空间上限，剩余资源保留为 pending",
-                    "processed": 0,
-                    "success": 0,
-                    "failed": 0,
-                    "usage_bytes": usage_bytes,
-                    "limit_bytes": limit_bytes,
-                }
             batch_limit = limit or int(config.get("build_batch") or 20)
             batch_limit = min(max(int(batch_limit), 1), 500)
             resources = self.store.list_build_candidates(
@@ -1428,9 +1373,6 @@ class LibraryBuilder:
                     )
                     finish_scrapes(done)
                 if self.stop_event.is_set() or self.pause_event.is_set():
-                    break
-                if limit_bytes and usage_bytes >= limit_bytes:
-                    space_limit_reached = True
                     break
                 processed += 1
                 directory: Optional[Path] = None
@@ -1500,8 +1442,6 @@ class LibraryBuilder:
                         ),
                     )
                     directory = self._base_directory(resource, mediainfo)
-                    if directory not in directory_usage:
-                        directory_usage[directory] = directory_size(directory)
                     if media_type == MediaType.TV:
                         output_path = self._build_tv(
                             resource,
@@ -1668,13 +1608,8 @@ class LibraryBuilder:
                         exc_info=True,
                     )
                 finally:
-                    if directory:
-                        account_directory(directory)
                     if not deferred_scrape:
                         notify_progress(resource, "finished")
-                if limit_bytes and usage_bytes >= limit_bytes:
-                    space_limit_reached = True
-                    break
             while pending_scrapes:
                 done, _ = wait(pending_scrapes, return_when=FIRST_COMPLETED)
                 finish_scrapes(done)
@@ -1682,16 +1617,12 @@ class LibraryBuilder:
                 # 所有任务已收集，关闭线程池避免线程泄漏。
                 scrape_executor.shutdown(wait=True)
                 scrape_executor = None
-            usage_bytes = max(usage_bytes, int(self.storage_snapshot()["usage_bytes"]))
             if self.stop_event.is_set():
                 status = "interrupted"
                 message = "媒体库生成已停止，剩余资源保留为 pending"
             elif self.pause_event.is_set():
                 status = "paused"
                 message = "媒体库生成已暂停，剩余资源保留为 pending"
-            elif space_limit_reached:
-                status = "space_limit"
-                message = "已达到输出空间上限，剩余资源保留为 pending"
             else:
                 status = "completed"
                 message = "媒体库生成批次已结束"
@@ -1702,8 +1633,6 @@ class LibraryBuilder:
                 "processed": processed,
                 "success": success_count,
                 "failed": failed_count,
-                "usage_bytes": usage_bytes,
-                "limit_bytes": limit_bytes,
             }
         finally:
             if scrape_executor:
