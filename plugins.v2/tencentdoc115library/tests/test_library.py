@@ -291,7 +291,7 @@ def test_tv_iso_disc_numbers_are_used_as_episode_numbers(tmp_path: Path) -> None
 
     generated = sorted(Path(result).rglob("*.strm"))
     assert [
-        re.sub(r" - [0-9a-f]{16}(?=\.strm$)", "", item.name) for item in generated
+        re.sub(r" \[uid=[g-v]+\](?=\.strm$)", "", item.name) for item in generated
     ] == [
         "北美大地 (2013) - S01E01.strm",
         "北美大地 (2013) - S01E03.strm",
@@ -352,7 +352,7 @@ def test_tv_files_without_episode_markers_use_natural_path_order(
 
     generated = sorted(Path(result).rglob("*.strm"))
     assert [
-        re.sub(r" - [0-9a-f]{16}(?=\.strm$)", "", item.name) for item in generated
+        re.sub(r" \[uid=[g-v]+\](?=\.strm$)", "", item.name) for item in generated
     ] == [
         "测试剧集 (2020) - S02E01.strm",
         "测试剧集 (2020) - S02E02.strm",
@@ -548,3 +548,59 @@ def test_page_and_status_do_not_scan_output_for_capacity(plugin, monkeypatch):
     form, defaults = plugin.get_form()
     assert 'output_size_limit_gb' not in str(form)
     assert 'output_size_limit_gb' not in defaults
+
+
+def test_episode_filename_identifiers_cannot_be_parsed_as_episode_ranges(tmp_path, monkeypatch):
+    saved = []
+    builder = LibraryBuilder(
+        store=SimpleNamespace(replace_resource_files=lambda rid, files: saved.extend(files)),
+        resolver=object(), config_provider=lambda: {'output_root': str(tmp_path)},
+        stop_event=Event(),
+    )
+    monkeypatch.setattr(builder, '_episode_identity', lambda *args: (2, 7))
+    monkeypatch.setattr(builder, '_play_url', lambda *args: 'http://example/play')
+    resource = _resource('test', '马男波杰克', 'https://115.com/s/test')
+    builder._build_tv(resource, SimpleNamespace(),
+                      SimpleNamespace(title='马男波杰克', year='2014'),
+                      directory=tmp_path / 'show', source_files=[
+                          {'file_id': 'a', 'file_name': 'S02E07 - 53e825062a9944ef.mkv'},
+                          {'file_id': 'b', 'file_name': 'S02E07 - 12e382572c4e604c.mkv'},
+                      ])
+    assert len(saved) == 2
+    paths = [Path(x['strm_path']) for x in saved]
+    assert paths[0] != paths[1]
+    for path in paths:
+        assert path.is_file()
+        assert re.fullmatch(r'马男波杰克 \(2014\) - S02E07 \[uid=[g-v]+\]\.strm', path.name)
+
+
+@pytest.mark.parametrize('name', [
+    '马男波杰克 (2014) - S02E07 - 53e825062a9944ef.strm',
+    '巴比伦柏林 (2017) - S01E01 - 12e382572c4e604c.strm',
+])
+def test_scraper_rejects_legacy_range_identifiers_before_calling_moviepilot(tmp_path, monkeypatch, name):
+    directory = tmp_path / 'Season 02'
+    directory.mkdir()
+    (directory / name).write_text('http://example/play')
+    calls = []
+    monkeypatch.setattr(library_module, 'ScrapingChain', lambda:
+                        SimpleNamespace(scrape_metadata=lambda **kwargs: calls.append(kwargs)))
+    builder = LibraryBuilder(store=object(), resolver=object(),
+                             config_provider=lambda: {'scrape_metadata': True}, stop_event=Event())
+    with pytest.raises(library_module.LibraryBuildError, match='旧剧集文件标识'):
+        builder._scrape(tmp_path, SimpleNamespace(), SimpleNamespace())
+    assert calls == []
+
+
+def test_scraper_accepts_safe_episode_filename(tmp_path, monkeypatch):
+    (tmp_path / '剧名 (2024) - S02E07 [uid=ghijklmnopqrstuv].strm').write_text('http://example/play')
+    calls = []
+    def scrape(**kwargs):
+        calls.append(kwargs)
+        return True, ''
+    monkeypatch.setattr(library_module, 'ScrapingChain', lambda:
+                        SimpleNamespace(scrape_metadata=scrape))
+    builder = LibraryBuilder(store=object(), resolver=object(),
+                             config_provider=lambda: {'scrape_metadata': True}, stop_event=Event())
+    builder._scrape(tmp_path, SimpleNamespace(), SimpleNamespace())
+    assert len(calls) == 1

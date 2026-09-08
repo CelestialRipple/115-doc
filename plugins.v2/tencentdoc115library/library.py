@@ -171,6 +171,13 @@ def resource_suffix(resource: Dict[str, Any]) -> str:
     return hashlib.sha256(str(resource["resource_id"]).encode()).hexdigest()[:16]
 
 
+def episode_identity(value: str) -> str:
+    """Keep uniqueness without numeric tokens that media parsers treat as episodes."""
+    return hashlib.sha256(value.encode()).hexdigest()[:16].translate(
+        str.maketrans("0123456789abcdef", "ghijklmnopqrstuv")
+    )
+
+
 class LibraryBuildError(RuntimeError):
     """媒体识别、STRM 生成或本地刮削错误"""
 
@@ -1036,6 +1043,17 @@ class LibraryBuilder:
     def _scrape(self, directory: Path, meta: Any, mediainfo: Any) -> None:
         if not self.config_provider().get("scrape_metadata", True):
             return
+        # Old hex identifiers can turn E07 into E07-E825062. Do not feed these
+        # files to the recursive scraper, even when another season is requested.
+        for path in directory.rglob("*.strm"):
+            legacy = re.search(
+                r"S\d+E\d+.* - ([0-9a-f]{16})$", path.stem, re.IGNORECASE
+            )
+            if legacy:
+                raise LibraryBuildError(
+                    f"旧剧集文件标识可能被识别为超大集数范围，已阻止刮削：{path.name}。"
+                    "请先迁移旧文件名及路径索引；无需删除现有 NFO。"
+                )
         result = ScrapingChain().scrape_metadata(
             fileitem=self._file_item(directory),
             meta=meta,
@@ -1207,13 +1225,16 @@ class LibraryBuilder:
                 unrecognized_files.append(source_file["file_name"])
                 continue
             season_directory = directory / f"Season {season:02d}"
+            identity = episode_identity(str(resource["resource_id"]))
             strm_path = season_directory / strm_file_name(
-                f"{media_name} - S{season:02d}E{episode:02d} - {resource_suffix(resource)}"
+                f"{media_name} - S{season:02d}E{episode:02d} [uid={identity}]"
             )
             if any(item.get("strm_path") == str(strm_path) for item in expanded_files):
-                suffix = safe_path_segment(Path(source_file["file_name"]).stem)
+                suffix = episode_identity(
+                    str(source_file["file_id"]) + ":" + str(source_file["file_name"])
+                )
                 strm_path = season_directory / strm_file_name(
-                    f"{media_name} - S{season:02d}E{episode:02d} - {suffix} - {resource_suffix(resource)}"
+                    f"{media_name} - S{season:02d}E{episode:02d} [uid={identity}{suffix}]"
                 )
             self._write_strm(
                 strm_path,
