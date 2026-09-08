@@ -336,6 +336,20 @@ class LibraryBuilder:
         )
 
     @staticmethod
+    def _stable_media_id(mediainfo: Any) -> Tuple[str, str]:
+        """返回可用于跨资源复用的媒体身份。
+
+        标题和年份只能用于展示，不能作为元数据身份：同名作品、重拍版和
+        不同剪辑版都可能共享这两个字段。优先使用 MoviePilot 提供的 TMDB、
+        IMDb 或内部媒体 ID，并返回字段名以避免不同 ID 命名空间碰撞。
+        """
+        for field in ("tmdb_id", "imdb_id", "media_id"):
+            value = str(getattr(mediainfo, field, None) or "").strip()
+            if value:
+                return field, value
+        return "", ""
+
+    @staticmethod
     def _recognize(
         resource: Dict[str, Any],
         media_type: MediaType,
@@ -375,6 +389,11 @@ class LibraryBuilder:
             raise LibraryBuildError(
                 f"MoviePilot 媒体类型不匹配：要求 {expected_type}，"
                 f"实际返回 {actual_type}；已拒绝写入错误元数据"
+            )
+        if not LibraryBuilder._stable_media_id(mediainfo)[1]:
+            raise MediaNotRecognizedError(
+                f"MoviePilot 识别结果缺少稳定媒体 ID：{title}"
+                + (f" ({meta.year})" if meta.year else "")
             )
         if mediainfo.type != media_type:
             meta.type = mediainfo.type
@@ -441,17 +460,13 @@ class LibraryBuilder:
             or LibraryBuilder._effective_media_type(resource)
             or ""
         )
-        identity = str(
-            getattr(mediainfo, "tmdb_id", None)
-            or getattr(mediainfo, "media_id", None)
-            or ""
-        ).strip()
-        if not identity:
-            title = str(
-                getattr(mediainfo, "title", None) or resource.get("title") or ""
-            )
-            year = str(getattr(mediainfo, "year", None) or resource.get("year") or "")
-            identity = f"{title.strip().casefold()}::{year.strip()}"
+        identity_field, identity = LibraryBuilder._stable_media_id(mediainfo)
+        if identity:
+            identity = f"{identity_field}:{identity}"
+        else:
+            # 无稳定 ID 的资源不会进入刮削/复用流程。保留资源级键只是为了
+            # 防止内部缓存把两个同名资源错误合并。
+            identity = f"resource:{str(resource.get('resource_id') or '')}"
         return media_type, identity
 
     @staticmethod
@@ -471,6 +486,8 @@ class LibraryBuilder:
         mediainfo: Any,
         target_directory: Path,
     ) -> Optional[Path]:
+        if not self._stable_media_id(mediainfo)[1]:
+            return None
         key = self._metadata_key(resource, mediainfo)
         with self._metadata_lock:
             cached = self._metadata_cache.get(key)
@@ -483,6 +500,7 @@ class LibraryBuilder:
         record = self.store.find_metadata_source(
             media_id=str(getattr(mediainfo, "media_id", None) or ""),
             tmdb_id=str(getattr(mediainfo, "tmdb_id", None) or ""),
+            imdb_id=str(getattr(mediainfo, "imdb_id", None) or ""),
             media_type=self._effective_media_type(resource),
             title=str(getattr(mediainfo, "title", None) or resource.get("title") or ""),
             year=str(getattr(mediainfo, "year", None) or resource.get("year") or ""),
@@ -1364,7 +1382,10 @@ class LibraryBuilder:
 
         try:
             config = self.config_provider()
-            scrape_enabled = bool(config.get("scrape_metadata", True))
+            fast_strm_mode = bool(config.get("fast_strm_mode", False))
+            scrape_enabled = (
+                bool(config.get("scrape_metadata", True)) and not fast_strm_mode
+            )
             try:
                 scrape_workers = min(
                     max(int(config.get("scrape_workers") or 1), 1),
@@ -1440,17 +1461,22 @@ class LibraryBuilder:
                         scrape_status="recognizing",
                     )
                     recognition_error = ""
-                    try:
-                        meta, mediainfo = self._recognize(
-                            resource,
-                            media_type,
-                            allow_type_correction=mixed_resource,
-                        )
-                        # MoviePilot 的识别结论优先于混合表格中不可靠的类型标签。
-                        media_type = mediainfo.type
-                    except MediaNotRecognizedError as error:
-                        recognition_error = str(error)
+                    if fast_strm_mode:
+                        # 快速模式只根据表格类型和文件名生成 STRM，把识别、
+                        # 元数据和图片交给 Emby，避免 MoviePilot 刮削占用资源。
                         meta, mediainfo = self._fallback_media(resource, media_type)
+                    else:
+                        try:
+                            meta, mediainfo = self._recognize(
+                                resource,
+                                media_type,
+                                allow_type_correction=mixed_resource,
+                            )
+                            # MoviePilot 的识别结论优先于混合表格中不可靠的类型标签。
+                            media_type = mediainfo.type
+                        except MediaNotRecognizedError as error:
+                            recognition_error = str(error)
+                            meta, mediainfo = self._fallback_media(resource, media_type)
                     self._save_detected_type(resource, media_type)
                     current_stage = "generating"
                     notify_progress(resource, current_stage)
@@ -1535,7 +1561,11 @@ class LibraryBuilder:
                             resource["resource_id"],
                             "ready",
                             strm_status="ready",
-                            scrape_status="skipped",
+                            scrape_status=(
+                                "skipped"
+                                if fast_strm_mode or not recognition_error
+                                else "unrecognized"
+                            ),
                             media_source=str(
                                 getattr(mediainfo, "media_source", None)
                                 or getattr(mediainfo, "source", None)

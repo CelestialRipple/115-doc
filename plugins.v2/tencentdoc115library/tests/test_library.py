@@ -476,6 +476,74 @@ def test_unrecognized_movie_still_generates_strm_without_metadata(
     assert not list(strm_path.parent.glob("*.nfo"))
 
 
+def test_recognized_media_without_stable_id_is_treated_as_unrecognized() -> None:
+    class MediaChainWithoutId:
+        @staticmethod
+        def recognize_by_meta(metainfo, obtain_images=False):
+            return SimpleNamespace(type=MediaType.MOVIE, title="同名电影")
+
+    original_media_chain = library_module.MediaChain
+    library_module.MediaChain = MediaChainWithoutId
+    try:
+        with pytest.raises(library_module.MediaNotRecognizedError, match="稳定媒体 ID"):
+            LibraryBuilder._recognize(
+                {"title": "同名电影", "year": "2024", "version": ""},
+                MediaType.MOVIE,
+            )
+    finally:
+        library_module.MediaChain = original_media_chain
+
+
+def test_fast_strm_mode_skips_recognition_and_metadata(
+    tmp_path: Path,
+) -> None:
+    store = CatalogStore(tmp_path / "catalog.db")
+    store.upsert_sheets([_sheet("sheet-a", "星火4K全站资源")])
+    store.configure_sheets(
+        {"sheet-a": {"enabled": True, "group_name": "星火", "media_mode": "movie"}}
+    )
+    checkpoint = store.begin_sheet_scan("sheet-a")
+    resource = _resource("resource-fast", "快速电影", "https://115.com/s/example")
+    store.save_page("sheet-a", checkpoint["scan_id"], 3, {}, [resource], 1)
+
+    class Resolver:
+        @staticmethod
+        def list_video_files(_share_url):
+            return [
+                {
+                    "file_id": "file-1",
+                    "file_name": "快速电影.2024.mkv",
+                    "file_path": "/快速电影.2024.mkv",
+                    "size": 1024,
+                }
+            ]
+
+        @staticmethod
+        def choose_movie_file(files):
+            return files[0]
+
+    builder = LibraryBuilder(
+        store=store,
+        resolver=Resolver(),
+        config_provider=lambda: {
+            "output_root": str(tmp_path / "output"),
+            "public_base_url": "http://moviepilot:3000",
+            "playback_token": "test-token",
+            "fast_strm_mode": True,
+            "scrape_metadata": True,
+        },
+        stop_event=Event(),
+    )
+
+    result = builder.build(limit=1)
+
+    updated = store.get_resource("resource-fast")
+    assert result["success"] == 1
+    assert updated["scrape_status"] == "skipped"
+    assert Path(updated["strm_path"]).is_file()
+    assert not list(Path(updated["strm_path"]).parent.glob("*.nfo"))
+
+
 @pytest.mark.parametrize('shared,fail', [(False, False), (True, False), (True, True)])
 def test_parallel_build_ignores_old_capacity_limit_and_never_scans_for_size(
     tmp_path, monkeypatch, shared, fail,

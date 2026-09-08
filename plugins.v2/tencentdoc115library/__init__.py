@@ -92,6 +92,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "public_base_url": "http://127.0.0.1:3000",
     "playback_token": "",
     "scrape_metadata": True,
+    "fast_strm_mode": False,
     "native_search_enabled": True,
     "browser_download_enabled": True,
     "native_search_scope": "all",
@@ -131,7 +132,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.13.5"
+    plugin_version = "0.13.6"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -2204,6 +2205,21 @@ refresh(); setInterval(refresh,1000);
                                         "props": {
                                             "model": "enabled",
                                             "label": "启用插件",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "fast_strm_mode",
+                                            "label": "快速生成 STRM（交给 Emby 刮削）",
+                                            "hint": "跳过 MoviePilot 识别、NFO 和图片生成，只按类型和文件名生成 STRM；启用后优先于 MoviePilot 刮削。",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],

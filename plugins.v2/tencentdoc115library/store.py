@@ -1309,6 +1309,7 @@ class CatalogStore:
         title: str = "",
         year: str = "",
         exclude_resource_id: str = "",
+        imdb_id: str = "",
     ) -> Optional[Dict[str, Any]]:
         """查找已刮削的同一媒体，供不同分享复用元数据目录。"""
         identity_conditions: List[str] = []
@@ -1319,14 +1320,11 @@ class CatalogStore:
         if str(media_id or "").strip():
             identity_conditions.append("media_id = ?")
             parameters.append(str(media_id).strip())
-        if not identity_conditions and str(title or "").strip():
-            title_condition = ["title = ?"]
-            title_parameters: List[Any] = [str(title).strip()]
-            if str(year or "").strip():
-                title_condition.append("year = ?")
-                title_parameters.append(str(year).strip())
-            identity_conditions.append("(" + " AND ".join(title_condition) + ")")
-            parameters.extend(title_parameters)
+        if str(imdb_id or "").strip():
+            identity_conditions.append("imdb_id = ?")
+            parameters.append(str(imdb_id).strip())
+        # 标题/年份只用于展示，不能作为跨资源元数据身份。否则同名电影
+        # 或重拍版会错误复用另一条资源的 NFO 和图片。
         if not identity_conditions:
             return None
         conditions = [
@@ -1344,7 +1342,7 @@ class CatalogStore:
             conditions.append("resource_id <> ?")
             parameters.append(str(exclude_resource_id))
         query = (
-            "SELECT resource_id, media_id, tmdb_id, media_type, strm_path "
+            "SELECT resource_id, media_id, tmdb_id, imdb_id, media_type, strm_path "
             "FROM resource WHERE " + " AND ".join(conditions) + " "
             "ORDER BY updated_at ASC LIMIT 1"
         )

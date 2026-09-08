@@ -244,6 +244,28 @@ def test_find_metadata_source_matches_media_identity(tmp_path: Path) -> None:
     assert source["strm_path"].endswith("测试电影.strm")
 
 
+def test_find_metadata_source_does_not_match_title_and_year_only(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page("sheet-1", checkpoint["scan_id"], 101, {}, [_resource()], 99)
+    store.update_resource_status(
+        "resource-1",
+        "ready",
+        strm_path="/media/电影合集/测试电影/测试电影.strm",
+        scrape_status="ready",
+    )
+
+    assert (
+        store.find_metadata_source(
+            media_type="电影",
+            title="测试电影",
+            year="2024",
+            exclude_resource_id="other-resource",
+        )
+        is None
+    )
+
+
 def test_migration_paths_can_be_listed_and_updated_atomically(tmp_path: Path) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")
