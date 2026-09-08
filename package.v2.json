@@ -3,11 +3,12 @@
         "name": "腾讯文档115媒体库",
         "description": "同步腾讯文档普通表/智能表或手动添加115分享、磁力和ED2K，支持按需115离线、MoviePilot刮削和Emby直链网关",
         "labels": "媒体库,115网盘,STRM,磁力,ED2K,直链下载,Emby",
-        "version": "0.13.5",
+        "version": "0.13.6",
         "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.13.6": "新增快速生成 STRM 模式，将识别和元数据交给 Emby；要求 MoviePilot 识别结果具备稳定媒体 ID，禁止按同名标题和年份错误复用 NFO/图片",
             "v0.13.5": "修复剧集资源标识被误解析为多集范围：使用无数字唯一标识，重名文件不再追加原始文件名；递归刮削前拦截危险旧命名，避免生成巨型NFO",
             "v0.13.4": "移除输出目录容量限制和容量展示，生成、刮削、详情页及状态接口不再为统计容量扫描目录，旧容量配置不再生效",
             "v0.13.3": "优化并行刮削容量统计：批次中仅统计活跃影片目录，避免逐批完成时遍历整个影视库；共享目录增量去重，失败产物计入容量，批次结束全量核对",
