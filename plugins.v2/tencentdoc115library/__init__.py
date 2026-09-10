@@ -132,7 +132,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.13.6"
+    plugin_version = "0.13.7"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -906,6 +906,7 @@ background:#1976d2;color:white;font-size:16px;padding:12px 22px;cursor:pointer}}
             self._builder.build,
             limit=action.limit,
             retry_failed=action.retry_failed,
+            sheet_ids=self._enabled_sheet_ids(),
         )
 
     def _import_manual_resources(
@@ -1354,6 +1355,16 @@ refresh(); setInterval(refresh,1000);
         with self._pipeline_lock:
             return dict(self._pipeline_status)
 
+    def _enabled_sheet_ids(self) -> List[str]:
+        """返回当前勾选的工作表 ID，供自动生成队列做边界筛选。"""
+        if not self._store:
+            return []
+        return [
+            str(sheet.get("sheet_id") or "")
+            for sheet in self._store.list_sheets(enabled_only=True)
+            if str(sheet.get("sheet_id") or "")
+        ]
+
     def _sync_all_and_build(self) -> Dict[str, Any]:
         """持续同步全部已选工作表，然后逐批生成所有 pending 资源。"""
         if not self._synchronizer or not self._builder:
@@ -1415,11 +1426,13 @@ refresh(); setInterval(refresh,1000);
 
         self._set_pipeline_status(
             phase="building",
-            message="目录同步完成，正在排队识别、刮削并生成 STRM",
+            message="目录同步完成，正在处理当前勾选工作表的 pending 资源",
             **totals,
         )
         while not self._stop_event.is_set() and not self._pause_event.is_set():
-            result = self._builder.build()
+            # 每个批次重新读取勾选状态。用户在任务运行期间取消勾选后，
+            # 对应资源会保留 pending，重新勾选后才会继续处理。
+            result = self._builder.build(sheet_ids=self._enabled_sheet_ids())
             processed = int(result.get("processed") or 0)
             totals["built"] += processed
             totals["success"] += int(result.get("success") or 0)
@@ -1604,6 +1617,7 @@ refresh(); setInterval(refresh,1000);
                 batch_limit,
                 retry_failed=True,
                 resource_ids=remaining_ids,
+                sheet_ids=self._enabled_sheet_ids(),
             )
             batch_ids = [str(item["resource_id"]) for item in candidates]
             if not batch_ids:
@@ -1620,6 +1634,7 @@ refresh(); setInterval(refresh,1000);
                 limit=len(batch_ids),
                 retry_failed=True,
                 resource_ids=batch_ids,
+                sheet_ids=self._enabled_sheet_ids(),
             )
             processed = int(result.get("processed") or 0)
             processed_ids = set(batch_ids[:processed])
@@ -1989,7 +2004,11 @@ refresh(); setInterval(refresh,1000);
         """提交一次有界自动媒体库生成批次。"""
         if not self._enabled or not self._builder:
             return
-        self._submit("自动媒体库生成", self._builder.build)
+        self._submit(
+            "自动媒体库生成",
+            self._builder.build,
+            sheet_ids=self._enabled_sheet_ids(),
+        )
 
     def _automatic_offline_cleanup(self) -> None:
         """清理到期的磁力和ED2K离线播放文件。"""

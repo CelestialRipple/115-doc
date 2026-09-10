@@ -381,9 +381,11 @@ def main() -> None:
 
         class FakeBuilder:
             calls = 0
+            sheet_args = []
 
-            def build(self):
+            def build(self, **kwargs):
                 self.calls += 1
+                self.sheet_args.append(kwargs.get("sheet_ids"))
                 if self.calls == 1:
                     return {
                         "status": "completed",
@@ -408,6 +410,7 @@ def main() -> None:
         assert pipeline["synced_rows"] == 30
         assert pipeline["success"] == 2
         assert plugin._pipeline_snapshot()["phase"] == "completed"
+        assert plugin._builder.sheet_args == [[], []]
         plugin.stop_service()
         print("MoviePilot plugin smoke test passed")
 

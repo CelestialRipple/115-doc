@@ -1081,12 +1081,14 @@ class CatalogStore:
         limit: int,
         retry_failed: bool = False,
         resource_ids: Optional[List[str]] = None,
+        sheet_ids: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         查询待生成 STRM 的资源
 
         :param limit (int): 最大返回数量
         :param retry_failed (bool): 是否包含失败资源
+        :param sheet_ids (Sequence[str]): 只返回指定工作表的资源；传入空序列时不返回资源
 
         :return List: 待处理资源列表
         """
@@ -1109,9 +1111,19 @@ class CatalogStore:
             id_placeholders = ",".join("?" for _ in normalized_ids)
             resource_clause = f" AND resource_id IN ({id_placeholders})"
             parameters.extend(normalized_ids)
+        sheet_clause = ""
+        if sheet_ids is not None:
+            normalized_sheet_ids = [
+                str(item).strip() for item in sheet_ids if str(item).strip()
+            ]
+            if not normalized_sheet_ids:
+                return []
+            sheet_placeholders = ",".join("?" for _ in normalized_sheet_ids)
+            sheet_clause = f" AND sheet_id IN ({sheet_placeholders})"
+            parameters.extend(normalized_sheet_ids)
         query = (
             f"SELECT * FROM resource WHERE {status_clause}"
-            f"{resource_clause} "
+            f"{resource_clause}{sheet_clause} "
             "ORDER BY updated_at, sheet_id, row_number LIMIT ?"
         )
         parameters.append(int(limit))

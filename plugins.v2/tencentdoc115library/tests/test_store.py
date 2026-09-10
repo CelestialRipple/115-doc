@@ -393,6 +393,51 @@ def test_unrecognized_strm_can_be_requeued_for_future_recognition(
     assert resource["scrape_status"] == "pending"
 
 
+def test_build_candidates_can_be_limited_to_enabled_sheet_ids(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.upsert_sheets(
+        [
+            {
+                "sheet_id": "sheet-2",
+                "title": "已取消勾选",
+                "row_count": 100,
+                "column_count": 6,
+                "used_row_count": 100,
+                "used_column_count": 6,
+            }
+        ]
+    )
+    store.configure_sheets(
+        {
+            "sheet-2": {
+                "enabled": False,
+                "group_name": "已取消勾选",
+                "media_mode": "movie",
+            }
+        }
+    )
+    first_checkpoint = store.begin_sheet_scan("sheet-1")
+    store.save_page(
+        "sheet-1", first_checkpoint["scan_id"], 101, {}, [_resource()], 99
+    )
+    second = dict(_resource())
+    second["resource_id"] = "resource-2"
+    second["row_hash"] = "hash-2"
+    second["share_url"] = "https://115.com/s/second"
+    checkpoint = store.begin_sheet_scan("sheet-2")
+    store.save_page("sheet-2", checkpoint["scan_id"], 101, {}, [second], 99)
+
+    assert [item["resource_id"] for item in store.list_build_candidates(10)] == [
+        "resource-1",
+        "resource-2",
+    ]
+    assert [
+        item["resource_id"]
+        for item in store.list_build_candidates(10, sheet_ids=["sheet-1"])
+    ] == ["resource-1"]
+    assert store.list_build_candidates(10, sheet_ids=[]) == []
+
+
 def test_search_save_overrides_survive_incremental_sheet_sync(tmp_path: Path) -> None:
     store = _store(tmp_path)
     checkpoint = store.begin_sheet_scan("sheet-1")

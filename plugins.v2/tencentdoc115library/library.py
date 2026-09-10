@@ -10,7 +10,7 @@ from inspect import signature
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlencode, urlsplit, parse_qs
 
 from app.chain.media import MediaChain
@@ -1287,6 +1287,7 @@ class LibraryBuilder:
         limit: Optional[int] = None,
         retry_failed: bool = False,
         resource_ids: Optional[List[str]] = None,
+        sheet_ids: Optional[Sequence[str]] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """
@@ -1295,6 +1296,7 @@ class LibraryBuilder:
         :param limit (int): 本次最大资源数
         :param retry_failed (bool): 是否包含失败资源
         :param resource_ids (List[str]): 只处理指定资源，供手动导入立即构建
+        :param sheet_ids (Sequence[str]): 只处理指定工作表的资源
 
         :return Dict: 处理统计
         """
@@ -1404,6 +1406,7 @@ class LibraryBuilder:
                 batch_limit,
                 retry_failed=retry_failed,
                 resource_ids=resource_ids,
+                sheet_ids=sheet_ids,
             )
             progress_total = len(resources)
             notify_progress(None, "starting")
