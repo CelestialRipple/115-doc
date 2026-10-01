@@ -67,7 +67,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": False,
     "auto_sync": False,
     "auto_build": False,
-    "sync_cron": "0 */6 * * *",
+    "sync_cron": "0 3 * * *",
     "build_cron": "*/5 * * * *",
     "document_url": "",
     "document_urls": "",
@@ -132,7 +132,7 @@ class TencentDoc115Library(_PluginBase):
     plugin_name = "腾讯文档115媒体库"
     plugin_desc = "同步腾讯普通/智能表中的115分享、磁力和ED2K，使用MoviePilot刮削并按需返回115直链。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png"
-    plugin_version = "0.13.7"
+    plugin_version = "0.13.8"
     plugin_author = "Codex"
     author_url = "https://github.com/CelestialRipple/115-doc"
     plugin_config_prefix = "tencentdoc115library_"
@@ -199,11 +199,22 @@ class TencentDoc115Library(_PluginBase):
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """加载配置并初始化持久化和任务组件。"""
         self.stop_service()
+        # 配置重载后旧的 Future/恢复入口已不属于新组件，不能继续拦截定时任务。
+        with self._task_lock:
+            self._future = None
+            self._task_name = ""
+            self._task_state = "idle"
+            self._task_message = "没有后台任务"
+            self._resume_spec = None
         self._stop_event = Event()
         self._pause_event.clear()
         self._config = {**DEFAULT_CONFIG, **(config or {})}
         self._config.pop("output_size_limit_gb", None)
         config_changed = False
+        if str(self._config.get("sync_cron") or "").strip() == "0 */6 * * *":
+            # 旧版默认每六小时运行；只迁移这个默认值，保留用户自定义 Cron。
+            self._config["sync_cron"] = DEFAULT_CONFIG["sync_cron"]
+            config_changed = True
         # 清理旧版本曾保存的转存和 ISO 实验开关，避免升级后继续显示或生效。
         for legacy_key in (
             "iso_fresh_redirect",
@@ -1365,7 +1376,7 @@ refresh(); setInterval(refresh,1000);
             if str(sheet.get("sheet_id") or "")
         ]
 
-    def _sync_all_and_build(self) -> Dict[str, Any]:
+    def _sync_all_and_build(self, mode: str = "manual-all") -> Dict[str, Any]:
         """持续同步全部已选工作表，然后逐批生成所有 pending 资源。"""
         if not self._synchronizer or not self._builder:
             return {"status": "failed", "message": "插件尚未初始化"}
@@ -1381,8 +1392,15 @@ refresh(); setInterval(refresh,1000);
             message="正在同步全部已勾选工作表",
             **totals,
         )
+        first_batch = True
         while not self._stop_event.is_set() and not self._pause_event.is_set():
-            result = self._synchronizer.sync(mode="manual-all")
+            # 定时任务每天从首行扫描全部已选工作表；同一次任务的后续批次
+            # 仍沿 SQLite 检查点继续。手动任务保留原有断点续跑行为。
+            sync_kwargs: Dict[str, Any] = {"mode": mode}
+            if mode == "automatic" and first_batch:
+                sync_kwargs["reset"] = True
+            result = self._synchronizer.sync(**sync_kwargs)
+            first_batch = False
             totals["synced_pages"] += int(result.get("processed_pages") or 0)
             totals["synced_rows"] += int(result.get("processed_rows") or 0)
             sync_status = str(result.get("status") or "failed")
@@ -1408,6 +1426,13 @@ refresh(); setInterval(refresh,1000);
                     **totals,
                 )
                 return {"status": final_phase, **totals}
+            if int(result.get("processed_pages") or 0) == 0:
+                self._set_pipeline_status(
+                    phase="failed",
+                    message="目录同步暂停但没有推进分页，请检查工作表状态",
+                    **totals,
+                )
+                return {"status": "failed", **totals}
 
         if self._stop_event.is_set():
             self._set_pipeline_status(
@@ -1450,7 +1475,7 @@ refresh(); setInterval(refresh,1000);
                     **totals,
                 )
                 return {"status": "paused", **totals}
-            if build_status in {"busy", "interrupted"}:
+            if build_status in {"busy", "interrupted", "failed"}:
                 final_phase = "stopped" if build_status == "interrupted" else "failed"
                 self._set_pipeline_status(
                     phase=final_phase,
@@ -1995,10 +2020,14 @@ refresh(); setInterval(refresh,1000);
         ]
 
     def _automatic_sync(self) -> None:
-        """提交一次有界自动同步批次。"""
-        if not self._enabled or not self._synchronizer:
+        """完整同步已勾选工作表，再生成新增的 pending 资源。"""
+        if not self._enabled or not self._synchronizer or not self._builder:
             return
-        self._submit("自动目录同步", self._synchronizer.sync, mode="automatic")
+        response = self._submit(
+            "自动同步并生成", self._sync_all_and_build, mode="automatic"
+        )
+        if not response.success:
+            logger.warning(f"自动同步并生成未启动：{response.message}")
 
     def _automatic_build(self) -> None:
         """提交一次有界自动媒体库生成批次。"""
@@ -2028,7 +2057,7 @@ refresh(); setInterval(refresh,1000);
                 "auto_sync",
                 "sync_cron",
                 "TencentDoc115LibrarySync",
-                "腾讯文档115媒体库分页同步",
+                "腾讯文档115媒体库全量同步并增量生成",
                 self._automatic_sync,
             ),
             (
@@ -2040,6 +2069,9 @@ refresh(); setInterval(refresh,1000);
             ),
         ]
         for enabled_key, cron_key, service_id, name, function in service_specs:
+            # 完整同步结束后已处理 pending，无需再每五分钟提交一次生成任务。
+            if enabled_key == "auto_build" and self._config.get("auto_sync"):
+                continue
             if not self._config.get(enabled_key):
                 continue
             cron = str(self._config.get(cron_key) or "").strip()
@@ -2251,7 +2283,7 @@ refresh(); setInterval(refresh,1000);
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "auto_sync",
-                                            "label": "自动分页同步",
+                                            "label": "自动全量同步并生成新增资源",
                                         },
                                     }
                                 ],
@@ -2264,7 +2296,7 @@ refresh(); setInterval(refresh,1000);
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "auto_build",
-                                            "label": "定时自动生成",
+                                            "label": "单独定时生成（未启用自动同步时）",
                                         },
                                     }
                                 ],
@@ -2378,7 +2410,9 @@ refresh(); setInterval(refresh,1000);
                                 True,
                                 hint="OAuth 授权码换取 Token 时由接口返回，控制台不会单独展示",
                             ),
-                            self._text_field("sync_cron", "自动同步 Cron", 6),
+                            self._text_field(
+                                "sync_cron", "自动同步 Cron（默认每天 03:00）", 6
+                            ),
                             self._text_field("build_cron", "自动生成 Cron", 6),
                         ],
                     },
@@ -2393,7 +2427,7 @@ refresh(); setInterval(refresh,1000);
                                 hint="Unraid 部署后不能使用 127.0.0.1，请填写局域网地址",
                             ),
                             self._text_field("page_rows", "每页行数（最高1000）", 3),
-                            self._text_field("pages_per_run", "每次最多页数", 3),
+                            self._text_field("pages_per_run", "每批最多页数", 3),
                             self._text_field("build_batch", "每次最多生成资源", 3),
                             self._text_field(
                                 "scrape_workers",
